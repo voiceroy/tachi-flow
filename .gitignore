@@ -1,0 +1,9 @@
+target
+Cargo.lock
+.idea
+.vscode
+*.swp
+.env
+tachi-lp.secret
+tachi-lp-alpha.secret
+tachi-lp-bravo.secret

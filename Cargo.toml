@@ -1,0 +1,26 @@
+[package]
+name = "tachi-flow"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "OP_Freedom bounty #10 PoC: Tachi on-chain ↔ VTXO liquidity engine"
+license = "MIT"
+
+[dependencies]
+actix-cors = "0.7"
+actix-web = { version = "4.15", features = ["macros"] }
+bitcoin = { version = "0.32.102", features = ["rand-std", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tracing = "0.1"
+tracing-actix-web = "0.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+actix-web = { version = "4.15", features = ["macros"] }

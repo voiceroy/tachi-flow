@@ -1,0 +1,125 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    In,
+    Out,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwapStatus {
+    Quoted,
+    InboundLocked,
+    OutboundPaid,
+    LpSettled,
+    Claimed,
+    Refunded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiquidityProvider {
+    pub id: String,
+    pub l1_sats: u64,
+    pub vtxo_sats: u64,
+    pub fee_ppm: u64,
+    pub max_swap_sats: u64,
+    pub defaulted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tachi_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Quote {
+    pub id: Uuid,
+    pub side: Side,
+    pub amount_sats: u64,
+    pub fee_sats: u64,
+    pub receive_sats: u64,
+    pub lp_id: String,
+    pub eta_seconds: u64,
+    pub expires_at: DateTime<Utc>,
+    pub user_tachi_address: Option<String>,
+    pub user_l1_address: Option<String>,
+    pub pay: PayInstructions,
+    /// Plain-language refund / next-step copy for the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum PayInstructions {
+    L1Htlc {
+        address: String,
+        payment_hash_hex: String,
+        timeout_height: u32,
+        redeem_script_hex: String,
+    },
+    TachiVtxo {
+        pay_to: String,
+        memo: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Swap {
+    pub id: Uuid,
+    pub quote_id: Uuid,
+    pub side: Side,
+    pub status: SwapStatus,
+    pub lp_id: String,
+    pub amount_sats: u64,
+    pub fee_sats: u64,
+    pub receive_sats: u64,
+    pub pay: PayInstructions,
+    pub user_tachi_address: Option<String>,
+    pub user_l1_address: Option<String>,
+    pub l1_lock_txid: Option<String>,
+    pub vtxo_payment_id: Option<String>,
+    pub tachi_tx_hash: Option<String>,
+    pub claim_tx_hex: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateQuoteRequest {
+    pub side: Side,
+    pub amount_sats: u64,
+    pub user_tachi_address: Option<String>,
+    pub user_l1_address: Option<String>,
+    /// Compressed secp256k1 pubkey hex (33 bytes). Required for `in` so the
+    /// HTLC refund path is the user's key.
+    pub user_refund_pubkey_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSwapRequest {
+    pub quote_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveLockRequest {
+    pub txid: String,
+    pub vout: u32,
+    pub value_sats: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveVtxoRequest {
+    pub vtxo_id: String,
+}
+
+pub fn fee_sats(amount: u64, fee_ppm: u64, min_fee: u64) -> u64 {
+    let proportional = amount.saturating_mul(fee_ppm) / 1_000_000;
+    proportional.max(min_fee)
+}

@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>tachi-flow — L1 ↔ VTXO desk</title>
+  <style>
+    :root {
+      --bg: #0e1116;
+      --panel: #171c24;
+      --line: #2a3340;
+      --text: #e8edf4;
+      --muted: #8b98a8;
+      --accent: #f4c14e;
+      --ok: #3dba84;
+      --warn: #e08a3c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 16px/1.45 "Iowan Old Style", Palatino, "Palatino Linotype", serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      padding: 2rem 1.5rem 1rem;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    header h1 { font-size: 1.8rem; margin: 0 0 .4rem; font-weight: 600; }
+    header p { margin: 0; color: var(--muted); max-width: 40rem; }
+    main { max-width: 960px; margin: 0 auto; padding: 0 1.5rem 4rem; }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 1.25rem 1.4rem;
+      margin: 1rem 0;
+    }
+    h2 { font-size: 1.05rem; margin: 0 0 .8rem; letter-spacing: .02em; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid var(--line); font-size: .92rem; }
+    th { color: var(--muted); font-weight: 500; }
+    label { display: block; font-size: .85rem; color: var(--muted); margin: .6rem 0 .2rem; }
+    input, select, button, textarea {
+      font: inherit;
+      padding: .45rem .6rem;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #10151c;
+      color: var(--text);
+    }
+    input, select { width: 100%; max-width: 28rem; }
+    button {
+      background: var(--accent);
+      color: #1a1406;
+      border: 0;
+      font-weight: 600;
+      cursor: pointer;
+      margin: .8rem .5rem 0 0;
+    }
+    button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+    .row { display: flex; flex-wrap: wrap; gap: 1rem; }
+    .row > * { flex: 1 1 16rem; }
+    .hint { color: var(--muted); font-size: .9rem; margin-top: .8rem; }
+    .pay {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .82rem;
+      word-break: break-all;
+      background: #10151c;
+      padding: .8rem;
+      border-radius: 6px;
+    }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    #status { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>tachi-flow</h1>
+    <p>
+      A liquidity desk for Tachi. Swap on-chain bitcoin for off-chain VTXOs (and back)
+      without waiting through a vault’s week-long exit. You never talk to a timelock;
+      the desk already holds both kinds of coins.
+    </p>
+    <p class="hint" id="meta">loading…</p>
+  </header>
+  <main>
+    <section>
+      <h2>Marketplace</h2>
+      <p class="hint">Each desk shows live Tachi VTXOs and bitcoin at its claim address. Quotes reserve stock so two cheap quotes cannot spend the same pile.</p>
+      <div id="books">loading inventory…</div>
+    </section>
+    <section>
+      <h2>Get a quote</h2>
+      <div class="row">
+        <div>
+          <label>Direction</label>
+          <select id="side">
+            <option value="in">I have bitcoin, I want Tachi coins</option>
+            <option value="out">I have Tachi coins, I want bitcoin</option>
+          </select>
+          <label>Amount (sats)</label>
+          <input id="amount" type="number" value="20000" min="10000" />
+          <label>Your Tachi key (in) — 64 hex or bcrt1p…</label>
+          <input id="tachiDest" placeholder="tachi_xonly_hex" />
+          <label>Refund pubkey (in) — from “new keys”</label>
+          <input id="refundPk" />
+          <label>Your bitcoin address (out) — bcrt1…</label>
+          <input id="l1Dest" />
+          <button id="btnKeys">New keys</button>
+          <button id="btnQuote">Quote</button>
+        </div>
+        <div>
+          <div id="quoteBox" class="hint">A quote shows fee, what you receive, who pays you, and when you can take bitcoin back if the desk stalls.</div>
+        </div>
+      </div>
+    </section>
+    <section>
+      <h2>Open swap &amp; status</h2>
+      <button id="btnOpen">Accept quote</button>
+      <button id="btnSync" class="ghost">Check if paid</button>
+      <p class="hint" id="swapHint"></p>
+      <div id="status"></div>
+    </section>
+    <section>
+      <h2>Recent swaps</h2>
+      <div id="swaps">—</div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let quote = null, swap = null;
+
+    function sats(n) { return Number(n).toLocaleString() + " sats"; }
+    function feePct(ppm) { return (ppm / 10000).toFixed(2) + "%"; }
+
+    async function j(url, opt) {
+      const r = await fetch(url, opt);
+      const t = await r.json();
+      if (!r.ok) throw new Error(t.error || r.statusText);
+      return t;
+    }
+
+    async function refreshMeta() {
+      const m = await j("/v1/meta");
+      $("meta").textContent = m.bounty + " · " + m.network + " · " + m.tachi + " · block " + m.height;
+    }
+
+    async function refreshBooks() {
+      const rows = await j("/v1/inventory");
+      const head = "<table><thead><tr><th>Desk</th><th>Fee</th><th>On-chain</th><th>Tachi VTXOs</th><th>Max</th></tr></thead><tbody>";
+      const body = rows.map(lp => `<tr>
+        <td>${lp.id}${lp.defaulted ? " (stopped)" : ""}</td>
+        <td>${feePct(lp.fee_ppm)}</td>
+        <td>${sats(lp.l1_sats)}</td>
+        <td>${sats(lp.vtxo_sats)}</td>
+        <td>${sats(lp.max_swap_sats)}</td>
+      </tr>`).join("");
+      $("books").innerHTML = head + body + "</tbody></table>";
+    }
+
+    async function refreshSwaps() {
+      const list = await j("/v1/swaps");
+      if (!list.length) { $("swaps").textContent = "None yet."; return; }
+      $("swaps").innerHTML = "<table><thead><tr><th>When</th><th>Side</th><th>Status</th><th>Amount</th><th>Desk</th></tr></thead><tbody>" +
+        list.slice(0, 12).map(s => `<tr>
+          <td>${(s.updated_at || "").slice(11, 19)}</td>
+          <td>${s.side}</td>
+          <td>${s.status}</td>
+          <td>${sats(s.amount_sats)}</td>
+          <td>${s.lp_id}</td>
+        </tr>`).join("") + "</tbody></table>";
+    }
+
+    $("btnKeys").onclick = async () => {
+      const k = await j("/v1/demo/keys", { method: "POST" });
+      $("refundPk").value = k.pubkey_hex;
+      $("tachiDest").value = k.tachi_xonly_hex;
+    };
+
+    $("btnQuote").onclick = async () => {
+      try {
+        const side = $("side").value;
+        const body = {
+          side,
+          amount_sats: Number($("amount").value),
+          user_tachi_address: $("tachiDest").value || null,
+          user_refund_pubkey_hex: $("refundPk").value || null,
+          user_l1_address: $("l1Dest").value || null,
+        };
+        quote = await j("/v1/quotes", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const pay = quote.pay || {};
+        let payHtml = "";
+        if (pay.method === "l1_htlc") {
+          payHtml = `<p>Send <strong>${sats(quote.amount_sats)}</strong> bitcoin to this locked address (not a normal wallet):</p>
+            <div class="pay">${pay.address}</div>
+            <p class="hint">Refund after block ${pay.timeout_height}. ${quote.hint || ""}</p>`;
+        } else {
+          payHtml = `<p>Send <strong>${sats(quote.amount_sats)}</strong> Tachi coins to desk <code>${pay.pay_to}</code></p>
+            <p class="hint">${quote.hint || ""}</p>`;
+        }
+        $("quoteBox").innerHTML = `
+          <p>Desk <strong>${quote.lp_id}</strong> · fee ${sats(quote.fee_sats)} · you receive <strong>${sats(quote.receive_sats)}</strong></p>
+          <p>Ready in about ${quote.eta_seconds} seconds · quote expires ${quote.expires_at}</p>
+          ${payHtml}`;
+        await refreshBooks();
+      } catch (e) {
+        $("quoteBox").innerHTML = `<p class="warn">${e.message}</p>`;
+      }
+    };
+
+    $("btnOpen").onclick = async () => {
+      if (!quote) return;
+      swap = await j("/v1/swaps", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ quote_id: quote.id }),
+      });
+      $("swapHint").textContent = "Swap " + swap.id + " is " + swap.status + ". Pay as quoted, then click Check if paid (or wait ~8s).";
+      $("status").textContent = JSON.stringify(swap, null, 2);
+      refreshSwaps();
+    };
+
+    $("btnSync").onclick = async () => {
+      if (!swap) return;
+      const s = await j("/v1/swaps/" + swap.id + "/sync", { method: "POST" });
+      $("status").textContent = JSON.stringify(s, null, 2);
+      if (s.status && s.status !== "waiting") {
+        swap = s;
+        $("swapHint").innerHTML = "<span class='ok'>Status: " + s.status + "</span>";
+      }
+      refreshBooks();
+      refreshSwaps();
+    };
+
+    refreshMeta();
+    refreshBooks();
+    refreshSwaps();
+    setInterval(() => { refreshBooks(); refreshSwaps(); refreshMeta(); }, 8000);
+  </script>
+</body>
+</html>
