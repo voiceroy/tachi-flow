@@ -125,6 +125,15 @@
           <input id="refundPk" />
           <label>Your bitcoin address (out)</label>
           <input id="l1Dest" placeholder="filled from identity" />
+          <label>Deadline (out): when the desk must lock your bitcoin</label>
+          <select id="deadline">
+            <option value="0">Now</option>
+            <option value="6">Within 6 blocks (~1 hour)</option>
+            <option value="36">Within 36 blocks (~6 hours)</option>
+            <option value="144">Within 144 blocks (~1 day)</option>
+            <option value="432">Within 432 blocks (~3 days)</option>
+            <option value="1008">Within 1008 blocks (vault-exit pace)</option>
+          </select>
           <label>Keep the price firm for</label>
           <select id="ttl">
             <option value="60">1 minute (cheapest)</option>
@@ -135,6 +144,7 @@
         </div>
         <div>
           <div id="quoteBox" class="hint">Every desk that can fill sends a firm quote, cheapest first. Pick one; the others are released when you accept.</div>
+          <div id="curve" class="hint"></div>
         </div>
       </div>
     </section>
@@ -199,6 +209,8 @@
         return "Accepted. Click Fund with faucet (the public faucet cannot pay the lock address).";
       if (s.status === "quoted" && s.side === "in" && s.faucet_txid)
         return "Test coins are in flight. The desk settles when the lock is visible (often the next block, ~5–10 min).";
+      if (s.status === "quoted" && s.side === "out" && !s.l1_lock_txid && s.lock_by_height)
+        return "Scheduled exit: the desk locks your bitcoin by block " + s.lock_by_height + ", batched with other exits. Send Tachi coins only after the lock is up.";
       if (s.status === "quoted" && s.side === "out" && !s.l1_lock_txid)
         return "Accept done. Desk is locking bitcoin first (same HTLC as inbound, roles reversed). Wait, then send Tachi coins.";
       if (s.status === "quoted" && s.side === "out" && s.l1_lock_txid)
@@ -278,9 +290,28 @@
 
     function breakdown(p) {
       if (!p) return "";
-      const s = `base ${feePct(p.base_ppm)} · inventory ${pct(p.skew_ppm)} · firm ${p.ttl_secs}s ${pct(p.ttl_ppm)}`;
+      let s = `base ${feePct(p.base_ppm)} · inventory ${pct(p.skew_ppm)} · firm ${p.ttl_secs}s ${pct(p.ttl_ppm)}`;
+      if (p.deadline_discount_ppm) s += ` · deadline ${pct(-p.deadline_discount_ppm)}`;
       return s + ` = <strong>${feePct(p.fee_ppm)}</strong>`;
     }
+
+    // Fee by deadline for each desk, so the urgency trade-off is visible.
+    async function refreshCurve() {
+      const side = $("side").value;
+      const amount = Number($("amount").value);
+      if (side !== "out" || !(amount >= 10000)) { $("curve").innerHTML = ""; return; }
+      try {
+        const rows = await j(`/v1/price-curve?side=out&amount_sats=${amount}`);
+        const marks = rows[0] ? rows[0].points.map(p => p.deadline_blocks) : [];
+        $("curve").innerHTML = "<p>Fee by deadline (blocks):</p><table><thead><tr><th>Desk</th>" +
+          marks.map(d => `<th>${d === 0 ? "now" : d}</th>`).join("") + "</tr></thead><tbody>" +
+          rows.map(r => `<tr><td>${r.lp_id}${r.can_fill ? "" : " (low stock)"}</td>` +
+            r.points.map(p => `<td>${sats(p.fee_sats)}</td>`).join("") + "</tr>").join("") +
+          "</tbody></table>";
+      } catch { $("curve").innerHTML = ""; }
+    }
+    $("side").onchange = refreshCurve;
+    $("amount").onchange = refreshCurve;
 
     let offers = [];
 
@@ -311,7 +342,7 @@
         <p class="hint">${breakdown(quote.pricing)}</p>
         <p class="ok">${quote.comparison || ""}</p>
         <p class="hint">${quote.hint || ""}</p>
-        <p>Price firm until ${quote.expires_at}</p>
+        <p>Price firm until ${quote.expires_at}${quote.lock_by_height ? " · bitcoin locked by block " + quote.lock_by_height : ""}</p>
         ${payHtml}`;
       document.querySelectorAll("input[name=offer]").forEach(r => {
         r.onchange = () => showQuote(offers[Number(r.dataset.i)]);
@@ -328,6 +359,7 @@
           user_refund_pubkey_hex: $("refundPk").value || null,
           user_l1_address: $("l1Dest").value || null,
           ttl_secs: Number($("ttl").value),
+          deadline_blocks: side === "out" ? Number($("deadline").value) : 0,
         };
         offers = await j("/v1/rfq", {
           method: "POST",
@@ -336,6 +368,7 @@
         });
         showQuote(offers[0]);
         await refreshBooks();
+        refreshCurve();
       } catch (e) {
         $("quoteBox").innerHTML = `<p class="warn">${e.message}</p>`;
       }

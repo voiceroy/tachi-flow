@@ -5,10 +5,14 @@ use actix_web::{FromRequest, HttpRequest, HttpResponse, get, post, web};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::engine::{Engine, HTLC_TIMEOUT_BLOCKS, PricingConfig, VAULT_EXIT_BLOCKS, parse_secret};
+use crate::engine::{
+    DEADLINE_PRESETS, Engine, HTLC_TIMEOUT_BLOCKS, PricingConfig, VAULT_EXIT_BLOCKS, parse_secret,
+};
 use crate::error::Error;
 use crate::htlc::{generate_keypair, p2wpkh_address};
-use crate::model::{CreateQuoteRequest, CreateSwapRequest, ObserveLockRequest, ObserveVtxoRequest};
+use crate::model::{
+    CreateQuoteRequest, CreateSwapRequest, ObserveLockRequest, ObserveVtxoRequest, Side,
+};
 use crate::tachi::Health;
 use crate::tachi_tx::xonly_from_secret;
 
@@ -52,6 +56,7 @@ struct Meta {
     vault_exit_blocks: u32,
     swap_timeout_blocks: u32,
     pricing: PricingConfig,
+    deadline_presets: [u32; 6],
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -61,6 +66,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(inventory)
         .service(create_quote)
         .service(rfq)
+        .service(price_curve)
         .service(open_swap)
         .service(list_swaps)
         .service(get_swap)
@@ -99,6 +105,7 @@ async fn meta(engine: web::Data<Engine>) -> HttpResponse {
         vault_exit_blocks: VAULT_EXIT_BLOCKS,
         swap_timeout_blocks: HTLC_TIMEOUT_BLOCKS,
         pricing: engine.pricing(),
+        deadline_presets: DEADLINE_PRESETS,
     })
 }
 
@@ -144,6 +151,18 @@ async fn rfq(
 ) -> Result<HttpResponse, Error> {
     let quotes = engine.request_quotes(body.into_inner()).await?;
     Ok(HttpResponse::Created().json(quotes))
+}
+
+#[derive(serde::Deserialize)]
+struct CurveQuery {
+    side: Side,
+    amount_sats: u64,
+}
+
+/// Fee by deadline per desk at current books. Reserves nothing.
+#[get("/v1/price-curve")]
+async fn price_curve(engine: web::Data<Engine>, q: web::Query<CurveQuery>) -> HttpResponse {
+    HttpResponse::Ok().json(engine.price_curve(q.side, q.amount_sats).await)
 }
 
 #[post("/v1/swaps")]
@@ -391,7 +410,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn rfq_route_returns_every_desk() {
+    async fn rfq_and_price_curve_routes() {
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(app_engine()))
@@ -406,11 +425,22 @@ mod tests {
                 "amount_sats": 10_000,
                 "user_l1_address": "bcrt1qtest",
                 "user_refund_pubkey_hex": user.public.to_string(),
+                "deadline_blocks": 144,
             }))
             .to_request();
         let quotes: Vec<serde_json::Value> = test::call_and_read_body_json(&app, req).await;
         assert_eq!(quotes.len(), 2, "both desks quote");
         assert!(quotes[0]["fee_sats"].as_u64() <= quotes[1]["fee_sats"].as_u64());
         assert_eq!(quotes[0]["rfq_id"], quotes[1]["rfq_id"]);
+
+        let req = test::TestRequest::get()
+            .uri("/v1/price-curve?side=out&amount_sats=100000")
+            .to_request();
+        let curve: Vec<serde_json::Value> = test::call_and_read_body_json(&app, req).await;
+        let points = curve[0]["points"].as_array().unwrap();
+        assert_eq!(points.len(), DEADLINE_PRESETS.len());
+        let first = points[0]["fee_ppm"].as_u64().unwrap();
+        let last = points[points.len() - 1]["fee_ppm"].as_u64().unwrap();
+        assert!(last < first, "waiting a vault exit must be cheaper: {first} -> {last}");
     }
 }

@@ -212,7 +212,31 @@ pub fn p2wpkh_send_hex(
     lp_secret: &SecretKey,
     network: Network,
 ) -> Result<String, Error> {
+    p2wpkh_send_many_hex(
+        inputs,
+        &[(dest.clone(), send_sats)],
+        fee_sats,
+        change,
+        lp_secret,
+        network,
+    )
+}
+
+/// Like [`p2wpkh_send_hex`] but pays several outputs in one tx (output order
+/// is preserved, so output `i` is `outputs[i]`; change goes last).
+pub fn p2wpkh_send_many_hex(
+    inputs: &[(OutPoint, u64)],
+    outputs: &[(Address, u64)],
+    fee_sats: u64,
+    change: &Address,
+    lp_secret: &SecretKey,
+    network: Network,
+) -> Result<String, Error> {
+    if outputs.is_empty() {
+        return Err(Error::Invalid("payment needs at least one output".into()));
+    }
     let total: u64 = inputs.iter().map(|(_, v)| *v).sum();
+    let send_sats: u64 = outputs.iter().map(|(_, v)| *v).sum();
     let need = send_sats.saturating_add(fee_sats);
     if total < need {
         return Err(Error::Invalid(format!(
@@ -225,10 +249,13 @@ pub fn p2wpkh_send_hex(
         bitcoin::CompressedPublicKey::try_from(lp_pub).map_err(|e| Error::Bitcoin(e.to_string()))?;
     let spk = bitcoin::Address::p2wpkh(&compressed, bitcoin::KnownHrp::from(network)).script_pubkey();
 
-    let mut outputs = vec![TxOut {
-        value: Amount::from_sat(send_sats),
-        script_pubkey: dest.script_pubkey(),
-    }];
+    let mut outputs: Vec<TxOut> = outputs
+        .iter()
+        .map(|(addr, sats)| TxOut {
+            value: Amount::from_sat(*sats),
+            script_pubkey: addr.script_pubkey(),
+        })
+        .collect();
     let change_sats = total - need;
     if change_sats > 0 {
         outputs.push(TxOut {
@@ -289,6 +316,36 @@ mod tests {
         let s = addr.to_string();
         assert!(s.starts_with("tb1"), "{s}");
         assert_eq!(addr.address_type(), Some(bitcoin::AddressType::P2wsh));
+    }
+
+    #[test]
+    fn batched_send_keeps_output_order() {
+        let lp = generate_keypair();
+        let change = p2wpkh_address(&lp.secret, Network::Regtest);
+        let a = p2wpkh_address(&generate_keypair().secret, Network::Regtest);
+        let b = p2wpkh_address(&generate_keypair().secret, Network::Regtest);
+        let input = (
+            OutPoint {
+                txid: parse_txid(&"cd".repeat(32)).unwrap(),
+                vout: 1,
+            },
+            100_000,
+        );
+        let hex = p2wpkh_send_many_hex(
+            &[input],
+            &[(a.clone(), 20_000), (b.clone(), 30_000)],
+            500,
+            &change,
+            &lp.secret,
+            Network::Regtest,
+        )
+        .unwrap();
+        let tx: Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&hex).unwrap()).unwrap();
+        assert_eq!(tx.output.len(), 3);
+        assert_eq!(tx.output[0].script_pubkey, a.script_pubkey());
+        assert_eq!(tx.output[1].script_pubkey, b.script_pubkey());
+        assert_eq!(tx.output[2].value, Amount::from_sat(100_000 - 50_000 - 500));
     }
 
     #[test]

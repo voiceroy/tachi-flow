@@ -31,10 +31,11 @@ Swaps survive `cargo run` restarts (`tachi-flow-state.json`, gitignored). Empty 
 
 A TAURUS vault has one exit: the whole deposit, after a fixed ~1008-block CSV, at no fee. The desks turn that wait into a priced market:
 
-- **Inventory-skew pricing.** Each desk's fee moves with its books. A swap that drains a desk's scarce side costs more; one that refills it costs less. The skew is averaged over the swap's before/after effect on the desk's VTXO share, so big swaps pay for their own impact. Every quote carries a `pricing` breakdown (base, inventory, firm-quote cost).
+- **Inventory-skew pricing.** Each desk's fee moves with its books. A swap that drains a desk's scarce side costs more; one that refills it costs less. The skew is averaged over the swap's before/after effect on the desk's VTXO share, so big swaps pay for their own impact. Every quote carries a `pricing` breakdown (base, inventory, firm-quote cost, deadline discount).
 - **RFQ with firm, expiring quotes.** `POST /v1/rfq` returns a firm quote from every desk that can fill, cheapest first. Each one reserves stock until it expires (`ttl_secs`, 30 s–1 h; holding a price longer costs more). Accepting one releases the rest.
+- **Pick your deadline (outbound).** `deadline_blocks` (0–1008) says how long the desk may wait before locking your bitcoin. Later is cheaper, down to 80% off at a full vault-exit wait. Locks that come due together are funded in one L1 tx per desk, which is where the desk saves. `GET /v1/price-curve` shows fee by deadline for each desk.
 
-Defaults (ppm): skew ±10,000 at full imbalance, 3,000/hour of quote TTL, fee floor 500, cap 50,000 (`PricingConfig`).
+Defaults (ppm): skew ±10,000 at full imbalance, 3,000/hour of quote TTL, 80% max deadline discount, fee floor 500, cap 50,000 (`PricingConfig`).
 
 ## Run tests
 
@@ -58,8 +59,9 @@ LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `
 ## API
 
 - `GET /` — UI
-- `POST /v1/rfq` — firm quotes from every desk; body like `/v1/quotes` plus optional `ttl_secs`
+- `POST /v1/rfq` — firm quotes from every desk; body like `/v1/quotes` plus optional `ttl_secs`, `deadline_blocks`
 - `POST /v1/quotes` — best single quote (same body)
+- `GET /v1/price-curve?side=out&amount_sats=…` — fee by deadline per desk (reserves nothing)
 - `POST /v1/swaps` · `POST /v1/sync` · `POST /v1/swaps/{id}/sync`
 - `POST /v1/swaps/{id}/fund` — faucet helper for inbound
 - `POST /v1/swaps/{id}/pay-vtxo` — `{ "secret_hex": "..." }` for outbound from the demo key (idempotent)

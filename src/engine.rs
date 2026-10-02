@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::error::Error;
 use crate::htlc::{
-    claim_tx_hex, generate_keypair, p2wpkh_address, p2wpkh_send_hex, p2wsh_address, parse_txid,
+    claim_tx_hex, generate_keypair, p2wpkh_address, p2wpkh_send_hex, p2wpkh_send_many_hex,
+    p2wsh_address, parse_txid,
     payment_hash, pubkey_from_hex, random_preimage, redeem_script, refund_tx_hex, txid_of_hex,
 };
 use crate::model::{
@@ -34,6 +35,11 @@ const MIN_FEE_SATS: u64 = 200;
 const DEFAULT_QUOTE_TTL_SECS: u64 = 10 * 60;
 const MIN_QUOTE_TTL_SECS: u64 = 30;
 const MAX_QUOTE_TTL_SECS: u64 = 60 * 60;
+/// A deadline lock is funded once the tip is this close to its deadline, so
+/// locks that come due together share one L1 tx.
+const LOCK_LEAD_BLOCKS: u32 = 3;
+/// Deadlines shown on the price curve.
+pub const DEADLINE_PRESETS: [u32; 6] = [0, 6, 36, 144, 432, 1008];
 pub const HTLC_TIMEOUT_BLOCKS: u32 = 144;
 /// Stop settling this many blocks before an HTLC times out, so a claim has
 /// time to confirm before the other side can take the refund path.
@@ -51,6 +57,8 @@ pub struct PricingConfig {
     pub skew_ppm: u64,
     /// Cost of holding a price firm, per hour of quote TTL.
     pub ttl_ppm_per_hour: u64,
+    /// Share of the fee waived at a full 1008-block (vault-exit) deadline.
+    pub max_deadline_discount_ppm: u64,
     pub min_fee_ppm: u64,
     pub max_fee_ppm: u64,
 }
@@ -60,6 +68,7 @@ impl Default for PricingConfig {
         Self {
             skew_ppm: 10_000,
             ttl_ppm_per_hour: 3_000,
+            max_deadline_discount_ppm: 800_000,
             min_fee_ppm: 500,
             max_fee_ppm: 50_000,
         }
@@ -72,6 +81,7 @@ impl PricingConfig {
         Self {
             skew_ppm: 0,
             ttl_ppm_per_hour: 0,
+            max_deadline_discount_ppm: 0,
             min_fee_ppm: 0,
             max_fee_ppm: u64::MAX / 2,
         }
@@ -141,8 +151,10 @@ struct BuiltTransfer {
 /// A validated quote request, with timeouts fixed against the current tip.
 struct QuoteTerms {
     ttl_secs: u64,
+    deadline: u32,
     user_pk: Option<PublicKey>,
     timeout_height: u32,
+    lock_by_height: Option<u32>,
 }
 
 /// One desk's priced quote for a request.
@@ -632,6 +644,35 @@ impl Engine {
         self.quote_desks(req, true).await
     }
 
+    /// Fee by deadline for each desk at its current books. Reserves nothing.
+    pub async fn price_curve(&self, side: Side, amount_sats: u64) -> Vec<serde_json::Value> {
+        let inner = self.inner.read().await;
+        inner
+            .lps
+            .iter()
+            .filter(|lp| !lp.defaulted)
+            .map(|lp| {
+                let points: Vec<_> = DEADLINE_PRESETS
+                    .iter()
+                    .filter(|&&d| side == Side::Out || d == 0)
+                    .map(|&d| {
+                        let p = price(&self.pricing, lp, side, amount_sats, DEFAULT_QUOTE_TTL_SECS, d);
+                        serde_json::json!({
+                            "deadline_blocks": d,
+                            "fee_ppm": p.fee_ppm,
+                            "fee_sats": fee_sats(amount_sats, p.fee_ppm, MIN_FEE_SATS),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "lp_id": lp.id,
+                    "can_fill": can_fill(lp, side, amount_sats),
+                    "points": points,
+                })
+            })
+            .collect()
+    }
+
     async fn quote_desks(&self, req: CreateQuoteRequest, all: bool) -> Result<Vec<Quote>, Error> {
         if req.amount_sats < MIN_SWAP_SATS {
             return Err(Error::AmountTooSmall(MIN_SWAP_SATS));
@@ -650,7 +691,7 @@ impl Engine {
             .iter()
             .filter(|lp| can_fill(lp, req.side, req.amount_sats))
             .map(|lp| {
-                let p = price(&self.pricing, lp, req.side, req.amount_sats, terms.ttl_secs);
+                let p = price(&self.pricing, lp, req.side, req.amount_sats, terms.ttl_secs, terms.deadline);
                 (lp.clone(), p, fee_sats(req.amount_sats, p.fee_ppm, MIN_FEE_SATS))
             })
             .collect();
@@ -694,6 +735,17 @@ impl Engine {
             return Err(Error::Invalid(format!(
                 "ttl_secs must be {MIN_QUOTE_TTL_SECS}..={MAX_QUOTE_TTL_SECS}"
             )));
+        }
+        let deadline = req.deadline_blocks.unwrap_or(0);
+        if deadline > VAULT_EXIT_BLOCKS {
+            return Err(Error::Invalid(format!(
+                "deadline_blocks must be at most {VAULT_EXIT_BLOCKS} (a vault exit)"
+            )));
+        }
+        if deadline > 0 && req.side == Side::In {
+            return Err(Error::Invalid(
+                "deadline_blocks applies to out swaps (when the desk locks bitcoin for you)".into(),
+            ));
         }
 
         if !self.test_mode {
@@ -739,11 +791,15 @@ impl Engine {
 
         // Quotes use the cached height (refreshed by the ticker). On a live
         // chain we fetch it once if we have never seen it, rather than guess.
+        // A deadline pushes the timeout out so the desk's refund window still
+        // starts after the latest lock.
         let height = self.known_height().await?;
         Ok(QuoteTerms {
             ttl_secs,
+            deadline,
             user_pk,
-            timeout_height: height + HTLC_TIMEOUT_BLOCKS,
+            timeout_height: height + deadline + HTLC_TIMEOUT_BLOCKS,
+            lock_by_height: (deadline > 0).then_some(height + deadline),
         })
     }
 
@@ -776,13 +832,14 @@ impl Engine {
             user_tachi_address: req.user_tachi_address.clone(),
             user_l1_address: req.user_l1_address.clone(),
             pay,
-            hint: Some(quote_hint(req.side)),
+            hint: Some(quote_hint(req.side, terms.lock_by_height)),
             vault_exit_blocks: VAULT_EXIT_BLOCKS,
             swap_timeout_blocks: HTLC_TIMEOUT_BLOCKS,
-            comparison: Some(quote_comparison(leg.fee_sats, &leg.pricing)),
+            comparison: Some(quote_comparison(leg.fee_sats, &leg.pricing, terms.lock_by_height)),
             user_pubkey_hex: terms.user_pk.map(|p| p.to_string()),
             pricing: Some(leg.pricing),
             rfq_id: leg.rfq_id,
+            lock_by_height: terms.lock_by_height,
         };
         debit_lp(
             &mut inner.lps,
@@ -903,6 +960,8 @@ impl Engine {
             user_pubkey_hex: quote.user_pubkey_hex.clone(),
             refund_txid: None,
             preimage_hex: None,
+            lock_by_height: quote.lock_by_height,
+            l1_lock_vout: None,
         };
 
         if let Some(preimage) = inner.preimages.remove(&quote.id) {
@@ -921,6 +980,14 @@ impl Engine {
                     self.inner.write().await.baseline_vtxos.insert(swap_id, ids);
                 }
                 Err(err) => tracing::warn!(%err, %swap_id, "outbound baseline"),
+            }
+            if let Some(by) = quote.lock_by_height {
+                self.update_swap(swap_id, |s| {
+                    s.demo_note = Some(format!(
+                        "The desk locks bitcoin for you by block {by}, batched with other exits. Send Tachi coins only after the lock is up."
+                    ));
+                })
+                .await?;
             }
             if let Err(err) = self.fund_outbound_lock(swap_id).await {
                 tracing::warn!(%err, %swap_id, "outbound LP lock");
@@ -956,35 +1023,111 @@ impl Engine {
                         lock.timeout_height
                     )));
                 }
+                if !lock_due(&swap, h) {
+                    return Ok(swap);
+                }
             }
             // The user already paid; the desk owes this lock regardless.
             SwapStatus::LpSettled => {}
             _ => return Ok(swap),
         }
+        let lp_id = swap.lp_id.clone();
+        self.lock_batch(&lp_id, vec![swap]).await?;
+        self.get_swap(id).await
+    }
 
-        let fund = swap.receive_sats + CLAIM_FEE_SATS;
-        let (hex, inputs) = self
-            .sign_l1_payment(&swap.lp_id, &lock.address, fund)
-            .await?;
+    /// Fund several outbound locks from one desk in a single L1 tx. Callers
+    /// hold every swap's lock. Output `i` is swap `i`'s HTLC.
+    async fn lock_batch(&self, lp_id: &str, swaps: Vec<Swap>) -> Result<(), Error> {
+        let mut outputs = Vec::with_capacity(swaps.len());
+        for swap in &swaps {
+            let lock = swap
+                .pay
+                .htlc()
+                .ok_or_else(|| Error::Invalid(format!("swap {} has no lock", swap.id)))?;
+            outputs.push((lock.address, swap.receive_sats + CLAIM_FEE_SATS));
+        }
+        let (hex, inputs) = self.sign_l1_payment(lp_id, &outputs).await?;
         let txid = txid_of_hex(&hex)?.to_string();
-        self.inner.write().await.pending_locks.insert(id, hex.clone());
-        let mut swap = self
-            .update_swap(id, |s| {
+        let n = swaps.len();
+        {
+            let mut inner = self.inner.write().await;
+            for swap in &swaps {
+                inner.pending_locks.insert(swap.id, hex.clone());
+            }
+        }
+        for (vout, swap) in swaps.iter().enumerate() {
+            let txid = txid.clone();
+            self.update_swap(swap.id, |s| {
                 s.l1_lock_txid = Some(txid);
-                s.demo_note = Some(format!(
-                    "Desk locked bitcoin first (HTLC). Send VTXOs only after this. Vault exit would be {VAULT_EXIT_BLOCKS} blocks."
-                ));
+                s.l1_lock_vout = Some(vout as u32);
+                s.demo_note = Some(if n > 1 {
+                    format!("Desk locked bitcoin first (HTLC), batched with {} other exits in one tx. Send VTXOs only after this.", n - 1)
+                } else {
+                    format!("Desk locked bitcoin first (HTLC). Send VTXOs only after this. Vault exit would be {VAULT_EXIT_BLOCKS} blocks.")
+                });
             })
             .await?;
+        }
         match self.broadcast_l1(&hex).await {
-            Ok(_) => {}
+            Ok(_) => {
+                tracing::info!(%txid, locks = n, lp = lp_id, "outbound locks funded");
+                Ok(())
+            }
             Err(Error::TachiRejected(why)) => {
-                swap = self.drop_outbound_lock(id, &swap.lp_id, &inputs, &why).await?;
+                for swap in &swaps {
+                    self.drop_outbound_lock(swap.id, lp_id, &inputs, &why).await?;
+                }
+                Err(Error::TachiRejected(why))
             }
             // Unknown outcome: keep the signed tx; sync re-sends it.
-            Err(err) => tracing::warn!(%err, %id, "outbound lock broadcast"),
+            Err(err) => {
+                tracing::warn!(%err, %txid, "outbound lock broadcast");
+                Ok(())
+            }
         }
-        Ok(swap)
+    }
+
+    /// Batch every outbound lock that has come due, one L1 tx per desk.
+    async fn fund_due_outbound_locks(&self) {
+        let Ok(h) = self.known_height().await else {
+            return;
+        };
+        let due: Vec<Swap> = self
+            .inner
+            .read()
+            .await
+            .swaps
+            .values()
+            .filter(|s| awaiting_lock(s, h))
+            .cloned()
+            .collect();
+        let mut by_lp: std::collections::BTreeMap<String, Vec<Uuid>> = Default::default();
+        for s in due {
+            by_lp.entry(s.lp_id).or_default().push(s.id);
+        }
+        for (lp_id, ids) in by_lp {
+            let mut guards = Vec::new();
+            let mut batch = Vec::new();
+            for id in ids {
+                // Skip swaps someone else is working on; re-check under the lock.
+                let Ok(guard) = self.swap_mutex(id).try_lock_owned() else {
+                    continue;
+                };
+                if let Ok(s) = self.get_swap(id).await
+                    && awaiting_lock(&s, h)
+                {
+                    guards.push(guard);
+                    batch.push(s);
+                }
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            if let Err(err) = self.lock_batch(&lp_id, batch).await {
+                tracing::warn!(%err, lp = %lp_id, "batched outbound locks");
+            }
+        }
     }
 
     /// Re-send a signed outbound lock until bitcoind shows it.
@@ -1027,6 +1170,7 @@ impl Engine {
         self.inner.write().await.pending_locks.remove(&id);
         self.update_swap(id, |s| {
             s.l1_lock_txid = None;
+            s.l1_lock_vout = None;
             s.demo_note = Some(format!(
                 "Desk lock was rejected by bitcoind ({why}). Retrying. Do not send Tachi coins yet."
             ));
@@ -1997,6 +2141,9 @@ impl Engine {
         if released {
             self.save_state().await;
         }
+        if !self.test_mode {
+            self.fund_due_outbound_locks().await;
+        }
         let ids: Vec<Uuid> = self
             .inner
             .read()
@@ -2086,7 +2233,11 @@ impl Engine {
         };
         // Mempool-aware first, so a just-broadcast lock counts.
         if let Some(txid) = swap.l1_lock_txid.as_deref() {
-            for vout in 0..2u32 {
+            let vouts = match swap.l1_lock_vout {
+                Some(v) => v..v + 1,
+                None => 0..2,
+            };
+            for vout in vouts {
                 if let Ok(Some(u)) = self.tachi.get_tx_out(txid, vout).await
                     && u.value_sats >= need
                 {
@@ -2160,14 +2311,22 @@ impl Engine {
     async fn sign_l1_payment(
         &self,
         lp_id: &str,
-        dest: &str,
-        amount_sats: u64,
+        outputs: &[(String, u64)],
     ) -> Result<(String, Vec<OutPoint>), Error> {
-        let dest = dest
-            .parse::<Address<bitcoin::address::NetworkUnchecked>>()
-            .map_err(|_| Error::Invalid(format!("{dest} is not a bitcoin address")))?
-            .require_network(self.network)
-            .map_err(|e| Error::Invalid(format!("{dest} must be a {} address: {e}", self.network)))?;
+        let outputs = outputs
+            .iter()
+            .map(|(dest, sats)| {
+                let addr = dest
+                    .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+                    .map_err(|_| Error::Invalid(format!("{dest} is not a bitcoin address")))?
+                    .require_network(self.network)
+                    .map_err(|e| {
+                        Error::Invalid(format!("{dest} must be a {} address: {e}", self.network))
+                    })?;
+                Ok((addr, *sats))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let amount_sats: u64 = outputs.iter().map(|(_, v)| *v).sum();
         let mut spend = self.lp_spend(lp_id).await?;
         let w = self.lp_wallet(lp_id)?;
         let mut utxos = self.tachi.scan_address(&w.claim_address.to_string()).await?;
@@ -2189,10 +2348,10 @@ impl Engine {
                 break;
             }
         }
-        let hex = p2wpkh_send_hex(
+        // One fee for the whole tx: batching is where deadline swaps save.
+        let hex = p2wpkh_send_many_hex(
             &picked,
-            &dest,
-            amount_sats,
+            &outputs,
             CLAIM_FEE_SATS,
             &w.claim_address,
             &w.secret,
@@ -2375,13 +2534,16 @@ fn lp(
 /// Price one desk's quote. Starts from the desk's base fee, then:
 /// - skew: averaged over the swap's before/after effect on the desk's VTXO
 ///   share, so draining the scarce side costs more and refilling it is cheaper;
-/// - TTL: holding a price firm longer costs more.
+/// - TTL: holding a price firm longer costs more;
+/// - deadline: letting the desk lock bitcoin later earns a discount that
+///   reaches `max_deadline_discount_ppm` at a full vault-exit wait.
 pub fn price(
     cfg: &PricingConfig,
     lp: &LiquidityProvider,
     side: Side,
     amount_sats: u64,
     ttl_secs: u64,
+    deadline_blocks: u32,
 ) -> PriceBreakdown {
     const HALF: i128 = 500_000;
     let (v, l, a) = (
@@ -2406,15 +2568,20 @@ pub fn price(
     let skew = cfg.skew_ppm as i128 * imbalance / HALF;
     let ttl = cfg.ttl_ppm_per_hour as i128 * ttl_secs as i128 / 3600;
     let subtotal = lp.fee_ppm as i128 + skew + ttl;
-    let fee = subtotal.clamp(cfg.min_fee_ppm as i128, cfg.max_fee_ppm as i128);
+    let d = deadline_blocks.min(VAULT_EXIT_BLOCKS) as i128;
+    let discount = subtotal.max(0) * cfg.max_deadline_discount_ppm as i128 / 1_000_000 * d
+        / VAULT_EXIT_BLOCKS as i128;
+    let fee = (subtotal - discount).clamp(cfg.min_fee_ppm as i128, cfg.max_fee_ppm as i128);
     PriceBreakdown {
         base_ppm: lp.fee_ppm,
         skew_ppm: skew as i64,
         ttl_ppm: ttl as i64,
+        deadline_discount_ppm: discount as i64,
         fee_ppm: fee as u64,
         vtxo_share_before_ppm: before as u64,
         vtxo_share_after_ppm: after as u64,
         ttl_secs,
+        deadline_blocks,
     }
 }
 
@@ -2432,28 +2599,60 @@ fn can_fill(lp: &LiquidityProvider, side: Side, amount_sats: u64) -> bool {
         && book(lp, side) >= reserve_sats(side, amount_sats)
 }
 
-fn quote_hint(side: Side) -> String {
+/// Whether an outbound lock should be funded at `height` (deadline swaps wait
+/// until close to their deadline so locks due together share a tx).
+fn lock_due(swap: &Swap, height: u32) -> bool {
+    swap.lock_by_height
+        .is_none_or(|by| height + LOCK_LEAD_BLOCKS >= by)
+}
+
+/// Unpaid outbound swap whose lock is due and not yet signed.
+fn awaiting_lock(s: &Swap, height: u32) -> bool {
+    s.side == Side::Out
+        && s.status == SwapStatus::Quoted
+        && s.l1_lock_txid.is_none()
+        && lock_due(s, height)
+        && s
+            .pay
+            .htlc()
+            .is_some_and(|l| height + SAFETY_MARGIN_BLOCKS < l.timeout_height)
+}
+
+fn quote_hint(side: Side, lock_by_height: Option<u32>) -> String {
     let blocks = HTLC_TIMEOUT_BLOCKS;
-    match side {
-        Side::In => format!(
+    match (side, lock_by_height) {
+        (Side::In, _) => format!(
             "Swap vs vault: pay a lock now (~{blocks} blocks to refund if the desk stalls) instead of a TAURUS unilateral exit (~{VAULT_EXIT_BLOCKS} blocks, about a week). The Tachi faucet cannot pay the lock — use Fund with faucet."
         ),
-        Side::Out => format!(
+        (Side::Out, None) => format!(
             "Swap vs vault: the desk locks bitcoin first (~{blocks}-block refund for them). You send Tachi coins only after that lock is up, then you claim. A vault exit would be ~{VAULT_EXIT_BLOCKS} blocks."
+        ),
+        (Side::Out, Some(by)) => format!(
+            "Scheduled exit: the desk locks bitcoin for you by block {by} (batched with other exits, so it costs less). You send Tachi coins only after that lock is up, then you claim. A vault exit would be ~{VAULT_EXIT_BLOCKS} blocks."
         ),
     }
 }
 
-fn quote_comparison(fee: u64, p: &PriceBreakdown) -> String {
+fn quote_comparison(fee: u64, p: &PriceBreakdown, lock_by_height: Option<u32>) -> String {
     let pct = |ppm: i64| format!("{:+.2}%", ppm as f64 / 10_000.0);
-    format!(
-        "This swap: fee {fee} sats ({:.2}% = base {:.2}%, inventory {}, firm {}s {}), refund window {HTLC_TIMEOUT_BLOCKS} blocks. TAURUS vault exit: {VAULT_EXIT_BLOCKS} blocks (~7 days) and no LP fee.",
+    let mut out = format!(
+        "This swap: fee {fee} sats ({:.2}% = base {:.2}%, inventory {}, firm {}s {}",
         p.fee_ppm as f64 / 10_000.0,
         p.base_ppm as f64 / 10_000.0,
         pct(p.skew_ppm),
         p.ttl_secs,
         pct(p.ttl_ppm),
-    )
+    );
+    if p.deadline_discount_ppm > 0 {
+        out.push_str(&format!(", deadline {}", pct(-p.deadline_discount_ppm)));
+    }
+    out.push_str(&format!(
+        "), refund window {HTLC_TIMEOUT_BLOCKS} blocks. TAURUS vault exit: {VAULT_EXIT_BLOCKS} blocks (~7 days) and no LP fee."
+    ));
+    if let Some(by) = lock_by_height {
+        out.push_str(&format!(" Bitcoin locked for you by block {by}."));
+    }
+    out
 }
 
 fn debit_lp(lps: &mut [LiquidityProvider], id: &str, side: Side, amount: u64) -> Result<(), Error> {
@@ -2536,6 +2735,7 @@ mod tests {
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .expect("quote");
@@ -2554,6 +2754,7 @@ mod tests {
                 user_l1_address: Some("tb1qtest".into()),
                 user_refund_pubkey_hex: None,
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .expect("quote");
@@ -2574,6 +2775,7 @@ mod tests {
                 user_l1_address: Some("tb1qtest".into()),
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .expect("quote");
@@ -2599,6 +2801,7 @@ mod tests {
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .unwrap();
@@ -2619,6 +2822,7 @@ mod tests {
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .unwrap();
@@ -2699,6 +2903,7 @@ mod tests {
                         user_l1_address: None,
                         user_refund_pubkey_hex: Some(pk),
                         ttl_secs: None,
+                        deadline_blocks: None,
                     })
                     .await?;
                 let swap = e.open_swap(q.id).await?;
@@ -2754,6 +2959,7 @@ mod tests {
                         user_l1_address: Some("tb1qtest".into()),
                         user_refund_pubkey_hex: None,
                         ttl_secs: None,
+                        deadline_blocks: None,
                     })
                     .await?;
                 let swap = e.open_swap(q.id).await?;
@@ -2805,6 +3011,7 @@ mod tests {
                     user_l1_address: Some("tb1qtest".into()),
                     user_refund_pubkey_hex: None,
                     ttl_secs: None,
+                    deadline_blocks: None,
                 })
                 .await
             }));
@@ -2843,6 +3050,7 @@ mod tests {
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .unwrap();
@@ -2879,6 +3087,7 @@ mod tests {
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .unwrap();
@@ -2947,6 +3156,7 @@ mod tests {
                     user_l1_address: None,
                     user_refund_pubkey_hex: Some(pk),
                     ttl_secs: None,
+                    deadline_blocks: None,
                 })
                 .await
             }));
@@ -2993,6 +3203,7 @@ mod tests {
                     user_l1_address: None,
                     user_refund_pubkey_hex: Some(user.public.to_string()),
                     ttl_secs: None,
+                    deadline_blocks: None,
                 })
                 .await
                 .unwrap();
@@ -3029,6 +3240,7 @@ mod tests {
                     user_l1_address: Some("tb1qtest".into()),
                     user_refund_pubkey_hex: None,
                     ttl_secs: None,
+                    deadline_blocks: None,
                 })
                 .await
             }));
@@ -3062,6 +3274,7 @@ mod tests {
             user_l1_address: None,
             user_refund_pubkey_hex: Some(user.public.to_string()),
             ttl_secs: None,
+            deadline_blocks: None,
         })
         .await
         .expect("quote");
@@ -3085,6 +3298,7 @@ mod tests {
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .expect_err("height unknown");
@@ -3102,6 +3316,7 @@ mod tests {
             user_l1_address: None,
             user_refund_pubkey_hex: Some(user.public.to_string()),
             ttl_secs: None,
+            deadline_blocks: None,
         })
         .await
         .unwrap();
@@ -3112,6 +3327,7 @@ mod tests {
             user_l1_address: Some("tb1qtest".into()),
             user_refund_pubkey_hex: None,
             ttl_secs: None,
+            deadline_blocks: None,
         })
         .await
         .unwrap();
@@ -3138,6 +3354,7 @@ mod tests {
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .unwrap();
@@ -3165,6 +3382,7 @@ mod tests {
                     user_l1_address: Some("tb1qtest".into()),
                     user_refund_pubkey_hex: Some(user.public.to_string()),
                     ttl_secs: None,
+                    deadline_blocks: None,
                 })
                 .await
                 .unwrap();
@@ -3201,6 +3419,7 @@ mod tests {
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: None,
+                deadline_blocks: None,
             })
             .await
             .unwrap();
@@ -3236,8 +3455,8 @@ mod tests {
     fn skew_charges_for_draining_the_scarce_side() {
         let cfg = PricingConfig::default();
         let vtxo_rich = desk(1_800_000, 200_000);
-        let sell_vtxo = price(&cfg, &vtxo_rich, Side::In, 100_000, 600);
-        let buy_vtxo = price(&cfg, &vtxo_rich, Side::Out, 100_000, 600);
+        let sell_vtxo = price(&cfg, &vtxo_rich, Side::In, 100_000, 600, 0);
+        let buy_vtxo = price(&cfg, &vtxo_rich, Side::Out, 100_000, 600, 0);
         assert!(sell_vtxo.skew_ppm < 0, "{sell_vtxo:?}");
         assert!(buy_vtxo.skew_ppm > 0, "{buy_vtxo:?}");
         assert!(sell_vtxo.fee_ppm < buy_vtxo.fee_ppm);
@@ -3246,22 +3465,31 @@ mod tests {
 
         // From balance, either direction moves away from it and costs a little.
         let balanced = desk(1_000_000, 1_000_000);
-        assert!(price(&cfg, &balanced, Side::In, 100_000, 600).skew_ppm > 0);
-        assert!(price(&cfg, &balanced, Side::Out, 100_000, 600).skew_ppm > 0);
+        assert!(price(&cfg, &balanced, Side::In, 100_000, 600, 0).skew_ppm > 0);
+        assert!(price(&cfg, &balanced, Side::Out, 100_000, 600, 0).skew_ppm > 0);
     }
 
     #[test]
-    fn longer_firm_quotes_cost_more() {
+    fn longer_firm_quotes_cost_more_and_deadlines_cost_less() {
         let cfg = PricingConfig::default();
         let d = desk(1_000_000, 1_000_000);
-        let short = price(&cfg, &d, Side::Out, 100_000, 60);
-        let long = price(&cfg, &d, Side::Out, 100_000, 3_600);
+        let short = price(&cfg, &d, Side::Out, 100_000, 60, 0);
+        let long = price(&cfg, &d, Side::Out, 100_000, 3_600, 0);
         assert_eq!(long.ttl_ppm, 3_000);
         assert!(long.fee_ppm > short.fee_ppm);
-        // Never below the floor, however favourable the skew.
-        let cheap = LiquidityProvider { fee_ppm: 0, ..desk(1_800_000, 200_000) };
+
+        let fees: Vec<u64> = DEADLINE_PRESETS
+            .iter()
+            .map(|&dl| price(&cfg, &d, Side::Out, 100_000, 600, dl).fee_ppm)
+            .collect();
+        assert!(fees.windows(2).all(|w| w[1] <= w[0]), "{fees:?}");
+        let vault_wait = price(&cfg, &d, Side::Out, 100_000, 600, VAULT_EXIT_BLOCKS);
+        let subtotal = vault_wait.base_ppm as i64 + vault_wait.skew_ppm + vault_wait.ttl_ppm;
+        assert_eq!(vault_wait.deadline_discount_ppm, subtotal * 8 / 10);
+        // Never below the floor, whatever the discount.
+        let cheap = LiquidityProvider { fee_ppm: 0, ..d };
         assert_eq!(
-            price(&cfg, &cheap, Side::In, 100_000, 60).fee_ppm,
+            price(&cfg, &cheap, Side::Out, 100_000, 600, VAULT_EXIT_BLOCKS).fee_ppm,
             cfg.min_fee_ppm
         );
     }
@@ -3269,7 +3497,7 @@ mod tests {
     #[test]
     fn flat_pricing_is_the_base_fee() {
         let d = desk(1_800_000, 200_000);
-        let p = price(&PricingConfig::flat(), &d, Side::Out, 100_000, 3_600);
+        let p = price(&PricingConfig::flat(), &d, Side::Out, 100_000, 3_600, 1008);
         assert_eq!(p.fee_ppm, 8_000);
     }
 
@@ -3285,6 +3513,7 @@ mod tests {
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
                 ttl_secs: Some(120),
+                deadline_blocks: None,
             })
             .await
             .unwrap();
@@ -3309,5 +3538,47 @@ mod tests {
         assert_eq!(bravo_book(&e.inventory().await), 5_000_000);
         let err = e.open_swap(quotes[1].id).await.expect_err("sibling released");
         assert!(matches!(err, Error::QuoteNotFound));
+    }
+
+    #[tokio::test]
+    async fn deadline_quotes_schedule_the_lock_and_cost_less() {
+        let e = priced_engine();
+        let user = generate_keypair();
+        let req = |deadline| CreateQuoteRequest {
+            side: Side::Out,
+            amount_sats: 100_000,
+            user_tachi_address: None,
+            user_l1_address: Some("tb1qtest".into()),
+            user_refund_pubkey_hex: Some(user.public.to_string()),
+            ttl_secs: None,
+            deadline_blocks: Some(deadline),
+        };
+        let now = e.create_quote(req(0)).await.unwrap();
+        let later = e.create_quote(req(144)).await.unwrap();
+        assert_eq!(now.lock_by_height, None);
+        assert_eq!(later.lock_by_height, Some(SIM_HEIGHT + 144));
+        assert!(later.fee_sats < now.fee_sats, "{} !< {}", later.fee_sats, now.fee_sats);
+        let timeout = later.pay.htlc().unwrap().timeout_height;
+        assert_eq!(timeout, SIM_HEIGHT + 144 + HTLC_TIMEOUT_BLOCKS);
+
+        let swap = e.open_swap(later.id).await.unwrap();
+        let by = SIM_HEIGHT + 144;
+        assert!(!lock_due(&swap, by - LOCK_LEAD_BLOCKS - 1));
+        assert!(lock_due(&swap, by - LOCK_LEAD_BLOCKS));
+        assert!(awaiting_lock(&swap, by));
+        assert!(!awaiting_lock(&swap, timeout - SAFETY_MARGIN_BLOCKS));
+
+        let err = e
+            .create_quote(CreateQuoteRequest {
+                side: Side::In,
+                user_tachi_address: Some("tb1ptest".into()),
+                user_l1_address: None,
+                ..req(6)
+            })
+            .await
+            .expect_err("deadline is outbound only");
+        assert!(err.to_string().contains("out swaps"), "{err}");
+        let err = e.create_quote(req(VAULT_EXIT_BLOCKS + 1)).await.expect_err("cap");
+        assert!(err.to_string().contains("at most"), "{err}");
     }
 }

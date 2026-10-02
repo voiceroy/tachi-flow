@@ -76,6 +76,9 @@ pub struct Quote {
     /// Set when this quote came from an RFQ. Accepting one releases the rest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rfq_id: Option<Uuid>,
+    /// Outbound with a deadline: the desk locks bitcoin by this height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_by_height: Option<u32>,
 }
 
 /// How a quote's fee was built. All figures are parts per million of the amount,
@@ -87,10 +90,13 @@ pub struct PriceBreakdown {
     pub skew_ppm: i64,
     /// Cost of holding the price firm for the quote's TTL.
     pub ttl_ppm: i64,
+    /// Discount for letting the desk lock bitcoin later (outbound deadline).
+    pub deadline_discount_ppm: i64,
     pub fee_ppm: u64,
     pub vtxo_share_before_ppm: u64,
     pub vtxo_share_after_ppm: u64,
     pub ttl_secs: u64,
+    pub deadline_blocks: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +180,12 @@ pub struct Swap {
     /// desk's lock with any wallet, not only through this server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preimage_hex: Option<String>,
+    /// Outbound with a deadline: the desk locks bitcoin by this height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_by_height: Option<u32>,
+    /// Output index of the desk's lock (batched locks share one tx).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_lock_vout: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +200,10 @@ pub struct CreateQuoteRequest {
     /// How long the price stays firm (30..=3600 s, default 600). Longer costs more.
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+    /// Outbound only: blocks the desk may wait before locking bitcoin for you
+    /// (0..=1008, default 0). Later is cheaper; 1008 matches a vault exit.
+    #[serde(default)]
+    pub deadline_blocks: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
