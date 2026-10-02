@@ -5,7 +5,7 @@ use actix_web::{FromRequest, HttpRequest, HttpResponse, get, post, web};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::engine::{Engine, HTLC_TIMEOUT_BLOCKS, VAULT_EXIT_BLOCKS, parse_secret};
+use crate::engine::{Engine, HTLC_TIMEOUT_BLOCKS, PricingConfig, VAULT_EXIT_BLOCKS, parse_secret};
 use crate::error::Error;
 use crate::htlc::{generate_keypair, p2wpkh_address};
 use crate::model::{CreateQuoteRequest, CreateSwapRequest, ObserveLockRequest, ObserveVtxoRequest};
@@ -51,6 +51,7 @@ struct Meta {
     height: u32,
     vault_exit_blocks: u32,
     swap_timeout_blocks: u32,
+    pricing: PricingConfig,
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -96,6 +97,7 @@ async fn meta(engine: web::Data<Engine>) -> HttpResponse {
         height: engine.cached_height(),
         vault_exit_blocks: VAULT_EXIT_BLOCKS,
         swap_timeout_blocks: HTLC_TIMEOUT_BLOCKS,
+        pricing: engine.pricing(),
     })
 }
 

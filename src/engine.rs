@@ -19,7 +19,7 @@ use crate::htlc::{
 };
 use crate::model::{
     CreateQuoteRequest, HtlcLock, LiquidityProvider, ObserveLockRequest, ObserveVtxoRequest,
-    PayInstructions, Quote, Side, Swap, SwapStatus, fee_sats,
+    PayInstructions, PriceBreakdown, Quote, Side, Swap, SwapStatus, fee_sats,
 };
 use crate::tachi::TachiClient;
 use crate::tachi_tx::{
@@ -31,7 +31,9 @@ use crate::tachi_tx::{
 const MIN_SWAP_SATS: u64 = 10_000;
 const MAX_SWAP_SATS: u64 = 2_000_000;
 const MIN_FEE_SATS: u64 = 200;
-const QUOTE_TTL_SECS: i64 = 10 * 60;
+const DEFAULT_QUOTE_TTL_SECS: u64 = 10 * 60;
+const MIN_QUOTE_TTL_SECS: u64 = 30;
+const MAX_QUOTE_TTL_SECS: u64 = 60 * 60;
 pub const HTLC_TIMEOUT_BLOCKS: u32 = 144;
 /// Stop settling this many blocks before an HTLC times out, so a claim has
 /// time to confirm before the other side can take the refund path.
@@ -41,6 +43,40 @@ pub const VAULT_EXIT_BLOCKS: u32 = 1008;
 const CLAIM_FEE_SATS: u64 = 500;
 /// Test mode has no chain behind it.
 const SIM_HEIGHT: u32 = 200_000;
+
+/// Knobs for [`price`]. All values are parts per million.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PricingConfig {
+    /// Fee change when a swap would leave the desk entirely on one side.
+    pub skew_ppm: u64,
+    /// Cost of holding a price firm, per hour of quote TTL.
+    pub ttl_ppm_per_hour: u64,
+    pub min_fee_ppm: u64,
+    pub max_fee_ppm: u64,
+}
+
+impl Default for PricingConfig {
+    fn default() -> Self {
+        Self {
+            skew_ppm: 10_000,
+            ttl_ppm_per_hour: 3_000,
+            min_fee_ppm: 500,
+            max_fee_ppm: 50_000,
+        }
+    }
+}
+
+impl PricingConfig {
+    /// Every desk charges exactly its base `fee_ppm`.
+    pub fn flat() -> Self {
+        Self {
+            skew_ppm: 0,
+            ttl_ppm_per_hour: 0,
+            min_fee_ppm: 0,
+            max_fee_ppm: u64::MAX / 2,
+        }
+    }
+}
 
 #[derive(Default)]
 struct Inner {
@@ -102,6 +138,20 @@ struct BuiltTransfer {
     own_outputs: Vec<String>,
 }
 
+/// A validated quote request, with timeouts fixed against the current tip.
+struct QuoteTerms {
+    ttl_secs: u64,
+    user_pk: Option<PublicKey>,
+    timeout_height: u32,
+}
+
+/// One desk's priced quote for a request.
+struct Leg {
+    amount_sats: u64,
+    fee_sats: u64,
+    pricing: PriceBreakdown,
+}
+
 #[derive(Clone)]
 struct LpWallet {
     id: String,
@@ -127,6 +177,7 @@ pub struct Engine {
     swap_locks: Arc<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
     /// One in-flight spend per desk wallet.
     lp_spends: Arc<HashMap<String, Arc<tokio::sync::Mutex<LpSpend>>>>,
+    pricing: PricingConfig,
 }
 
 impl Engine {
@@ -219,7 +270,17 @@ impl Engine {
             persist_lock: Arc::default(),
             swap_locks: Arc::default(),
             lp_spends: Arc::new(lp_spends),
+            pricing: PricingConfig::default(),
         }
+    }
+
+    pub fn with_pricing(mut self, pricing: PricingConfig) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
+    pub fn pricing(&self) -> PricingConfig {
+        self.pricing
     }
 
     /// Load/save quotes, swaps, and HTLC preimages across restarts. A file that
@@ -558,6 +619,7 @@ impl Engine {
         ))
     }
 
+    /// Best quote across desks. Reserves only that desk's stock.
     pub async fn create_quote(&self, req: CreateQuoteRequest) -> Result<Quote, Error> {
         if req.amount_sats < MIN_SWAP_SATS {
             return Err(Error::AmountTooSmall(MIN_SWAP_SATS));
@@ -565,6 +627,52 @@ impl Engine {
         if req.amount_sats > MAX_SWAP_SATS {
             return Err(Error::Invalid(format!(
                 "amount must be at most {MAX_SWAP_SATS} sats"
+            )));
+        }
+        let terms = self.quote_terms(&req).await?;
+
+        let mut inner = self.inner.write().await;
+        release_expired_quotes(&mut inner);
+        let mut offers: Vec<(LiquidityProvider, PriceBreakdown, u64)> = inner
+            .lps
+            .iter()
+            .filter(|lp| can_fill(lp, req.side, req.amount_sats))
+            .map(|lp| {
+                let p = price(&self.pricing, lp, req.side, req.amount_sats, terms.ttl_secs);
+                (lp.clone(), p, fee_sats(req.amount_sats, p.fee_ppm, MIN_FEE_SATS))
+            })
+            .collect();
+        if offers.is_empty() {
+            return Err(Error::NoLiquidity {
+                side: req.side,
+                amount_sats: req.amount_sats,
+            });
+        }
+        offers.retain(|(_, _, fee)| *fee < req.amount_sats);
+        if offers.is_empty() {
+            return Err(Error::Invalid("fee consumes the whole amount".into()));
+        }
+        // Cheapest in sats; when the minimum fee makes desks tie, the lower
+        // rate wins, then the deeper book.
+        offers.sort_by_key(|(lp, p, fee)| (*fee, p.fee_ppm, std::cmp::Reverse(book(lp, req.side))));
+        let (lp, pricing, fee) = offers.swap_remove(0);
+        let leg = Leg {
+            amount_sats: req.amount_sats,
+            fee_sats: fee,
+            pricing,
+        };
+        let quote = self.make_quote(&mut inner, &lp.id, &req, &terms, leg)?;
+        drop(inner);
+        self.save_state().await;
+        Ok(quote)
+    }
+
+    /// Validate a quote request and fix its timeouts against the current tip.
+    async fn quote_terms(&self, req: &CreateQuoteRequest) -> Result<QuoteTerms, Error> {
+        let ttl_secs = req.ttl_secs.unwrap_or(DEFAULT_QUOTE_TTL_SECS);
+        if !(MIN_QUOTE_TTL_SECS..=MAX_QUOTE_TTL_SECS).contains(&ttl_secs) {
+            return Err(Error::Invalid(format!(
+                "ttl_secs must be {MIN_QUOTE_TTL_SECS}..={MAX_QUOTE_TTL_SECS}"
             )));
         }
 
@@ -611,92 +719,50 @@ impl Engine {
 
         // Quotes use the cached height (refreshed by the ticker). On a live
         // chain we fetch it once if we have never seen it, rather than guess.
-        let timeout_height = self.known_height().await? + HTLC_TIMEOUT_BLOCKS;
+        let height = self.known_height().await?;
+        Ok(QuoteTerms {
+            ttl_secs,
+            user_pk,
+            timeout_height: height + HTLC_TIMEOUT_BLOCKS,
+        })
+    }
 
-        let mut inner = self.inner.write().await;
-        release_expired_quotes(&mut inner);
-        let lp = select_lp(&inner.lps, req.side, req.amount_sats)
-            .cloned()
-            .ok_or(Error::NoLiquidity {
-                side: req.side,
-                amount_sats: req.amount_sats,
-            })?;
-
-        let fee = fee_sats(req.amount_sats, lp.fee_ppm, MIN_FEE_SATS);
-        let receive = req.amount_sats.saturating_sub(fee);
-        if receive == 0 {
-            return Err(Error::Invalid("fee consumes the whole amount".into()));
-        }
-
+    /// Build one desk's quote, reserve its stock, and store it.
+    fn make_quote(
+        &self,
+        inner: &mut Inner,
+        lp_id: &str,
+        req: &CreateQuoteRequest,
+        terms: &QuoteTerms,
+        leg: Leg,
+    ) -> Result<Quote, Error> {
         let quote_id = Uuid::now_v7();
-        let lp_pk = self.lp_pubkey(&lp.id)?;
-        let (preimage, pay) = match (req.side, user_pk.as_ref()) {
-            (Side::In, Some(user_pk)) => {
-                let (preimage, lock) = self.build_htlc(&lp_pk, user_pk, timeout_height)?;
-                (
-                    Some(preimage),
-                    PayInstructions::L1Htlc {
-                        address: lock.address,
-                        payment_hash_hex: lock.payment_hash_hex,
-                        timeout_height: lock.timeout_height,
-                        redeem_script_hex: lock.redeem_script_hex,
-                    },
-                )
-            }
-            (Side::In, None) => unreachable!("checked above"),
-            (Side::Out, user_pk) => {
-                let w = self.lp_wallet(&lp.id)?;
-                // User claims with preimage; LP refunds after timeout.
-                let (preimage, lock) = match user_pk {
-                    Some(user_pk) => {
-                        let (pre, lock) = self.build_htlc(user_pk, &lp_pk, timeout_height)?;
-                        (Some(pre), Some(lock))
-                    }
-                    None => (None, None),
-                };
-                (
-                    preimage,
-                    PayInstructions::TachiVtxo {
-                        pay_to: hex::encode(xonly_from_secret(&w.secret)),
-                        memo: format!("tachi-flow out {} {}", lp.id, quote_id),
-                        lock,
-                    },
-                )
-            }
-        };
-
-        let blocks = HTLC_TIMEOUT_BLOCKS;
-        let hint = match req.side {
-            Side::In => Some(format!(
-                "Swap vs vault: pay a lock now (~{blocks} blocks to refund if the desk stalls) instead of a TAURUS unilateral exit (~{VAULT_EXIT_BLOCKS} blocks, about a week). The Tachi faucet cannot pay the lock — use Fund with faucet."
-            )),
-            Side::Out => Some(format!(
-                "Swap vs vault: the desk locks bitcoin first (~{blocks}-block refund for them). You send Tachi coins only after that lock is up, then you claim. A vault exit would be ~{VAULT_EXIT_BLOCKS} blocks."
-            )),
-        };
-        let comparison = Some(format!(
-            "This swap: fee {fee} sats, refund window {blocks} blocks. TAURUS vault exit: {VAULT_EXIT_BLOCKS} blocks (~7 days) and no LP fee. Use the vault to save; use this desk to spend today."
-        ));
-
+        let (preimage, pay) = self.pay_instructions(
+            lp_id,
+            req.side,
+            terms.user_pk.as_ref(),
+            terms.timeout_height,
+            quote_id,
+        )?;
         let quote = Quote {
             id: quote_id,
             side: req.side,
-            amount_sats: req.amount_sats,
-            fee_sats: fee,
-            receive_sats: receive,
-            lp_id: lp.id,
+            amount_sats: leg.amount_sats,
+            fee_sats: leg.fee_sats,
+            receive_sats: leg.amount_sats - leg.fee_sats,
+            lp_id: lp_id.to_string(),
             eta_seconds: if req.side == Side::In { 120 } else { 30 },
-            expires_at: Utc::now() + Duration::seconds(QUOTE_TTL_SECS),
-            user_tachi_address: req.user_tachi_address,
-            user_l1_address: req.user_l1_address,
+            expires_at: Utc::now() + Duration::seconds(terms.ttl_secs as i64),
+            user_tachi_address: req.user_tachi_address.clone(),
+            user_l1_address: req.user_l1_address.clone(),
             pay,
-            hint,
+            hint: Some(quote_hint(req.side)),
             vault_exit_blocks: VAULT_EXIT_BLOCKS,
             swap_timeout_blocks: HTLC_TIMEOUT_BLOCKS,
-            comparison,
-            user_pubkey_hex: user_pk.map(|p| p.to_string()),
+            comparison: Some(quote_comparison(leg.fee_sats, &leg.pricing)),
+            user_pubkey_hex: terms.user_pk.map(|p| p.to_string()),
+            pricing: Some(leg.pricing),
         };
-
         debit_lp(
             &mut inner.lps,
             &quote.lp_id,
@@ -707,9 +773,54 @@ impl Engine {
             inner.preimages.insert(quote_id, preimage);
         }
         inner.quotes.insert(quote.id, quote.clone());
-        drop(inner);
-        self.save_state().await;
         Ok(quote)
+    }
+
+    /// HTLC + payment instructions for one desk's quote.
+    fn pay_instructions(
+        &self,
+        lp_id: &str,
+        side: Side,
+        user_pk: Option<&PublicKey>,
+        timeout_height: u32,
+        quote_id: Uuid,
+    ) -> Result<(Option<[u8; 32]>, PayInstructions), Error> {
+        let lp_pk = self.lp_pubkey(lp_id)?;
+        match (side, user_pk) {
+            (Side::In, Some(user_pk)) => {
+                let (preimage, lock) = self.build_htlc(&lp_pk, user_pk, timeout_height)?;
+                Ok((
+                    Some(preimage),
+                    PayInstructions::L1Htlc {
+                        address: lock.address,
+                        payment_hash_hex: lock.payment_hash_hex,
+                        timeout_height: lock.timeout_height,
+                        redeem_script_hex: lock.redeem_script_hex,
+                    },
+                ))
+            }
+            (Side::In, None) => Err(Error::Invalid(
+                "user_refund_pubkey_hex is required for in".into(),
+            )),
+            (Side::Out, user_pk) => {
+                // User claims with preimage; LP refunds after timeout.
+                let (preimage, lock) = match user_pk {
+                    Some(user_pk) => {
+                        let (pre, lock) = self.build_htlc(user_pk, &lp_pk, timeout_height)?;
+                        (Some(pre), Some(lock))
+                    }
+                    None => (None, None),
+                };
+                Ok((
+                    preimage,
+                    PayInstructions::TachiVtxo {
+                        pay_to: hex::encode(xonly_from_secret(&self.lp_wallet(lp_id)?.secret)),
+                        memo: format!("tachi-flow out {lp_id} {quote_id}"),
+                        lock,
+                    },
+                ))
+            }
+        }
     }
 
     pub async fn open_swap(&self, quote_id: Uuid) -> Result<Swap, Error> {
@@ -2226,23 +2337,88 @@ fn lp(
     }
 }
 
-fn select_lp(lps: &[LiquidityProvider], side: Side, amount: u64) -> Option<&LiquidityProvider> {
-    let need = |receive: u64| reserve_sats(side, receive);
-    lps.iter()
-        .filter(|lp| !lp.defaulted && amount <= lp.max_swap_sats)
-        .filter(|lp| match side {
-            Side::In => lp.vtxo_sats >= need(amount),
-            Side::Out => lp.l1_sats >= need(amount),
-        })
-        .min_by_key(|lp| {
-            (
-                lp.fee_ppm,
-                std::cmp::Reverse(match side {
-                    Side::In => lp.vtxo_sats,
-                    Side::Out => lp.l1_sats,
-                }),
-            )
-        })
+/// Price one desk's quote. Starts from the desk's base fee, then:
+/// - skew: averaged over the swap's before/after effect on the desk's VTXO
+///   share, so draining the scarce side costs more and refilling it is cheaper;
+/// - TTL: holding a price firm longer costs more.
+pub fn price(
+    cfg: &PricingConfig,
+    lp: &LiquidityProvider,
+    side: Side,
+    amount_sats: u64,
+    ttl_secs: u64,
+) -> PriceBreakdown {
+    const HALF: i128 = 500_000;
+    let (v, l, a) = (
+        lp.vtxo_sats as i128,
+        lp.l1_sats as i128,
+        amount_sats as i128,
+    );
+    let share = |v: i128, l: i128| {
+        let (v, l) = (v.max(0), l.max(0));
+        if v + l == 0 { HALF } else { v * 1_000_000 / (v + l) }
+    };
+    let before = share(v, l);
+    let after = match side {
+        Side::In => share(v - a, l + a),
+        Side::Out => share(v + a, l - a),
+    };
+    let mid = (before + after) / 2;
+    let imbalance = match side {
+        Side::In => HALF - mid,
+        Side::Out => mid - HALF,
+    };
+    let skew = cfg.skew_ppm as i128 * imbalance / HALF;
+    let ttl = cfg.ttl_ppm_per_hour as i128 * ttl_secs as i128 / 3600;
+    let subtotal = lp.fee_ppm as i128 + skew + ttl;
+    let fee = subtotal.clamp(cfg.min_fee_ppm as i128, cfg.max_fee_ppm as i128);
+    PriceBreakdown {
+        base_ppm: lp.fee_ppm,
+        skew_ppm: skew as i64,
+        ttl_ppm: ttl as i64,
+        fee_ppm: fee as u64,
+        vtxo_share_before_ppm: before as u64,
+        vtxo_share_after_ppm: after as u64,
+        ttl_secs,
+    }
+}
+
+/// The side of a desk's books a swap draws on.
+fn book(lp: &LiquidityProvider, side: Side) -> u64 {
+    match side {
+        Side::In => lp.vtxo_sats,
+        Side::Out => lp.l1_sats,
+    }
+}
+
+fn can_fill(lp: &LiquidityProvider, side: Side, amount_sats: u64) -> bool {
+    !lp.defaulted
+        && amount_sats <= lp.max_swap_sats
+        && book(lp, side) >= reserve_sats(side, amount_sats)
+}
+
+fn quote_hint(side: Side) -> String {
+    let blocks = HTLC_TIMEOUT_BLOCKS;
+    match side {
+        Side::In => format!(
+            "Swap vs vault: pay a lock now (~{blocks} blocks to refund if the desk stalls) instead of a TAURUS unilateral exit (~{VAULT_EXIT_BLOCKS} blocks, about a week). The Tachi faucet cannot pay the lock — use Fund with faucet."
+        ),
+        Side::Out => format!(
+            "Swap vs vault: the desk locks bitcoin first (~{blocks}-block refund for them). You send Tachi coins only after that lock is up, then you claim. A vault exit would be ~{VAULT_EXIT_BLOCKS} blocks."
+        ),
+    }
+}
+
+fn quote_comparison(fee: u64, p: &PriceBreakdown) -> String {
+    let pct = |ppm: i64| format!("{:+.2}%", ppm as f64 / 10_000.0);
+    format!(
+        "This swap: fee {fee} sats ({:.2}% = base {:.2}%, inventory {}, firm {}s {}), refund window {HTLC_TIMEOUT_BLOCKS} blocks. TAURUS vault exit: {VAULT_EXIT_BLOCKS} blocks (~7 days) and no LP fee.",
+        p.fee_ppm as f64 / 10_000.0,
+        p.base_ppm as f64 / 10_000.0,
+        pct(p.skew_ppm),
+        p.ttl_secs,
+        pct(p.ttl_ppm),
+    )
 }
 
 fn debit_lp(lps: &mut [LiquidityProvider], id: &str, side: Side, amount: u64) -> Result<(), Error> {
@@ -2308,7 +2484,9 @@ mod tests {
 
     fn engine() -> Engine {
         let tachi = TachiClient::new("http://127.0.0.1:9").expect("client");
+        // Flat pricing keeps fee math in these routing/concurrency tests exact.
         Engine::from_lp_secret_mode(tachi, Network::Signet, generate_keypair().secret, true)
+            .with_pricing(PricingConfig::flat())
     }
 
     #[tokio::test]
@@ -2322,6 +2500,7 @@ mod tests {
                 user_tachi_address: Some("tb1ptest".into()),
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
             })
             .await
             .expect("quote");
@@ -2339,6 +2518,7 @@ mod tests {
                 user_tachi_address: None,
                 user_l1_address: Some("tb1qtest".into()),
                 user_refund_pubkey_hex: None,
+                ttl_secs: None,
             })
             .await
             .expect("quote");
@@ -2358,6 +2538,7 @@ mod tests {
                 user_tachi_address: None,
                 user_l1_address: Some("tb1qtest".into()),
                 user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
             })
             .await
             .expect("quote");
@@ -2382,6 +2563,7 @@ mod tests {
                 user_tachi_address: Some("tb1ptest".into()),
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
             })
             .await
             .unwrap();
@@ -2401,6 +2583,7 @@ mod tests {
                 user_tachi_address: Some("tb1ptest".into()),
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
             })
             .await
             .unwrap();
@@ -2480,6 +2663,7 @@ mod tests {
                         user_tachi_address: Some("tb1ptest".into()),
                         user_l1_address: None,
                         user_refund_pubkey_hex: Some(pk),
+                        ttl_secs: None,
                     })
                     .await?;
                 let swap = e.open_swap(q.id).await?;
@@ -2534,6 +2718,7 @@ mod tests {
                         user_tachi_address: None,
                         user_l1_address: Some("tb1qtest".into()),
                         user_refund_pubkey_hex: None,
+                        ttl_secs: None,
                     })
                     .await?;
                 let swap = e.open_swap(q.id).await?;
@@ -2584,6 +2769,7 @@ mod tests {
                     user_tachi_address: None,
                     user_l1_address: Some("tb1qtest".into()),
                     user_refund_pubkey_hex: None,
+                    ttl_secs: None,
                 })
                 .await
             }));
@@ -2621,6 +2807,7 @@ mod tests {
                 user_tachi_address: Some("tb1ptest".into()),
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
             })
             .await
             .unwrap();
@@ -2656,6 +2843,7 @@ mod tests {
                 user_tachi_address: Some("tb1ptest".into()),
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
             })
             .await
             .unwrap();
@@ -2723,6 +2911,7 @@ mod tests {
                     user_tachi_address: Some("tb1ptest".into()),
                     user_l1_address: None,
                     user_refund_pubkey_hex: Some(pk),
+                    ttl_secs: None,
                 })
                 .await
             }));
@@ -2768,6 +2957,7 @@ mod tests {
                     user_tachi_address: Some("tb1ptest".into()),
                     user_l1_address: None,
                     user_refund_pubkey_hex: Some(user.public.to_string()),
+                    ttl_secs: None,
                 })
                 .await
                 .unwrap();
@@ -2803,6 +2993,7 @@ mod tests {
                     user_tachi_address: None,
                     user_l1_address: Some("tb1qtest".into()),
                     user_refund_pubkey_hex: None,
+                    ttl_secs: None,
                 })
                 .await
             }));
@@ -2835,6 +3026,7 @@ mod tests {
             user_tachi_address: Some("tb1ptest".into()),
             user_l1_address: None,
             user_refund_pubkey_hex: Some(user.public.to_string()),
+            ttl_secs: None,
         })
         .await
         .expect("quote");
@@ -2857,6 +3049,7 @@ mod tests {
                 user_tachi_address: Some(e.tachi_lp_pubkey_hex()),
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
             })
             .await
             .expect_err("height unknown");
@@ -2873,6 +3066,7 @@ mod tests {
             user_tachi_address: Some("tb1ptest".into()),
             user_l1_address: None,
             user_refund_pubkey_hex: Some(user.public.to_string()),
+            ttl_secs: None,
         })
         .await
         .unwrap();
@@ -2882,6 +3076,7 @@ mod tests {
             user_tachi_address: None,
             user_l1_address: Some("tb1qtest".into()),
             user_refund_pubkey_hex: None,
+            ttl_secs: None,
         })
         .await
         .unwrap();
@@ -2907,6 +3102,7 @@ mod tests {
                 user_tachi_address: Some("tb1ptest".into()),
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
             })
             .await
             .unwrap();
@@ -2933,6 +3129,7 @@ mod tests {
                     user_tachi_address: None,
                     user_l1_address: Some("tb1qtest".into()),
                     user_refund_pubkey_hex: Some(user.public.to_string()),
+                    ttl_secs: None,
                 })
                 .await
                 .unwrap();
@@ -2968,6 +3165,7 @@ mod tests {
                 user_tachi_address: Some("tb1ptest".into()),
                 user_l1_address: None,
                 user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
             })
             .await
             .unwrap();
@@ -2987,5 +3185,80 @@ mod tests {
             .expect("corrupt file must not start empty");
         assert!(err.to_string().contains("preimages"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Simulated books with the default (dynamic) pricing.
+    fn priced_engine() -> Engine {
+        let tachi = TachiClient::new("http://127.0.0.1:9").expect("client");
+        Engine::from_lp_secret_mode(tachi, Network::Signet, generate_keypair().secret, true)
+    }
+
+    fn desk(vtxo_sats: u64, l1_sats: u64) -> LiquidityProvider {
+        lp("d", l1_sats, vtxo_sats, 8_000, None, None, "test")
+    }
+
+    #[test]
+    fn skew_charges_for_draining_the_scarce_side() {
+        let cfg = PricingConfig::default();
+        let vtxo_rich = desk(1_800_000, 200_000);
+        let sell_vtxo = price(&cfg, &vtxo_rich, Side::In, 100_000, 600);
+        let buy_vtxo = price(&cfg, &vtxo_rich, Side::Out, 100_000, 600);
+        assert!(sell_vtxo.skew_ppm < 0, "{sell_vtxo:?}");
+        assert!(buy_vtxo.skew_ppm > 0, "{buy_vtxo:?}");
+        assert!(sell_vtxo.fee_ppm < buy_vtxo.fee_ppm);
+        assert_eq!(sell_vtxo.vtxo_share_before_ppm, 900_000);
+        assert_eq!(sell_vtxo.vtxo_share_after_ppm, 850_000);
+
+        // From balance, either direction moves away from it and costs a little.
+        let balanced = desk(1_000_000, 1_000_000);
+        assert!(price(&cfg, &balanced, Side::In, 100_000, 600).skew_ppm > 0);
+        assert!(price(&cfg, &balanced, Side::Out, 100_000, 600).skew_ppm > 0);
+    }
+
+    #[test]
+    fn longer_firm_quotes_cost_more() {
+        let cfg = PricingConfig::default();
+        let d = desk(1_000_000, 1_000_000);
+        let short = price(&cfg, &d, Side::Out, 100_000, 60);
+        let long = price(&cfg, &d, Side::Out, 100_000, 3_600);
+        assert_eq!(long.ttl_ppm, 3_000);
+        assert!(long.fee_ppm > short.fee_ppm);
+        // Never below the floor, however favourable the skew.
+        let cheap = LiquidityProvider { fee_ppm: 0, ..desk(1_800_000, 200_000) };
+        assert_eq!(
+            price(&cfg, &cheap, Side::In, 100_000, 60).fee_ppm,
+            cfg.min_fee_ppm
+        );
+    }
+
+    #[test]
+    fn flat_pricing_is_the_base_fee() {
+        let d = desk(1_800_000, 200_000);
+        let p = price(&PricingConfig::flat(), &d, Side::Out, 100_000, 3_600);
+        assert_eq!(p.fee_ppm, 8_000);
+    }
+
+    #[tokio::test]
+    async fn priced_quote_routes_to_the_cheaper_desk_and_holds_its_ttl() {
+        let e = priced_engine();
+        let user = generate_keypair();
+        let q = e
+            .create_quote(CreateQuoteRequest {
+                side: Side::In,
+                amount_sats: 100_000,
+                user_tachi_address: Some("tb1ptest".into()),
+                user_l1_address: None,
+                user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: Some(120),
+            })
+            .await
+            .unwrap();
+        // alpha is VTXO-rich and cheaper at base: it should win selling VTXOs.
+        assert_eq!(q.lp_id, "lp-alpha");
+        let p = q.pricing.expect("breakdown");
+        assert!(p.skew_ppm < 0, "selling the plentiful side is discounted: {p:?}");
+        assert_eq!(q.fee_sats, fee_sats(100_000, p.fee_ppm, MIN_FEE_SATS));
+        let ttl = (q.expires_at - Utc::now()).num_seconds();
+        assert!((100..=120).contains(&ttl), "ttl {ttl}");
     }
 }

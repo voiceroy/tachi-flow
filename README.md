@@ -27,6 +27,14 @@ Optional outbound: quote **out** (same identity). Accept — the desk funds an H
 
 Swaps survive `cargo run` restarts (`tachi-flow-state.json`, gitignored). Empty LP books get a demo VTXO deposit on startup.
 
+## What the vault can't do
+
+A TAURUS vault has one exit: the whole deposit, after a fixed ~1008-block CSV, at no fee. The desks turn that wait into a priced market:
+
+- **Inventory-skew pricing.** Each desk's fee moves with its books. A swap that drains a desk's scarce side costs more; one that refills it costs less. The skew is averaged over the swap's before/after effect on the desk's VTXO share, so big swaps pay for their own impact. Every quote carries a `pricing` breakdown (base, inventory, firm-quote cost). A quote stays firm for `ttl_secs` (30 s–1 h); holding a price longer costs more.
+
+Defaults (ppm): skew ±10,000 at full imbalance, 3,000/hour of quote TTL, fee floor 500, cap 50,000 (`PricingConfig`).
+
 ## Run tests
 
 ```bash
@@ -49,7 +57,8 @@ LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `
 ## API
 
 - `GET /` — UI
-- `POST /v1/quotes` · `POST /v1/swaps` · `POST /v1/sync` · `POST /v1/swaps/{id}/sync`
+- `POST /v1/quotes` — best quote across desks; optional `ttl_secs`
+- `POST /v1/swaps` · `POST /v1/sync` · `POST /v1/swaps/{id}/sync`
 - `POST /v1/swaps/{id}/fund` — faucet helper for inbound
 - `POST /v1/swaps/{id}/pay-vtxo` — `{ "secret_hex": "..." }` for outbound from the demo key (idempotent)
 - `POST /v1/swaps/{id}/refund` — `{ "secret_hex": "..." }`; cancel, or on-chain refund after the timeout

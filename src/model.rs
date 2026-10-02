@@ -71,6 +71,23 @@ pub struct Quote {
     /// Compressed pubkey the user controls (refund key `in`, claim key `out`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<PriceBreakdown>,
+}
+
+/// How a quote's fee was built. All figures are parts per million of the amount,
+/// except the shares, which are parts per million of the desk's books.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriceBreakdown {
+    pub base_ppm: u64,
+    /// Inventory skew: positive when this swap drains the desk's scarce side.
+    pub skew_ppm: i64,
+    /// Cost of holding the price firm for the quote's TTL.
+    pub ttl_ppm: i64,
+    pub fee_ppm: u64,
+    pub vtxo_share_before_ppm: u64,
+    pub vtxo_share_after_ppm: u64,
+    pub ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +182,9 @@ pub struct CreateQuoteRequest {
     /// Compressed secp256k1 pubkey hex (33 bytes). Required for `in` so the
     /// HTLC refund path is the user's key.
     pub user_refund_pubkey_hex: Option<String>,
+    /// How long the price stays firm (30..=3600 s, default 600). Longer costs more.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

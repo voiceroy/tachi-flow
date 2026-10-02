@@ -125,6 +125,12 @@
           <input id="refundPk" />
           <label>Your bitcoin address (out)</label>
           <input id="l1Dest" placeholder="filled from identity" />
+          <label>Keep the price firm for</label>
+          <select id="ttl">
+            <option value="60">1 minute (cheapest)</option>
+            <option value="600" selected>10 minutes</option>
+            <option value="3600">1 hour</option>
+          </select>
           <button id="btnQuote">Quote</button>
         </div>
         <div>
@@ -268,6 +274,36 @@
       applyKeys(await j("/v1/demo/keys", { method: "POST" }));
     };
 
+    const pct = (ppm) => (ppm >= 0 ? "+" : "") + (ppm / 10000).toFixed(2) + "%";
+
+    function breakdown(p) {
+      if (!p) return "";
+      const s = `base ${feePct(p.base_ppm)} · inventory ${pct(p.skew_ppm)} · firm ${p.ttl_secs}s ${pct(p.ttl_ppm)}`;
+      return s + ` = <strong>${feePct(p.fee_ppm)}</strong>`;
+    }
+
+    function showQuote(q) {
+      quote = q;
+      const pay = quote.pay || {};
+      let payHtml = "";
+      if (pay.method === "l1_htlc") {
+        payHtml = `<p>Lock (do <em>not</em> paste this into the faucet):</p>
+          <div class="pay">${pay.address}</div>`;
+      } else {
+        payHtml = `<p>After the desk locks bitcoin, send Tachi coins to <code>${pay.pay_to}</code></p>`;
+        if (pay.lock && pay.lock.address) {
+          payHtml += `<p>Desk HTLC (they fund this first):</p><div class="pay">${pay.lock.address}</div>`;
+        }
+      }
+      $("quoteBox").innerHTML = `
+        <p>Desk <strong>${quote.lp_id}</strong> · fee ${sats(quote.fee_sats)} · you receive <strong>${sats(quote.receive_sats)}</strong></p>
+        <p class="hint">${breakdown(quote.pricing)}</p>
+        <p class="ok">${quote.comparison || ""}</p>
+        <p class="hint">${quote.hint || ""}</p>
+        <p>Price firm until ${quote.expires_at}</p>
+        ${payHtml}`;
+    }
+
     $("btnQuote").onclick = async () => {
       try {
         const side = $("side").value;
@@ -277,29 +313,13 @@
           user_tachi_address: $("tachiDest").value || null,
           user_refund_pubkey_hex: $("refundPk").value || null,
           user_l1_address: $("l1Dest").value || null,
+          ttl_secs: Number($("ttl").value),
         };
-        quote = await j("/v1/quotes", {
+        showQuote(await j("/v1/quotes", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
-        });
-        const pay = quote.pay || {};
-        let payHtml = "";
-        if (pay.method === "l1_htlc") {
-          payHtml = `<p>Lock (do <em>not</em> paste this into the faucet):</p>
-            <div class="pay">${pay.address}</div>`;
-        } else {
-          payHtml = `<p>After the desk locks bitcoin, send Tachi coins to <code>${pay.pay_to}</code></p>`;
-          if (pay.lock && pay.lock.address) {
-            payHtml += `<p>Desk HTLC (they fund this first):</p><div class="pay">${pay.lock.address}</div>`;
-          }
-        }
-        $("quoteBox").innerHTML = `
-          <p>Desk <strong>${quote.lp_id}</strong> · fee ${sats(quote.fee_sats)} · you receive <strong>${sats(quote.receive_sats)}</strong></p>
-          <p class="ok">${quote.comparison || ""}</p>
-          <p class="hint">${quote.hint || ""}</p>
-          <p>Quote expires ${quote.expires_at}</p>
-          ${payHtml}`;
+        }));
         await refreshBooks();
       } catch (e) {
         $("quoteBox").innerHTML = `<p class="warn">${e.message}</p>`;
@@ -314,6 +334,7 @@
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ quote_id: quote.id }),
         }));
+        refreshBooks();
         refreshSwaps();
       } catch (e) {
         $("swapHint").innerHTML = "<span class='warn'>" + e.message + "</span>";
