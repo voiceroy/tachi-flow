@@ -240,6 +240,14 @@ pub struct Swap {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookRequest {
+    pub url: String,
+    /// Only events for this swap (default: every swap).
+    #[serde(default)]
+    pub swap_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateQuoteRequest {
     pub side: Side,
     pub amount_sats: u64,

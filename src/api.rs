@@ -12,7 +12,7 @@ use crate::error::Error;
 use crate::htlc::{generate_keypair, p2wpkh_address};
 use crate::model::{
     CreatePlanRequest, CreateQuoteRequest, CreateSwapRequest, ObserveLockRequest,
-    ObserveVtxoRequest, Side,
+    ObserveVtxoRequest, Side, WebhookRequest,
 };
 use crate::tachi::Health;
 use crate::tachi_tx::xonly_from_secret;
@@ -89,7 +89,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(plan_exit)
         .service(get_plan)
         .service(accept_plan)
-        .service(post_bond);
+        .service(post_bond)
+        .service(events)
+        .service(add_webhook);
 }
 
 #[get("/")]
@@ -154,6 +156,48 @@ async fn post_bond(
 ) -> Result<HttpResponse, Error> {
     let total = engine.post_bond(&path, body.amount_sats).await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({ "lp_id": *path, "bond_sats": total })))
+}
+
+#[derive(serde::Deserialize)]
+struct EventsQuery {
+    swap_id: Option<Uuid>,
+}
+
+/// Server-sent events (#7): every swap change.
+#[get("/v1/events")]
+async fn events(engine: web::Data<Engine>, q: web::Query<EventsQuery>) -> HttpResponse {
+    use tokio::sync::broadcast::error::RecvError;
+    let filter = q.swap_id;
+    let stream = futures_util::stream::unfold(engine.subscribe(), move |mut rx| async move {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv()).await {
+                Ok(Ok(ev)) if filter.is_none_or(|id| id == ev.id()) => {
+                    let frame = web::Bytes::from(ev.sse_frame());
+                    return Some((Ok::<_, actix_web::Error>(frame), rx));
+                }
+                Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => continue,
+                Ok(Err(RecvError::Closed)) => return None,
+                // Keep proxies from closing an idle stream.
+                Err(_) => return Some((Ok(web::Bytes::from_static(b": keepalive\n\n")), rx)),
+            }
+        }
+    });
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .insert_header(("cache-control", "no-cache"))
+        .streaming(stream)
+}
+
+/// Register a URL to POST every event to. Operator route: the server makes
+/// outbound requests to whatever is registered.
+#[post("/v1/webhooks")]
+async fn add_webhook(
+    _admin: Admin,
+    engine: web::Data<Engine>,
+    body: web::Json<WebhookRequest>,
+) -> Result<HttpResponse, Error> {
+    let n = engine.add_webhook(body.into_inner()).await?;
+    Ok(HttpResponse::Created().json(serde_json::json!({ "webhooks": n })))
 }
 
 #[get("/v1/swaps")]

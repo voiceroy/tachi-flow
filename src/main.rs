@@ -75,6 +75,8 @@ async fn main() -> std::io::Result<()> {
                 tracing::warn!(%err, "demo liquidity");
             }
         });
+        // Push stream: settle the moment Tachi credits a desk, not on the next tick.
+        tokio::spawn(tachi_flow::watch::run(engine.clone()));
     }
 
     let ticker = engine.clone();

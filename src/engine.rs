@@ -13,6 +13,7 @@ use tokio::sync::{OwnedMutexGuard, RwLock};
 use uuid::Uuid;
 
 use crate::error::Error;
+use crate::events::{Event, MAX_WEBHOOKS, validate_webhook_url};
 use crate::htlc::{
     claim_tx_hex, generate_keypair, p2wpkh_address, p2wpkh_send_hex, p2wpkh_send_many_hex,
     p2wsh_address, parse_txid,
@@ -21,7 +22,7 @@ use crate::htlc::{
 use crate::model::{
     CreatePlanRequest, CreateQuoteRequest, ExitPlan, HtlcLock, LiquidityProvider,
     ObserveLockRequest, ObserveVtxoRequest, PayInstructions, PriceBreakdown, Quote, Side, Swap,
-    SwapStatus, fee_sats,
+    SwapStatus, WebhookRequest, fee_sats,
 };
 use crate::tachi::TachiClient;
 use crate::tachi_tx::{
@@ -120,6 +121,7 @@ struct Inner {
     bonds: HashMap<String, u64>,
     /// (fills, defaults) per desk.
     reputation: HashMap<String, (u64, u64)>,
+    webhooks: Vec<WebhookRequest>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -208,6 +210,8 @@ pub struct Engine {
     pricing: PricingConfig,
     /// Holds desk bonds. Custodial: this server controls the key.
     escrow: SecretKey,
+    events: tokio::sync::broadcast::Sender<Event>,
+    webhook_http: reqwest::Client,
 }
 
 impl Engine {
@@ -288,6 +292,7 @@ impl Engine {
             .chain([ESCROW_ID.to_string()])
             .map(|id| (id, Arc::default()))
             .collect();
+        let (events, _) = tokio::sync::broadcast::channel(crate::events::CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(RwLock::new(Inner {
                 lps,
@@ -304,6 +309,8 @@ impl Engine {
             lp_spends: Arc::new(lp_spends),
             pricing: PricingConfig::default(),
             escrow: generate_keypair().secret,
+            events,
+            webhook_http: crate::events::webhook_client(),
         }
     }
 
@@ -319,6 +326,39 @@ impl Engine {
 
     pub fn escrow_pubkey_hex(&self) -> String {
         hex::encode(xonly_from_secret(&self.escrow))
+    }
+
+    /// Tachi keys whose credits matter to us (desks + escrow), for the push stream.
+    pub fn desk_tachi_keys(&self) -> Vec<String> {
+        self.wallets
+            .iter()
+            .map(|w| hex::encode(xonly_from_secret(&w.secret)))
+            .chain([self.escrow_pubkey_hex()])
+            .collect()
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
+    async fn publish(&self, event: Event) {
+        let hooks = self.inner.read().await.webhooks.clone();
+        crate::events::deliver(&self.webhook_http, &hooks, &event);
+        let _ = self.events.send(event);
+    }
+
+    pub async fn add_webhook(&self, hook: WebhookRequest) -> Result<usize, Error> {
+        validate_webhook_url(&hook.url)?;
+        let n = {
+            let mut inner = self.inner.write().await;
+            if inner.webhooks.len() >= MAX_WEBHOOKS {
+                return Err(Error::Invalid(format!("at most {MAX_WEBHOOKS} webhooks")));
+            }
+            inner.webhooks.push(hook);
+            inner.webhooks.len()
+        };
+        self.save_state().await;
+        Ok(n)
     }
 
     /// Secret behind a spend lock id: a desk wallet, or the escrow.
@@ -397,6 +437,7 @@ impl Engine {
         inner.plans = file.plans.into_iter().map(|p| (p.id, p)).collect();
         inner.bonds = file.bonds;
         inner.reputation = file.reputation;
+        inner.webhooks = file.webhooks;
         apply_desk_stats(&mut inner);
         tracing::info!(
             quotes = inner.quotes.len(),
@@ -644,6 +685,7 @@ impl Engine {
             s.clone()
         };
         self.save_state().await;
+        self.publish(Event::Swap(Box::new(out.clone()))).await;
         Ok(out)
     }
 
@@ -1146,8 +1188,9 @@ impl Engine {
         if let Some(preimage) = inner.preimages.remove(&quote.id) {
             inner.preimages.insert(swap_id, preimage);
         }
-        inner.swaps.insert(swap_id, swap);
+        inner.swaps.insert(swap_id, swap.clone());
         drop(inner);
+        self.publish(Event::Swap(Box::new(swap))).await;
 
         if !self.test_mode && quote.side == Side::Out {
             let pk = hex::encode(xonly_from_secret(&self.lp_wallet(&quote.lp_id)?.secret));
@@ -2785,6 +2828,8 @@ struct PersistFile {
     bonds: HashMap<String, u64>,
     #[serde(default)]
     reputation: HashMap<String, (u64, u64)>,
+    #[serde(default)]
+    webhooks: Vec<WebhookRequest>,
 }
 
 impl From<&Inner> for PersistFile {
@@ -2815,6 +2860,7 @@ impl From<&Inner> for PersistFile {
             plans: inner.plans.values().cloned().collect(),
             bonds: inner.bonds.clone(),
             reputation: inner.reputation.clone(),
+            webhooks: inner.webhooks.clone(),
         }
     }
 }
@@ -4079,5 +4125,44 @@ mod tests {
         let alpha = e.inventory().await.into_iter().find(|lp| lp.id == "lp-alpha").unwrap();
         assert_eq!(alpha.fills, 3);
         assert_eq!(alpha.score_ppm, 4 * 1_000_000 / 5);
+    }
+
+    #[tokio::test]
+    async fn swap_changes_stream_as_events() {
+        let e = engine();
+        let mut rx = e.subscribe();
+        let user = generate_keypair();
+        let q = e
+            .create_quote(CreateQuoteRequest {
+                side: Side::In,
+                amount_sats: 10_000,
+                user_tachi_address: Some("tb1ptest".into()),
+                user_l1_address: None,
+                user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
+                deadline_blocks: None,
+            })
+            .await
+            .unwrap();
+        let s = e.open_swap(q.id).await.unwrap();
+        e.observe_lock(
+            s.id,
+            ObserveLockRequest {
+                txid: "ab".repeat(32),
+                vout: 0,
+                value_sats: 10_000,
+            },
+        )
+        .await
+        .unwrap();
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            let Event::Swap(sw) = &ev;
+            assert_eq!(sw.id, s.id);
+            assert!(ev.sse_frame().starts_with("event: swap\ndata: {"));
+            seen.push(sw.status);
+        }
+        assert_eq!(seen.first(), Some(&SwapStatus::Quoted));
+        assert_eq!(seen.last(), Some(&SwapStatus::LpSettled));
     }
 }

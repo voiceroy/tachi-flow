@@ -261,7 +261,8 @@
 
     async function refreshMeta() {
       const m = await j("/v1/meta");
-      $("meta").textContent = m.bounty + " · " + m.network + " · " + m.tachi + " · block " + m.height;
+      $("meta").textContent = m.bounty + " · " + m.network + " · " + m.tachi + " · block " + m.height +
+        (liveUp() ? " · live" : "");
     }
 
     async function refreshBooks() {
@@ -461,7 +462,27 @@
       }
     };
 
+    // Live updates: one server-sent event stream for every swap. Polling is
+    // only a fallback if the stream is down.
+    let live = null, listTimer = null;
     let plan = null;
+
+    function refreshListsSoon() {
+      clearTimeout(listTimer);
+      listTimer = setTimeout(() => { refreshBooks(); refreshSwaps(); }, 300);
+    }
+
+    function connectLive() {
+      if (!window.EventSource) return;
+      live = new EventSource("/v1/events");
+      live.addEventListener("swap", (m) => {
+        const s = JSON.parse(m.data).data;
+        if (swap && s.id === swap.id) showSwap(s);
+        refreshListsSoon();
+      });
+    }
+
+    function liveUp() { return live && live.readyState === 1; }
 
     $("btnPlan").onclick = async () => {
       try {
@@ -503,6 +524,7 @@
     };
 
     function startPoll() {
+      if (liveUp()) return;
       if (poll) clearInterval(poll);
       poll = setInterval(async () => {
         if (!swap) return;
@@ -520,10 +542,12 @@
     }
 
     ensureKeys();
+    connectLive();
     refreshMeta();
     refreshBooks();
     refreshSwaps();
-    setInterval(() => { refreshBooks(); refreshSwaps(); refreshMeta(); }, 8000);
+    // Swaps arrive live; books and the block height still refresh on a timer.
+    setInterval(() => { refreshBooks(); refreshMeta(); if (!liveUp()) refreshSwaps(); }, 8000);
   </script>
 </body>
 </html>
