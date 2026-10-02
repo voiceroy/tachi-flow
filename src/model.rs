@@ -43,6 +43,18 @@ pub struct LiquidityProvider {
     pub vault_exit_blocks: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backing: Option<String>,
+    /// VTXOs this desk has posted to escrow. Pays users when the desk defaults.
+    #[serde(default)]
+    pub bond_sats: u64,
+    /// Swaps this desk completed.
+    #[serde(default)]
+    pub fills: u64,
+    /// Swaps this desk failed (never locked for `out`, never paid a funded `in`).
+    #[serde(default)]
+    pub defaults: u64,
+    /// `(fills + 1) / (fills + defaults + 2)` in ppm; below 400k the desk stops routing.
+    #[serde(default)]
+    pub score_ppm: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +229,14 @@ pub struct Swap {
     pub lock_batch_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<Uuid>,
+    /// The desk failed this swap (see `LiquidityProvider::defaults`).
+    #[serde(default)]
+    pub desk_defaulted: bool,
+    /// VTXOs paid to the user from the desk's bond after a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensation_sats: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensation_vtxo_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

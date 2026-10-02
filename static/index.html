@@ -266,14 +266,19 @@
 
     async function refreshBooks() {
       const rows = await j("/v1/inventory");
-      const head = "<table><thead><tr><th>Desk</th><th>Fee</th><th>On-chain</th><th>Tachi VTXOs</th><th>Vault exit</th></tr></thead><tbody>";
-      const body = rows.map(lp => `<tr>
-        <td>${lp.id}${lp.defaulted ? " (stopped)" : ""}</td>
+      const head = "<table><thead><tr><th>Desk</th><th>Fee</th><th>On-chain</th><th>Tachi VTXOs</th><th>Bond</th><th>Track record</th></tr></thead><tbody>";
+      const body = rows.map(lp => {
+        const score = (lp.score_ppm / 10000).toFixed(0) + "%";
+        const benched = lp.defaulted || lp.score_ppm < 400000;
+        return `<tr>
+        <td>${lp.id}${benched ? " (not routing)" : ""}</td>
         <td>${feePct(lp.fee_ppm)}</td>
         <td>${sats(lp.l1_sats)}</td>
         <td>${sats(lp.vtxo_sats)}</td>
-        <td>${lp.vault_exit_blocks || 1008} blocks</td>
-      </tr>`).join("");
+        <td>${lp.bond_sats ? sats(lp.bond_sats) : "none"}</td>
+        <td>${lp.fills} filled · ${lp.defaults} defaulted · score ${score}</td>
+      </tr>`;
+      }).join("");
       $("books").innerHTML = head + body + "</tbody></table>";
     }
 

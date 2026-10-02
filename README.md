@@ -36,6 +36,7 @@ A TAURUS vault has one exit: the whole deposit, after a fixed ~1008-block CSV, a
 - **Pick your deadline (outbound).** `deadline_blocks` (0–1008) says how long the desk may wait before locking your bitcoin. Later is cheaper, down to 80% off at a full vault-exit wait. `GET /v1/price-curve` shows fee by deadline for each desk.
 - **Batched exits.** Every outbound lock that is due, deadline or "now", is funded by the desk's next batch pass (each sync, ~8 s), one L1 tx per desk. Each swap records its `l1_lock_vout` and `lock_batch_size`.
 - **Split exits.** `POST /v1/exits` splits any amount (also above one swap's 2M limit or one desk's stock) into legs, cheapest marginal price first, never leaving a remainder too small to be its own leg. Every leg is a firm quote; `POST /v1/exits/{id}/accept` opens them all. If the desks can't cover the whole amount, nothing is reserved.
+- **Desk bonds and track record.** Desks post VTXOs to an escrow key (`POST /v1/lps/{id}/bond`, operator route). A desk *defaults* when it never locks bitcoin for an outbound swap, or never pays a funded inbound lock, before the timeout margin. Then the user gets 1% of the swap (at least 500 sats, at most what is bonded) in VTXOs from the bond. Each desk's score is `(fills + 1) / (fills + defaults + 2)`; below 40% it stops routing. The books show bond, fills, defaults and score.
 
 Defaults (ppm): skew ±10,000 at full imbalance, 3,000/hour of quote TTL, 80% max deadline discount, fee floor 500, cap 50,000 (`PricingConfig`).
 
@@ -56,7 +57,7 @@ Env:
 | `TEST_MODE` | unset = live Tachi |
 | `ADMIN_TOKEN` | unset = read/create `tachi-flow-admin.token` (0600) |
 
-LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `tachi-lp.secret`).
+LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `tachi-lp.secret`). Bond escrow: `tachi-escrow.secret`.
 
 ## API
 
@@ -71,7 +72,7 @@ LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `
 - `POST /v1/demo/keys` — refund pubkey, Tachi x-only, L1 `bcrt1q…`
 - `POST /v1/exits` · `GET /v1/exits/{id}` · `POST /v1/exits/{id}/accept` — split exits
 
-Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>`): `/v1/vtxo/send`, `/v1/vtxo/deposit`, `/v1/swaps/{id}/observe/lock`, `/v1/swaps/{id}/observe/vtxo`, `/v1/swaps/{id}/claim`, `/v1/swaps/{id}/lp-default`. There is no CORS layer; the UI is same-origin.
+Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>`): `/v1/vtxo/send`, `/v1/vtxo/deposit`, `/v1/swaps/{id}/observe/lock`, `/v1/swaps/{id}/observe/vtxo`, `/v1/swaps/{id}/claim`, `/v1/swaps/{id}/lp-default`, `/v1/lps/{id}/bond`. There is no CORS layer; the UI is same-origin.
 
 ## Swap lifecycle
 
@@ -92,3 +93,4 @@ Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>
 - Outbound VTXOs themselves are not scripted (Tachi transfers are owner-based); safety is **LP locks L1 first**, then you pay.
 - Outbound is **not trustless**. The desk holds the preimage. After you pay VTXOs, a dishonest desk could withhold it and refund its lock after the timeout. This desk reveals the preimage on the swap (`preimage_hex`) as soon as it sees your payment, so you can claim with any wallet, but that is a promise, not a protocol guarantee. A real fix needs hash-locked VTXOs on Tachi.
 - Tachi transfers carry no memo. Outbound payments are matched automatically only when unambiguous (exact amount, new coin, no other open swap on that desk waiting for the same amount); otherwise pay through `pay-vtxo`, which records the payment id.
+- **Bonds are custodial.** This server holds the escrow key, so a bond protects users only as far as the operator is honest. There is no bond withdrawal route yet.

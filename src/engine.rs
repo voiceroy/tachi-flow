@@ -50,6 +50,14 @@ pub const VAULT_EXIT_BLOCKS: u32 = 1008;
 const CLAIM_FEE_SATS: u64 = 500;
 /// Test mode has no chain behind it.
 const SIM_HEIGHT: u32 = 200_000;
+/// Spend-lock id for the bond escrow wallet.
+const ESCROW_ID: &str = "escrow";
+/// Desks scoring below this (fills vs defaults, Laplace-smoothed) stop routing.
+const MIN_ROUTING_SCORE_PPM: u64 = 400_000;
+/// What a defaulting desk owes the user from its bond: share of the swap...
+const DEFAULT_PENALTY_PPM: u64 = 10_000;
+/// ...but at least this much (capped by the bond itself).
+const MIN_COMPENSATION_SATS: u64 = 500;
 
 /// Knobs for [`price`]. All values are parts per million.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -108,6 +116,10 @@ struct Inner {
     /// Signed outbound L1 locks, by swap id, re-broadcast until visible.
     pending_locks: HashMap<Uuid, String>,
     plans: HashMap<Uuid, ExitPlan>,
+    /// VTXOs each desk has in escrow.
+    bonds: HashMap<String, u64>,
+    /// (fills, defaults) per desk.
+    reputation: HashMap<String, (u64, u64)>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -191,9 +203,11 @@ pub struct Engine {
     persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// One in-flight operation per swap. Anything that moves money holds it.
     swap_locks: Arc<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
-    /// One in-flight spend per desk wallet.
+    /// One in-flight spend per desk wallet (and the escrow).
     lp_spends: Arc<HashMap<String, Arc<tokio::sync::Mutex<LpSpend>>>>,
     pricing: PricingConfig,
+    /// Holds desk bonds. Custodial: this server controls the key.
+    escrow: SecretKey,
 }
 
 impl Engine {
@@ -270,7 +284,9 @@ impl Engine {
         };
         let lp_spends = wallets
             .iter()
-            .map(|w| (w.id.clone(), Arc::default()))
+            .map(|w| w.id.clone())
+            .chain([ESCROW_ID.to_string()])
+            .map(|id| (id, Arc::default()))
             .collect();
         Self {
             inner: Arc::new(RwLock::new(Inner {
@@ -287,12 +303,31 @@ impl Engine {
             swap_locks: Arc::default(),
             lp_spends: Arc::new(lp_spends),
             pricing: PricingConfig::default(),
+            escrow: generate_keypair().secret,
         }
     }
 
     pub fn with_pricing(mut self, pricing: PricingConfig) -> Self {
         self.pricing = pricing;
         self
+    }
+
+    pub fn with_escrow(mut self, secret: SecretKey) -> Self {
+        self.escrow = secret;
+        self
+    }
+
+    pub fn escrow_pubkey_hex(&self) -> String {
+        hex::encode(xonly_from_secret(&self.escrow))
+    }
+
+    /// Secret behind a spend lock id: a desk wallet, or the escrow.
+    fn spend_secret(&self, id: &str) -> Result<SecretKey, Error> {
+        if id == ESCROW_ID {
+            Ok(self.escrow)
+        } else {
+            Ok(self.lp_wallet(id)?.secret)
+        }
     }
 
     pub fn pricing(&self) -> PricingConfig {
@@ -360,6 +395,9 @@ impl Engine {
         inner.pending_payouts = file.pending_payouts;
         inner.pending_locks = file.pending_locks;
         inner.plans = file.plans.into_iter().map(|p| (p.id, p)).collect();
+        inner.bonds = file.bonds;
+        inner.reputation = file.reputation;
+        apply_desk_stats(&mut inner);
         tracing::info!(
             quotes = inner.quotes.len(),
             swaps = inner.swaps.len(),
@@ -523,7 +561,9 @@ impl Engine {
         if !self.test_mode {
             self.refresh_live_inventory().await;
         }
-        self.inner.read().await.lps.clone()
+        let mut inner = self.inner.write().await;
+        apply_desk_stats(&mut inner);
+        inner.lps.clone()
     }
 
     async fn live_vtxo_sats_for(&self, secret: &SecretKey) -> u64 {
@@ -575,6 +615,7 @@ impl Engine {
                 );
             }
         }
+        apply_desk_stats(&mut inner);
     }
 
     pub async fn list_swaps(&self) -> Vec<Swap> {
@@ -1097,6 +1138,9 @@ impl Engine {
             l1_lock_vout: None,
             lock_batch_size: None,
             plan_id: quote.plan_id,
+            desk_defaulted: false,
+            compensation_sats: None,
+            compensation_vtxo_id: None,
         };
 
         if let Some(preimage) = inner.preimages.remove(&quote.id) {
@@ -1590,6 +1634,7 @@ impl Engine {
             &dest,
         )?;
         let sent = self.broadcast_l1(&hex).await?;
+        self.record_fill(&swap.lp_id).await;
         self.update_swap(id, |s| {
             s.claim_tx_hex = Some(hex);
             s.status = SwapStatus::Claimed;
@@ -1727,9 +1772,10 @@ impl Engine {
         Ok(swap)
     }
 
-    /// Pay VTXOs for an inbound swap exactly once. The signed tx is persisted
-    /// before broadcast; a retry re-sends it, or confirms it already landed,
-    /// and only re-signs when the old tx provably cannot land.
+    /// Pay VTXOs exactly once for `id` (a swap or a compensation) from
+    /// a desk wallet or the escrow. The signed tx is persisted before
+    /// broadcast; a retry re-sends it, or confirms it already landed, and only
+    /// re-signs when the old tx provably cannot land.
     async fn settle_payout(
         &self,
         id: Uuid,
@@ -1738,7 +1784,7 @@ impl Engine {
         amount_sats: u64,
     ) -> Result<SignedTransfer, Error> {
         let mut spend = self.lp_spend(lp_id).await?;
-        let secret = self.lp_wallet(lp_id)?.secret;
+        let secret = self.spend_secret(lp_id)?;
         let pk_hex = hex::encode(xonly_from_secret(&secret));
 
         let pending = self.inner.read().await.pending_payouts.get(&id).cloned();
@@ -1898,6 +1944,7 @@ impl Engine {
                 &swap.lp_id,
                 swap.amount_sats,
             );
+            self.record_fill(&swap.lp_id).await;
             return self
                 .update_swap(id, |s| s.status = SwapStatus::Claimed)
                 .await;
@@ -1909,6 +1956,7 @@ impl Engine {
         match self.broadcast_l1(&hex).await {
             Ok(txid) => {
                 tracing::info!(%txid, %id, "broadcast HTLC claim");
+                self.record_fill(&swap.lp_id).await;
                 self.update_swap(id, |s| {
                     s.status = SwapStatus::Claimed;
                     s.demo_note = Some(format!("Desk claimed the lock ({txid})."));
@@ -2065,10 +2113,22 @@ impl Engine {
         Ok(())
     }
 
+    /// Too close to the timeout to settle. Also decides whether the desk is to
+    /// blame: it never locked bitcoin for an `out` swap, or the user's `in`
+    /// lock was funded and the desk never paid. A desk default costs it
+    /// reputation and pays the user from its bond.
     async fn expire(&self, id: Uuid) -> Result<Swap, Error> {
         let swap = self.get_swap(id).await?;
         let timeout = swap.pay.htlc().map(|l| l.timeout_height).unwrap_or_default();
-        let note = match swap.side {
+        let desk_failed = match swap.side {
+            Side::Out => swap.l1_lock_txid.is_none() && swap.pay.htlc().is_some(),
+            Side::In => {
+                // A pending payout means the desk may have paid; never blame it then.
+                let maybe_paid = self.inner.read().await.pending_payouts.contains_key(&id);
+                !self.test_mode && !maybe_paid && self.scan_htlc(&swap).await?.is_some()
+            }
+        };
+        let mut note = match swap.side {
             Side::In => format!(
                 "Too close to the lock's timeout (block {timeout}) to settle safely. If you paid the lock, refund it after block {timeout}."
             ),
@@ -2076,11 +2136,108 @@ impl Engine {
                 "Expired before payment. Do not send Tachi coins now. The desk takes its lock back after block {timeout}."
             ),
         };
-        self.update_swap(id, |s| {
-            s.status = SwapStatus::Expired;
-            s.demo_note = Some(note);
-        })
-        .await
+        let compensation = if desk_failed {
+            let comp = self.record_default(&swap.lp_id, swap.amount_sats).await;
+            note.push_str(&format!(
+                " The desk defaulted on this swap{}.",
+                if comp > 0 {
+                    format!("; {comp} sats from its bond are on their way to your Tachi key")
+                } else {
+                    " (it had no bond to pay you from)".to_string()
+                }
+            ));
+            Some(comp).filter(|c| *c > 0)
+        } else {
+            None
+        };
+        let swap = self
+            .update_swap(id, |s| {
+                s.status = SwapStatus::Expired;
+                s.desk_defaulted = desk_failed;
+                s.compensation_sats = compensation;
+                s.demo_note = Some(note);
+            })
+            .await?;
+        if compensation.is_some() {
+            // Failure is retried by sync (`compensation_owed`).
+            if let Err(err) = self.pay_compensation(&swap).await {
+                tracing::warn!(%err, %id, "bond compensation");
+            }
+        }
+        self.get_swap(id).await
+    }
+
+    /// Count a default and reserve compensation out of the desk's bond.
+    async fn record_default(&self, lp_id: &str, amount_sats: u64) -> u64 {
+        let comp = {
+            let mut inner = self.inner.write().await;
+            inner.reputation.entry(lp_id.to_string()).or_default().1 += 1;
+            let bond = inner.bonds.entry(lp_id.to_string()).or_default();
+            let owed = (amount_sats * DEFAULT_PENALTY_PPM / 1_000_000).max(MIN_COMPENSATION_SATS);
+            let comp = owed.min(*bond);
+            *bond -= comp;
+            apply_desk_stats(&mut inner);
+            comp
+        };
+        tracing::warn!(lp = lp_id, comp, "desk default recorded");
+        self.save_state().await;
+        comp
+    }
+
+    async fn record_fill(&self, lp_id: &str) {
+        let mut inner = self.inner.write().await;
+        inner.reputation.entry(lp_id.to_string()).or_default().0 += 1;
+        apply_desk_stats(&mut inner);
+    }
+
+    /// Pay a default's compensation from escrow to the user's Tachi key.
+    async fn pay_compensation(&self, swap: &Swap) -> Result<(), Error> {
+        let Some(amount) = swap.compensation_sats else {
+            return Ok(());
+        };
+        if swap.compensation_vtxo_id.is_some() {
+            return Ok(());
+        }
+        let dest = swap
+            .user_tachi_address
+            .clone()
+            .filter(|a| looks_like_tachi_owner(a))
+            .or_else(|| swap.user_pubkey_hex.clone())
+            .ok_or_else(|| Error::Invalid("no Tachi key to compensate".into()))?;
+        let vtxo_id = if self.test_mode {
+            format!("sim-comp-{}", swap.id)
+        } else {
+            self.settle_payout(comp_key(swap.id), ESCROW_ID, &dest, amount)
+                .await?
+                .output_vtxo_id
+        };
+        self.inner.write().await.pending_payouts.remove(&comp_key(swap.id));
+        self.update_swap(swap.id, |s| s.compensation_vtxo_id = Some(vtxo_id))
+            .await?;
+        Ok(())
+    }
+
+    /// Desk posts VTXOs to escrow as a bond. Custodial: this server holds the
+    /// escrow key, so a bond protects users only as far as the operator is honest.
+    pub async fn post_bond(&self, lp_id: &str, amount_sats: u64) -> Result<u64, Error> {
+        self.lp_wallet(lp_id)?;
+        if amount_sats < MIN_SWAP_SATS {
+            return Err(Error::AmountTooSmall(MIN_SWAP_SATS));
+        }
+        if !self.test_mode {
+            self.send_vtxo_from(lp_id, &self.escrow_pubkey_hex(), amount_sats)
+                .await?;
+        }
+        let total = {
+            let mut inner = self.inner.write().await;
+            let bond = inner.bonds.entry(lp_id.to_string()).or_default();
+            *bond += amount_sats;
+            let total = *bond;
+            apply_desk_stats(&mut inner);
+            total
+        };
+        self.save_state().await;
+        Ok(total)
     }
 
     pub async fn mark_lp_default(&self, id: Uuid) -> Result<Swap, Error> {
@@ -2122,7 +2279,7 @@ impl Engine {
         amount_sats: u64,
     ) -> Result<SignedTransfer, Error> {
         let mut spend = self.lp_spend(lp_id).await?;
-        let secret = self.lp_wallet(lp_id)?.secret;
+        let secret = self.spend_secret(lp_id)?;
         let built = self
             .build_transfer(&secret, &spend, dest, amount_sats)
             .await?;
@@ -2315,6 +2472,9 @@ impl Engine {
             .pay
             .htlc()
             .is_some_and(|l| h + SAFETY_MARGIN_BLOCKS >= l.timeout_height);
+        if compensation_owed(&before) {
+            self.pay_compensation(&before).await?;
+        }
         match (before.side, before.status) {
             (Side::In, SwapStatus::Quoted) => {
                 if near_timeout {
@@ -2505,6 +2665,11 @@ impl Engine {
     }
 }
 
+/// Pending-payout key for a default's compensation, distinct from the swap's own.
+fn comp_key(swap_id: Uuid) -> Uuid {
+    Uuid::new_v5(&swap_id, b"compensation")
+}
+
 pub fn parse_secret(secret_hex: &str) -> Result<SecretKey, Error> {
     let bytes = hex::decode(secret_hex.trim()).map_err(|e| Error::Invalid(e.to_string()))?;
     SecretKey::from_slice(&bytes).map_err(|e| Error::Invalid(format!("secret: {e}")))
@@ -2538,10 +2703,28 @@ fn needs_sync(s: &Swap) -> bool {
     match (s.side, s.status) {
         (_, SwapStatus::Quoted) | (Side::In, SwapStatus::LpSettled) => true,
         (Side::Out, SwapStatus::LpSettled) => s.l1_lock_txid.is_none(),
-        (Side::Out, SwapStatus::Expired | SwapStatus::Refunded | SwapStatus::Failed) => {
-            s.l1_lock_txid.is_some() && s.refund_txid.is_none()
+        (Side::Out, SwapStatus::Expired | SwapStatus::Refunded | SwapStatus::Failed)
+            if s.l1_lock_txid.is_some() && s.refund_txid.is_none() =>
+        {
+            true
         }
-        _ => false,
+        _ => compensation_owed(s),
+    }
+}
+
+/// A default was recorded but the bond payout has not landed yet.
+fn compensation_owed(s: &Swap) -> bool {
+    s.desk_defaulted && s.compensation_sats.is_some() && s.compensation_vtxo_id.is_none()
+}
+
+/// Refresh each desk's bond / fills / defaults / score from the books.
+fn apply_desk_stats(inner: &mut Inner) {
+    for lp in inner.lps.iter_mut() {
+        let (fills, defaults) = inner.reputation.get(&lp.id).copied().unwrap_or_default();
+        lp.fills = fills;
+        lp.defaults = defaults;
+        lp.score_ppm = (fills + 1) * 1_000_000 / (fills + defaults + 2);
+        lp.bond_sats = inner.bonds.get(&lp.id).copied().unwrap_or_default();
     }
 }
 
@@ -2598,6 +2781,10 @@ struct PersistFile {
     pending_locks: HashMap<Uuid, String>,
     #[serde(default)]
     plans: Vec<ExitPlan>,
+    #[serde(default)]
+    bonds: HashMap<String, u64>,
+    #[serde(default)]
+    reputation: HashMap<String, (u64, u64)>,
 }
 
 impl From<&Inner> for PersistFile {
@@ -2626,6 +2813,8 @@ impl From<&Inner> for PersistFile {
             pending_payouts: inner.pending_payouts.clone(),
             pending_locks: inner.pending_locks.clone(),
             plans: inner.plans.values().cloned().collect(),
+            bonds: inner.bonds.clone(),
+            reputation: inner.reputation.clone(),
         }
     }
 }
@@ -2663,6 +2852,10 @@ fn lp(
         source: Some(source.into()),
         vault_exit_blocks: Some(VAULT_EXIT_BLOCKS),
         backing: Some("Desk reserve. TAURUS exit is 1008 blocks; swaps skip that wait.".into()),
+        bond_sats: 0,
+        fills: 0,
+        defaults: 0,
+        score_ppm: 500_000,
     }
 }
 
@@ -2729,14 +2922,19 @@ fn book(lp: &LiquidityProvider, side: Side) -> u64 {
 }
 
 fn can_fill(lp: &LiquidityProvider, side: Side, amount_sats: u64) -> bool {
-    !lp.defaulted
+    routable(lp)
         && amount_sats <= lp.max_swap_sats
         && book(lp, side) >= reserve_sats(side, amount_sats)
 }
 
+/// Not banned by the operator and not failing too often.
+fn routable(lp: &LiquidityProvider) -> bool {
+    !lp.defaulted && lp.score_ppm >= MIN_ROUTING_SCORE_PPM
+}
+
 /// Largest amount a desk can take on `side` right now (0 if it cannot route).
 fn capacity(lp: &LiquidityProvider, side: Side) -> u64 {
-    if lp.defaulted {
+    if !routable(lp) {
         return 0;
     }
     let book = match side {
@@ -3789,5 +3987,97 @@ mod tests {
             assert_eq!(a.vtxo_sats, b.vtxo_sats, "{} book leaked", a.id);
         }
         assert!(e.inner.read().await.quotes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn desk_default_pays_from_bond_and_costs_routing() {
+        let e = engine();
+        assert_eq!(e.post_bond("lp-alpha", 50_000).await.unwrap(), 50_000);
+        let user = generate_keypair();
+        // A 10k out routes to alpha (cheapest base fee; its 50k L1 covers it).
+        let q = e
+            .create_quote(CreateQuoteRequest {
+                side: Side::Out,
+                amount_sats: 10_000,
+                user_tachi_address: None,
+                user_l1_address: Some("tb1qtest".into()),
+                user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
+                deadline_blocks: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(q.lp_id, "lp-alpha");
+        let swap = e.open_swap(q.id).await.unwrap();
+
+        // The desk never locked bitcoin before the timeout: its default.
+        let expired = e.expire(swap.id).await.unwrap();
+        assert_eq!(expired.status, SwapStatus::Expired);
+        assert!(expired.desk_defaulted);
+        let owed = (q.amount_sats * DEFAULT_PENALTY_PPM / 1_000_000).max(MIN_COMPENSATION_SATS);
+        assert_eq!(expired.compensation_sats, Some(owed));
+        assert_eq!(
+            expired.compensation_vtxo_id.as_deref(),
+            Some(format!("sim-comp-{}", swap.id).as_str())
+        );
+
+        let alpha = e
+            .inventory()
+            .await
+            .into_iter()
+            .find(|lp| lp.id == "lp-alpha")
+            .unwrap();
+        assert_eq!(alpha.bond_sats, 50_000 - owed);
+        assert_eq!((alpha.fills, alpha.defaults), (0, 1));
+        assert!(alpha.score_ppm < MIN_ROUTING_SCORE_PPM);
+        // With a poor score alpha drops out of routing.
+        let next = e
+            .create_quote(CreateQuoteRequest {
+                side: Side::In,
+                amount_sats: 10_000,
+                user_tachi_address: Some("tb1ptest".into()),
+                user_l1_address: None,
+                user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
+                deadline_blocks: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.lp_id, "lp-bravo");
+    }
+
+    #[tokio::test]
+    async fn fills_raise_the_score() {
+        let e = engine();
+        let user = generate_keypair();
+        for i in 0..3 {
+            let q = e
+                .create_quote(CreateQuoteRequest {
+                    side: Side::In,
+                    amount_sats: 10_000,
+                    user_tachi_address: Some("tb1ptest".into()),
+                    user_l1_address: None,
+                    user_refund_pubkey_hex: Some(user.public.to_string()),
+                    ttl_secs: None,
+                    deadline_blocks: None,
+                })
+                .await
+                .unwrap();
+            let s = e.open_swap(q.id).await.unwrap();
+            e.observe_lock(
+                s.id,
+                ObserveLockRequest {
+                    txid: format!("{i:064x}"),
+                    vout: 0,
+                    value_sats: 10_000,
+                },
+            )
+            .await
+            .unwrap();
+            e.claim(s.id).await.unwrap();
+        }
+        let alpha = e.inventory().await.into_iter().find(|lp| lp.id == "lp-alpha").unwrap();
+        assert_eq!(alpha.fills, 3);
+        assert_eq!(alpha.score_ppm, 4 * 1_000_000 / 5);
     }
 }

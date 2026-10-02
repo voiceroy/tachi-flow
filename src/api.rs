@@ -58,6 +58,8 @@ struct Meta {
     swap_timeout_blocks: u32,
     pricing: PricingConfig,
     deadline_presets: [u32; 6],
+    /// Tachi key holding desk bonds (custodial escrow).
+    escrow_pubkey: String,
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -86,7 +88,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(pay_outbound)
         .service(plan_exit)
         .service(get_plan)
-        .service(accept_plan);
+        .service(accept_plan)
+        .service(post_bond);
 }
 
 #[get("/")]
@@ -110,6 +113,7 @@ async fn meta(engine: web::Data<Engine>) -> HttpResponse {
         swap_timeout_blocks: HTLC_TIMEOUT_BLOCKS,
         pricing: engine.pricing(),
         deadline_presets: DEADLINE_PRESETS,
+        escrow_pubkey: engine.escrow_pubkey_hex(),
     })
 }
 
@@ -133,6 +137,23 @@ async fn accept_plan(
     path: web::Path<Uuid>,
 ) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Ok().json(engine.accept_plan(path.into_inner()).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct BondBody {
+    amount_sats: u64,
+}
+
+/// Desk posts VTXOs to the bond escrow (#6). Operator route.
+#[post("/v1/lps/{id}/bond")]
+async fn post_bond(
+    _admin: Admin,
+    engine: web::Data<Engine>,
+    path: web::Path<String>,
+    body: web::Json<BondBody>,
+) -> Result<HttpResponse, Error> {
+    let total = engine.post_bond(&path, body.amount_sats).await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "lp_id": *path, "bond_sats": total })))
 }
 
 #[get("/v1/swaps")]

@@ -47,6 +47,7 @@ async fn main() -> std::io::Result<()> {
                 ("lp-bravo".into(), bravo, 10_000),
             ],
         )
+        .with_escrow(load_or_create_secret("tachi-escrow.secret", ""))
         .with_persist("tachi-flow-state.json")
         .unwrap_or_else(|err| panic!("{err}"))
     };
