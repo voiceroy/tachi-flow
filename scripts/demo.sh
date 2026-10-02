@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8080}"
+# Operator routes (/v1/vtxo/*) need the admin token the server created.
+ADMIN_TOKEN="${ADMIN_TOKEN:-$(cat tachi-flow-admin.token 2>/dev/null || true)}"
 
 echo "== health"
 curl -sS "$BASE/health" | python3 -m json.tool
@@ -15,7 +17,7 @@ UNSPENT=$(python3 -c "import json,sys; print(json.load(sys.stdin)['unspent_sats'
 if [ "$UNSPENT" -lt 50000 ]; then
   echo "== deposit 100000 VTXOs to LP (regtest)"
   curl -sS -X POST "$BASE/v1/vtxo/deposit" \
-    -H 'content-type: application/json' \
+    -H 'content-type: application/json' -H "x-admin-token: $ADMIN_TOKEN" \
     -d '{"amount_sats":100000}' | python3 -m json.tool
   sleep 3
   curl -sS "$BASE/v1/tachi/wallet" | python3 -m json.tool
@@ -29,7 +31,7 @@ TACHI=$(python3 -c "import json,sys; print(json.load(sys.stdin)['tachi_xonly_hex
 
 echo "== send 10000 VTXOs to the demo Tachi key"
 curl -sS -X POST "$BASE/v1/vtxo/send" \
-  -H 'content-type: application/json' \
+  -H 'content-type: application/json' -H "x-admin-token: $ADMIN_TOKEN" \
   -d "{\"dest\":\"$TACHI\",\"amount_sats\":10000}" | python3 -m json.tool
 sleep 2
 

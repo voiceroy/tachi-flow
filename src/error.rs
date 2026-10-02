@@ -26,6 +26,12 @@ pub enum Error {
     Bitcoin(String),
     #[error("tachi rpc: {0}")]
     Tachi(String),
+    /// Tachi (or its bitcoind) answered with an explicit error, e.g. CheckTx
+    /// code != 0. Unlike a transport failure, the tx was definitely not accepted.
+    #[error("tachi rejected tx: {0}")]
+    TachiRejected(String),
+    #[error("admin token required")]
+    Unauthorized,
 }
 
 #[derive(Serialize)]
@@ -44,7 +50,8 @@ impl ResponseError for Error {
             Self::AmountTooSmall(_) | Self::Invalid(_) | Self::Bitcoin(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Self::Tachi(_) => StatusCode::BAD_GATEWAY,
+            Self::Tachi(_) | Self::TachiRejected(_) => StatusCode::BAD_GATEWAY,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
         }
     }
 

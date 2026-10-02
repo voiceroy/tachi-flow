@@ -2,16 +2,36 @@
 
 OP_Freedom **bounty #10 — Liquidity Management** PoC against **live Tachi regtest** (`https://rpc-regtest.tachibtc.com`).
 
-Quotes L1 ↔ VTXO swaps. Inventory is the LP’s real Tachi VTXOs plus Bitcoin UTXOs at the claim address (via Tachi’s `scantxoutset`). Inbound HTLCs are watched on bitcoind; VTXO payouts are TachiTx transfers. A background sync runs every 8 seconds.
+Quotes L1 ↔ VTXO swaps so you **skip a TAURUS ~1008-block vault exit**. Two desks reserve stock.
 
-## Run
+- **In:** you lock bitcoin in an HTLC (~144-block refund) → desk pays VTXOs → desk claims.
+- **Out:** desk locks bitcoin first (you claim with the preimage) → you send VTXOs → you claim the HTLC. Same script, roles reversed. Not “pay VTXOs and hope.”
+
+Open `http://127.0.0.1:8080` for the demo UI.
+
+## Demo (inbound, the path judges care about)
 
 ```bash
-cargo test
 cargo run
 ```
 
-Restart after pulls so `tachi-lp.secret` keeps the same Tachi identity.
+1. Open `http://127.0.0.1:8080`. The page creates a **demo identity** and keeps it in the browser.
+2. Direction: **I have bitcoin, I want Tachi coins**. Amount `20000`. Quote → Accept quote.
+3. Click **Fund with faucet**.  
+   Do **not** paste the lock address into https://faucet.tachibtc.com — that faucet rejects P2WSH lock addresses (`unknown output kind: p2wsh`). The desk faucets a normal wallet and forwards coins into the lock.
+4. Status moves to **claimed**. VTXOs sit on the Tachi key shown at the top.
+
+Optional outbound: quote **out** (same identity). Accept — the desk funds an HTLC to you. Then **Send my Tachi coins**. You claim the lock. If the desk never locks, you never send VTXOs. Clicking **Send** again after paying never pays twice; it only retries the claim.
+
+**Refund / cancel** cancels a swap before any bitcoin is locked. If you already paid an inbound lock and the desk did not settle, the same button refunds it on-chain once the lock's timeout block has passed.
+
+Swaps survive `cargo run` restarts (`tachi-flow-state.json`, gitignored). Empty LP books get a demo VTXO deposit on startup.
+
+## Run tests
+
+```bash
+cargo test
+```
 
 Env:
 
@@ -20,46 +40,39 @@ Env:
 | `BIND` | `127.0.0.1:8080` |
 | `TACHI_BASE_URL` | `https://rpc-regtest.tachibtc.com` |
 | `BITCOIN_NETWORK` | `regtest` |
-| `TACHI_LP_SECRET_HEX` | else `tachi-lp.secret` |
+| `TACHI_FAUCET_URL` | `https://faucet.tachibtc.com` |
+| `TEST_MODE` | unset = live Tachi |
+| `ADMIN_TOKEN` | unset = read/create `tachi-flow-admin.token` (0600) |
 
-Then `./scripts/demo.sh`.
-
-## Swap flow (live)
-
-**In (L1 → VTXO)**
-
-1. `POST /v1/quotes` with `user_tachi_address` = 64-char x-only or `bcrt1p…`, plus `user_refund_pubkey_hex`
-2. Pay the returned HTLC `bcrt1q…` on Tachi’s Bitcoin regtest
-3. `POST /v1/sync` (or wait ~8s) — scan finds the lock, LP sends VTXOs, claim tx is broadcast if bitcoind accepts it
-
-**Out (VTXO → L1)**
-
-1. Quote with `user_l1_address` = a **regtest** Bitcoin address (`bcrt1q…` / `bcrt1p…`)
-2. Pay VTXOs to the LP Tachi pubkey (`GET /` → `tachi_lp_pubkey`)
-3. Sync — new VTXO on the LP triggers an L1 send from the claim address (needs coins there, usually after inbound claims)
-
-Regtest VTXO balance can be topped up with `POST /v1/vtxo/deposit` (Tachi ledger deposit + min fee). That is a real daemon tx, not an in-process fake.
+LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `tachi-lp.secret`).
 
 ## API
 
-- `GET /` — service, bounty, `tachi_lp_pubkey`
-- `GET /health` — Tachi daemon
-- `GET /v1/inventory` — live LP (`source: tachi`)
-- `GET /v1/tachi/wallet` — unspent VTXOs
-- `POST /v1/vtxo/deposit` / `POST /v1/vtxo/send`
-- `POST /v1/quotes` — `side: in|out`
-- `POST /v1/swaps` — `{ "quote_id": "..." }`
-- `GET /v1/swaps/{id}`
-- `POST /v1/sync` — scan all quoted swaps
-- `POST /v1/swaps/{id}/sync`
-- `POST /v1/swaps/{id}/observe/lock` — same as sync for inbound (must be funded on chain)
-- `POST /v1/swaps/{id}/observe/vtxo` — `{ "vtxo_id": "<64 hex>" }` paid to the LP
-- `POST /v1/swaps/{id}/claim` — broadcast the HTLC claim
-- `POST /v1/demo/keys` — refund pubkey + `tachi_xonly_hex`
+- `GET /` — UI
+- `POST /v1/quotes` · `POST /v1/swaps` · `POST /v1/sync` · `POST /v1/swaps/{id}/sync`
+- `POST /v1/swaps/{id}/fund` — faucet helper for inbound
+- `POST /v1/swaps/{id}/pay-vtxo` — `{ "secret_hex": "..." }` for outbound from the demo key (idempotent)
+- `POST /v1/swaps/{id}/refund` — `{ "secret_hex": "..." }`; cancel, or on-chain refund after the timeout
+- `POST /v1/demo/keys` — refund pubkey, Tachi x-only, L1 `bcrt1q…`
+
+Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>`): `/v1/vtxo/send`, `/v1/vtxo/deposit`, `/v1/swaps/{id}/observe/lock`, `/v1/swaps/{id}/observe/vtxo`, `/v1/swaps/{id}/claim`, `/v1/swaps/{id}/lp-default`. There is no CORS layer; the UI is same-origin.
+
+## Swap lifecycle
+
+`quoted` → `lp_settled` → `claimed`, or `expired` / `refunded` / `failed`.
+
+- Timeouts are absolute block heights. The server fetches the tip before serving and refuses to quote while it is unknown.
+- The desk stops settling 12 blocks before a lock's timeout. Such swaps become `expired`; the user refunds an inbound lock after the timeout, and the desk takes back an unpaid outbound lock.
+- Desk payouts (VTXOs and L1 locks) are signed and saved before broadcast. Retries re-send the same tx or confirm it landed, so a lost reply cannot pay twice.
+- Open quotes and unsettled swaps hold desk inventory; live books are chain balance minus those holds.
+- State is written atomically. A corrupt `tachi-flow-state.json` stops startup instead of silently dropping preimages.
 
 ## Honest limits
 
 - Tachi **regtest**, not mainnet.
-- You still need Bitcoin on that regtest to fund an inbound HTLC (the hosted node may not give you a faucet).
-- Outbound L1 send needs UTXOs at the LP claim address (after a successful inbound claim, or a deposit to that `bcrt1q…`).
-- Unit tests keep an in-memory booth so they do not hit the public RPC.
+- The faucet helper is a **demo convenience**. A real wallet pays the lock directly.
+- Desk inventory is **LP float** (VTXOs + L1 claim address), labeled against a 1008-block TAURUS exit. It is not opening a vault for the user.
+- `POST /v1/vtxo/deposit` is a Tachi ledger mint for demo books, not a user TAURUS deposit.
+- Outbound VTXOs themselves are not scripted (Tachi transfers are owner-based); safety is **LP locks L1 first**, then you pay.
+- Outbound is **not trustless**. The desk holds the preimage. After you pay VTXOs, a dishonest desk could withhold it and refund its lock after the timeout. This desk reveals the preimage on the swap (`preimage_hex`) as soon as it sees your payment, so you can claim with any wallet, but that is a promise, not a protocol guarantee. A real fix needs hash-locked VTXOs on Tachi.
+- Tachi transfers carry no memo. Outbound payments are matched automatically only when unambiguous (exact amount, new coin, no other open swap on that desk waiting for the same amount); otherwise pay through `pay-vtxo`, which records the payment id.

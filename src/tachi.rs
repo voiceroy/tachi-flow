@@ -86,7 +86,7 @@ impl TachiClient {
             .map_err(|e| Error::Tachi(e.to_string()))?;
         let payload: Value = resp.json().await.map_err(|e| Error::Tachi(e.to_string()))?;
         if !payload.get("error").is_none_or(Value::is_null) {
-            return Err(Error::Tachi(payload["error"].to_string()));
+            return Err(Error::TachiRejected(payload["error"].to_string()));
         }
         Ok(payload.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -142,7 +142,32 @@ impl TachiClient {
     }
 
     pub async fn get_vtxo(&self, id: &str) -> Result<Vtxo, Error> {
-        self.get_json("/tachi_vtxo", &[("id", id)]).await
+        self.find_vtxo(id)
+            .await?
+            .ok_or_else(|| Error::Tachi(format!("vtxo {id} not found")))
+    }
+
+    /// `Ok(None)` only when Tachi says the VTXO does not exist (HTTP 404).
+    /// Transport errors stay errors so callers never mistake them for "not paid".
+    pub async fn find_vtxo(&self, id: &str) -> Result<Option<Vtxo>, Error> {
+        let resp = self
+            .http
+            .get(format!("{}/tachi_vtxo", self.base_url))
+            .query(&[("id", id)])
+            .send()
+            .await
+            .map_err(|e| Error::Tachi(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let text = resp.text().await.map_err(|e| Error::Tachi(e.to_string()))?;
+        if !status.is_success() {
+            return Err(Error::Tachi(format!("/tachi_vtxo HTTP {status}: {text}")));
+        }
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| Error::Tachi(format!("/tachi_vtxo decode: {e}: {text}")))
     }
 
     pub async fn address_vtxos(&self, address: &str) -> Result<Vec<Vtxo>, Error> {
@@ -206,7 +231,7 @@ impl TachiClient {
                 .get("log")
                 .and_then(Value::as_str)
                 .unwrap_or("checktx failed");
-            return Err(Error::Tachi(format!("CheckTx code {code}: {log}")));
+            return Err(Error::TachiRejected(format!("CheckTx code {code}: {log}")));
         }
         result
             .get("hash")
@@ -243,6 +268,31 @@ impl TachiClient {
             }
         }
         Ok(out)
+    }
+
+    /// Mempool-aware `gettxout`. Used so a just-broadcast faucet/lock tx is visible
+    /// before the next block (`scantxoutset` only sees confirmed coins).
+    pub async fn get_tx_out(&self, txid: &str, vout: u32) -> Result<Option<ChainUtxo>, Error> {
+        let result = self
+            .bitcoin_rpc("gettxout", serde_json::json!([txid, vout, true]))
+            .await?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        let value_sats = if let Some(s) = result.get("value_sats").and_then(Value::as_u64) {
+            s
+        } else {
+            let btc = result.get("value").and_then(Value::as_f64).unwrap_or(0.0);
+            (btc * 100_000_000.0).round() as u64
+        };
+        if value_sats == 0 {
+            return Ok(None);
+        }
+        Ok(Some(ChainUtxo {
+            txid: txid.to_string(),
+            vout,
+            value_sats,
+        }))
     }
 
     pub async fn send_raw_tx(&self, hex_tx: &str) -> Result<String, Error> {

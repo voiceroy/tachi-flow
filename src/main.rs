@@ -1,12 +1,14 @@
 use std::env;
+use std::path::Path;
 
-use actix_cors::Cors;
 use actix_web::{App, HttpServer, web};
 use bitcoin::Network;
 use tachi_flow::Engine;
-use tachi_flow::api;
+use tachi_flow::api::{self, AdminToken};
 use tachi_flow::tachi::TachiClient;
 use tracing_actix_web::TracingLogger;
+
+const ADMIN_TOKEN_FILE: &str = "tachi-flow-admin.token";
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -33,7 +35,7 @@ async fn main() -> std::io::Result<()> {
     );
     let engine = if test_mode {
         tracing::warn!("TEST_MODE: simulated lp-alpha / lp-bravo, no live Tachi books");
-        tachi_flow::Engine::simulated(tachi, network)
+        Engine::simulated(tachi, network)
     } else {
         let alpha = load_or_create_secret("tachi-lp-alpha.secret", "tachi-lp.secret");
         let bravo = load_or_create_secret("tachi-lp-bravo.secret", "");
@@ -45,38 +47,78 @@ async fn main() -> std::io::Result<()> {
                 ("lp-bravo".into(), bravo, 10_000),
             ],
         )
+        .with_persist("tachi-flow-state.json")
+        .unwrap_or_else(|err| panic!("{err}"))
     };
 
+    // HTLC timeouts are absolute heights; never quote before we know the tip.
+    engine.refresh_height().await;
+    if !test_mode && engine.cached_height() == 0 {
+        tracing::warn!("block height unknown; quotes fail until Tachi RPC answers");
+    }
+
+    let admin = AdminToken(load_or_create_admin_token());
     tracing::info!(
         %bind,
         network = %engine.network(),
         tachi = engine.tachi().base_url(),
         tachi_lp_pubkey = %engine.tachi_lp_pubkey_hex(),
-        "tachi-flow listening"
+        height = engine.cached_height(),
+        "tachi-flow listening (operator routes need the admin token)"
     );
+
+    if !test_mode {
+        let books = engine.clone();
+        tokio::spawn(async move {
+            if let Err(err) = books.ensure_demo_liquidity().await {
+                tracing::warn!(%err, "demo liquidity");
+            }
+        });
+    }
 
     let ticker = engine.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
             ticker.refresh_height().await;
-            let _ = ticker.refresh_live_inventory().await;
+            ticker.refresh_live_inventory().await;
             if let Err(err) = ticker.sync_all().await {
                 tracing::warn!(%err, "background sync");
             }
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
         }
     });
 
+    // No CORS layer: the UI is same-origin, and other sites must not be able
+    // to drive this desk from a visitor's browser.
     HttpServer::new(move || {
         App::new()
             .wrap(TracingLogger::default())
-            .wrap(Cors::permissive())
             .app_data(web::Data::new(engine.clone()))
+            .app_data(web::Data::new(admin.clone()))
             .configure(api::configure)
     })
     .bind(&bind)?
     .run()
     .await
+}
+
+/// `ADMIN_TOKEN` env, else `tachi-flow-admin.token`, else a new random token
+/// written there (mode 0600).
+fn load_or_create_admin_token() -> String {
+    if let Ok(token) = env::var("ADMIN_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return token.trim().to_string();
+    }
+    if let Ok(token) = std::fs::read_to_string(ADMIN_TOKEN_FILE)
+        && !token.trim().is_empty()
+    {
+        return token.trim().to_string();
+    }
+    let token = hex::encode(tachi_flow::htlc::random_preimage());
+    write_private(Path::new(ADMIN_TOKEN_FILE), &token).expect("write admin token");
+    tracing::info!(file = ADMIN_TOKEN_FILE, "created admin token");
+    token
 }
 
 fn load_or_create_secret(path: &str, migrate_from: &str) -> bitcoin::secp256k1::SecretKey {
@@ -92,6 +134,18 @@ fn load_or_create_secret(path: &str, migrate_from: &str) -> bitcoin::secp256k1::
         return bitcoin::secp256k1::SecretKey::from_slice(&bytes).expect("32-byte secp256k1 key");
     }
     let secret = tachi_flow::htlc::generate_keypair().secret;
-    let _ = std::fs::write(path, hex::encode(secret.secret_bytes()));
+    write_private(Path::new(path), &hex::encode(secret.secret_bytes())).expect("write lp secret");
     secret
+}
+
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(contents.as_bytes())
 }

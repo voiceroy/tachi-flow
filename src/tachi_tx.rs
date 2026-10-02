@@ -6,7 +6,8 @@
 
 use bitcoin::hashes::{Hash, sha256};
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey};
-use bitcoin::{Address, Network};
+use bitcoin::Address;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::tachi::Vtxo;
@@ -27,7 +28,7 @@ pub struct TransferOutput {
     pub amount: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedTransfer {
     pub hex: String,
     pub tendermint_hash: String,
@@ -59,7 +60,7 @@ fn owner_from_key_bytes(bytes: &[u8]) -> Result<[u8; 32], Error> {
     }
 }
 
-pub fn parse_tachi_owner(s: &str, _network: Network) -> Result<[u8; 32], Error> {
+pub fn parse_tachi_owner(s: &str) -> Result<[u8; 32], Error> {
     let t = s
         .trim()
         .trim_matches('"')
@@ -89,8 +90,8 @@ pub fn parse_tachi_owner(s: &str, _network: Network) -> Result<[u8; 32], Error> 
     )))
 }
 
-pub fn looks_like_tachi_owner(s: &str, network: Network) -> bool {
-    parse_tachi_owner(s, network).is_ok()
+pub fn looks_like_tachi_owner(s: &str) -> bool {
+    parse_tachi_owner(s).is_ok()
 }
 
 pub fn looks_like_vtxo_id(s: &str) -> bool {
@@ -352,16 +353,16 @@ mod tests {
     #[test]
     fn parse_xonly_hex() {
         let hex32 = "b59aa9e53cea3947b204002e14c439a0bfbf9de39ead5673b77c0bafe8b4e561";
-        let owner = parse_tachi_owner(hex32, Network::Regtest).unwrap();
+        let owner = parse_tachi_owner(hex32).unwrap();
         assert_eq!(hex::encode(owner), hex32);
-        let with_prefix = parse_tachi_owner(&format!("0x{hex32}"), Network::Signet).unwrap();
+        let with_prefix = parse_tachi_owner(&format!("0x{hex32}")).unwrap();
         assert_eq!(hex::encode(with_prefix), hex32);
     }
 
     #[test]
     fn parse_compressed_pubkey_hex() {
         let compressed = "02b59aa9e53cea3947b204002e14c439a0bfbf9de39ead5673b77c0bafe8b4e561";
-        let owner = parse_tachi_owner(compressed, Network::Regtest).unwrap();
+        let owner = parse_tachi_owner(compressed).unwrap();
         assert_eq!(
             hex::encode(owner),
             "b59aa9e53cea3947b204002e14c439a0bfbf9de39ead5673b77c0bafe8b4e561"
@@ -370,7 +371,7 @@ mod tests {
 
     #[test]
     fn wrong_length_hex_mentions_byte_count() {
-        let err = parse_tachi_owner("aabbccdd", Network::Regtest).unwrap_err();
+        let err = parse_tachi_owner("aabbccdd").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("4 bytes"), "{msg}");
         assert!(msg.contains("bcrt1p"), "{msg}");

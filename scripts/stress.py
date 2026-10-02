@@ -7,14 +7,15 @@ the run does not broadcast to the Tachi daemon.
 
 Example:
 
-    TACHI_BASE_URL=http://127.0.0.1:9 BIND=127.0.0.1:18080 cargo run --release
-    ./scripts/stress.py --base http://127.0.0.1:18080
+    TEST_MODE=1 ADMIN_TOKEN=stress BIND=127.0.0.1:18080 cargo run --release
+    ./scripts/stress.py --base http://127.0.0.1:18080 --admin-token stress
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import threading
@@ -88,9 +89,10 @@ class Stats:
 
 
 class Client:
-    def __init__(self, base: str, timeout: float) -> None:
+    def __init__(self, base: str, timeout: float, admin_token: str = "") -> None:
         self.base = base.rstrip("/")
         self.timeout = timeout
+        self.admin_token = admin_token
 
     def call(
         self,
@@ -103,6 +105,8 @@ class Client:
     ) -> tuple[int, Any]:
         data = None if body is None else json.dumps(body).encode()
         headers = {"accept": "application/json"}
+        if self.admin_token:
+            headers["x-admin-token"] = self.admin_token
         if data is not None:
             headers["content-type"] = "application/json"
         req = urllib.request.Request(
@@ -309,6 +313,11 @@ def main() -> int:
     p.add_argument("--amount-in", type=int, default=10_000)
     p.add_argument("--amount-out", type=int, default=100_000)
     p.add_argument("--timeout", type=float, default=10.0)
+    p.add_argument(
+        "--admin-token",
+        default=os.environ.get("ADMIN_TOKEN", ""),
+        help="for observe/claim operator routes (default: $ADMIN_TOKEN)",
+    )
     p.add_argument("--skip-races", action="store_true")
     p.add_argument(
         "--stampede",
@@ -318,10 +327,10 @@ def main() -> int:
     args = p.parse_args()
 
     stats = Stats()
-    client = Client(args.base, args.timeout)
+    client = Client(args.base, args.timeout, args.admin_token)
 
     print(f"target {args.base}")
-    code, meta = client.call(stats, "root", "GET", "/", expect=200)
+    code, meta = client.call(stats, "meta", "GET", "/v1/meta", expect=200)
     print(f"service {meta.get('service')} network {meta.get('network')} tachi {meta.get('tachi')}")
     before = inventory(client, stats)
     print("inventory before:")

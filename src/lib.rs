@@ -3,6 +3,7 @@
 pub mod api;
 pub mod engine;
 pub mod error;
+pub mod faucet;
 pub mod htlc;
 pub mod model;
 pub mod tachi;

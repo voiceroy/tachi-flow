@@ -22,13 +22,9 @@
       background: var(--bg);
       color: var(--text);
     }
-    header {
-      padding: 2rem 1.5rem 1rem;
-      max-width: 960px;
-      margin: 0 auto;
-    }
+    header { padding: 2rem 1.5rem 1rem; max-width: 960px; margin: 0 auto; }
     header h1 { font-size: 1.8rem; margin: 0 0 .4rem; font-weight: 600; }
-    header p { margin: 0; color: var(--muted); max-width: 40rem; }
+    header p { margin: 0; color: var(--muted); max-width: 42rem; }
     main { max-width: 960px; margin: 0 auto; padding: 0 1.5rem 4rem; }
     section {
       background: var(--panel);
@@ -38,6 +34,8 @@
       margin: 1rem 0;
     }
     h2 { font-size: 1.05rem; margin: 0 0 .8rem; letter-spacing: .02em; }
+    ol.steps { margin: .4rem 0 0; padding-left: 1.2rem; color: var(--muted); }
+    ol.steps li { margin: .25rem 0; }
     table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
     th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid var(--line); font-size: .92rem; }
     th { color: var(--muted); font-weight: 500; }
@@ -60,6 +58,7 @@
       margin: .8rem .5rem 0 0;
     }
     button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
     .row { display: flex; flex-wrap: wrap; gap: 1rem; }
     .row > * { flex: 1 1 16rem; }
     .hint { color: var(--muted); font-size: .9rem; margin-top: .8rem; }
@@ -73,23 +72,40 @@
     }
     .ok { color: var(--ok); }
     .warn { color: var(--warn); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; word-break: break-all; }
     #status { white-space: pre-wrap; }
+    .idcard p { margin: .3rem 0; }
   </style>
 </head>
 <body>
   <header>
     <h1>tachi-flow</h1>
     <p>
-      A liquidity desk for Tachi. Swap on-chain bitcoin for off-chain VTXOs (and back)
-      without waiting through a vault’s week-long exit. You never talk to a timelock;
-      the desk already holds both kinds of coins.
+      Swap on-chain bitcoin for Tachi VTXOs (and back) without a week-long vault exit.
+      This page is a live demo on Tachi’s test chain.
     </p>
     <p class="hint" id="meta">loading…</p>
   </header>
   <main>
     <section>
+      <h2>How to demo</h2>
+      <ol class="steps">
+        <li>Keep the identity below (saved in this browser).</li>
+        <li>Quote inbound, accept, <strong>Fund with faucet</strong> (do not paste the lock into the faucet site).</li>
+        <li>Wait until <em>claimed</em>. That skipped a ~1008-block TAURUS vault exit.</li>
+        <li>Optional reverse: quote outbound. The desk locks bitcoin first; then <strong>Send my Tachi coins</strong> and you claim the lock.</li>
+      </ol>
+    </section>
+    <section class="idcard">
+      <h2>Your demo identity</h2>
+      <p class="hint">Same keys after refresh. Tachi coins from inbound swaps land on this Tachi key.</p>
+      <p>Tachi key: <span class="mono" id="showTachi">—</span></p>
+      <p>Bitcoin address: <span class="mono" id="showL1">—</span></p>
+      <button id="btnKeys">New keys</button>
+    </section>
+    <section>
       <h2>Marketplace</h2>
-      <p class="hint">Each desk shows live Tachi VTXOs and bitcoin at its claim address. Quotes reserve stock so two cheap quotes cannot spend the same pile.</p>
+      <p class="hint">Desk float vs a TAURUS vault: vault unilateral exit is ~1008 blocks (~a week). This desk swaps so you don’t sit that wait.</p>
       <div id="books">loading inventory…</div>
     </section>
     <section>
@@ -103,13 +119,12 @@
           </select>
           <label>Amount (sats)</label>
           <input id="amount" type="number" value="20000" min="10000" />
-          <label>Your Tachi key (in) — 64 hex or bcrt1p…</label>
-          <input id="tachiDest" placeholder="tachi_xonly_hex" />
-          <label>Refund pubkey (in) — from “new keys”</label>
+          <label>Your Tachi key (in)</label>
+          <input id="tachiDest" placeholder="filled from identity" />
+          <label>Refund pubkey (in)</label>
           <input id="refundPk" />
-          <label>Your bitcoin address (out) — bcrt1…</label>
-          <input id="l1Dest" />
-          <button id="btnKeys">New keys</button>
+          <label>Your bitcoin address (out)</label>
+          <input id="l1Dest" placeholder="filled from identity" />
           <button id="btnQuote">Quote</button>
         </div>
         <div>
@@ -118,9 +133,12 @@
       </div>
     </section>
     <section>
-      <h2>Open swap &amp; status</h2>
+      <h2>Swap</h2>
       <button id="btnOpen">Accept quote</button>
+      <button id="btnFund">Fund with faucet</button>
+      <button id="btnPayOut">Send my Tachi coins</button>
       <button id="btnSync" class="ghost">Check if paid</button>
+      <button id="btnRefund" class="ghost">Refund / cancel</button>
       <p class="hint" id="swapHint"></p>
       <div id="status"></div>
     </section>
@@ -131,7 +149,8 @@
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    let quote = null, swap = null;
+    const KEYS = "tachi-flow-demo-keys";
+    let quote = null, swap = null, keys = null, poll = null;
 
     function sats(n) { return Number(n).toLocaleString() + " sats"; }
     function feePct(ppm) { return (ppm / 10000).toFixed(2) + "%"; }
@@ -143,6 +162,76 @@
       return t;
     }
 
+    function applyKeys(k) {
+      keys = k;
+      localStorage.setItem(KEYS, JSON.stringify(k));
+      $("tachiDest").value = k.tachi_xonly_hex;
+      $("refundPk").value = k.pubkey_hex;
+      $("l1Dest").value = k.l1_address || "";
+      $("showTachi").textContent = k.tachi_xonly_hex;
+      $("showL1").textContent = k.l1_address || "(click New keys)";
+    }
+
+    async function ensureKeys() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(KEYS) || "null");
+        if (saved && saved.tachi_xonly_hex && saved.pubkey_hex) {
+          applyKeys(saved);
+          if (!saved.l1_address) {
+            const k = await j("/v1/demo/keys", { method: "POST" });
+            applyKeys(k);
+          }
+          return;
+        }
+      } catch {}
+      applyKeys(await j("/v1/demo/keys", { method: "POST" }));
+    }
+
+    function human(s) {
+      if (!s) return "";
+      if (s.status === "quoted" && s.side === "in" && !s.faucet_txid)
+        return "Accepted. Click Fund with faucet (the public faucet cannot pay the lock address).";
+      if (s.status === "quoted" && s.side === "in" && s.faucet_txid)
+        return "Test coins are in flight. The desk settles when the lock is visible (often the next block, ~5–10 min).";
+      if (s.status === "quoted" && s.side === "out" && !s.l1_lock_txid)
+        return "Accept done. Desk is locking bitcoin first (same HTLC as inbound, roles reversed). Wait, then send Tachi coins.";
+      if (s.status === "quoted" && s.side === "out" && s.l1_lock_txid)
+        return "Desk lock is up. Send my Tachi coins — then you claim the bitcoin. If you never send, they refund after the timeout (not a 1008-block vault wait).";
+      if (s.status === "lp_settled" && s.side === "in")
+        return "Desk paid your Tachi coins. Claiming the bitcoin lock…";
+      if (s.status === "lp_settled" && s.side === "out")
+        return "Desk has your Tachi coins and revealed the preimage. Claim pending — click Send my Tachi coins again to retry the claim (it never pays twice).";
+      if (s.status === "claimed" && s.side === "in")
+        return "Done. You hold Tachi coins on the identity above.";
+      if (s.status === "claimed" && s.side === "out")
+        return "Done. The bitcoin is on your address above.";
+      if (s.status === "expired")
+        return "Expired: too close to the lock timeout to settle safely. If you paid a lock, click Refund / cancel after the timeout block.";
+      if (s.status === "refunded")
+        return s.refund_txid ? "Refunded on-chain." : "Cancelled.";
+      if (s.status === "waiting")
+        return "Still waiting for the payment to show up.";
+      return "Status: " + (s.status || "?");
+    }
+
+    function showSwap(s) {
+      swap = s;
+      const pay = s.pay || {};
+      let extra = "";
+      if (pay.method === "l1_htlc") extra += "Lock: " + pay.address + "\n";
+      if (pay.pay_to) extra += "Pay Tachi to: " + pay.pay_to + "\n";
+      if (s.faucet_txid) extra += "Faucet tx: " + s.faucet_txid + "\n";
+      if (s.l1_lock_txid) extra += "Bitcoin tx: " + s.l1_lock_txid + "\n";
+      if (s.vtxo_payment_id) extra += "VTXO: " + s.vtxo_payment_id + "\n";
+      const lock = pay.method === "l1_htlc" ? pay : pay.lock;
+      if (lock && lock.timeout_height) extra += "Lock timeout: block " + lock.timeout_height + "\n";
+      if (s.preimage_hex) extra += "Preimage: " + s.preimage_hex + "\n";
+      if (s.refund_txid) extra += "Refund tx: " + s.refund_txid + "\n";
+      if (s.demo_note) extra += s.demo_note + "\n";
+      $("swapHint").innerHTML = "<span class='" + (s.status === "claimed" || s.status === "lp_settled" ? "ok" : "") + "'>" + human(s) + "</span>";
+      $("status").textContent = "Swap " + s.id + " · " + s.side + " · " + sats(s.amount_sats) + " via " + s.lp_id + "\n" + extra;
+    }
+
     async function refreshMeta() {
       const m = await j("/v1/meta");
       $("meta").textContent = m.bounty + " · " + m.network + " · " + m.tachi + " · block " + m.height;
@@ -150,13 +239,13 @@
 
     async function refreshBooks() {
       const rows = await j("/v1/inventory");
-      const head = "<table><thead><tr><th>Desk</th><th>Fee</th><th>On-chain</th><th>Tachi VTXOs</th><th>Max</th></tr></thead><tbody>";
+      const head = "<table><thead><tr><th>Desk</th><th>Fee</th><th>On-chain</th><th>Tachi VTXOs</th><th>Vault exit</th></tr></thead><tbody>";
       const body = rows.map(lp => `<tr>
         <td>${lp.id}${lp.defaulted ? " (stopped)" : ""}</td>
         <td>${feePct(lp.fee_ppm)}</td>
         <td>${sats(lp.l1_sats)}</td>
         <td>${sats(lp.vtxo_sats)}</td>
-        <td>${sats(lp.max_swap_sats)}</td>
+        <td>${lp.vault_exit_blocks || 1008} blocks</td>
       </tr>`).join("");
       $("books").innerHTML = head + body + "</tbody></table>";
     }
@@ -175,9 +264,8 @@
     }
 
     $("btnKeys").onclick = async () => {
-      const k = await j("/v1/demo/keys", { method: "POST" });
-      $("refundPk").value = k.pubkey_hex;
-      $("tachiDest").value = k.tachi_xonly_hex;
+      if (!confirm("Replace the saved demo identity? Existing VTXOs stay on the old key.")) return;
+      applyKeys(await j("/v1/demo/keys", { method: "POST" }));
     };
 
     $("btnQuote").onclick = async () => {
@@ -198,16 +286,19 @@
         const pay = quote.pay || {};
         let payHtml = "";
         if (pay.method === "l1_htlc") {
-          payHtml = `<p>Send <strong>${sats(quote.amount_sats)}</strong> bitcoin to this locked address (not a normal wallet):</p>
-            <div class="pay">${pay.address}</div>
-            <p class="hint">Refund after block ${pay.timeout_height}. ${quote.hint || ""}</p>`;
+          payHtml = `<p>Lock (do <em>not</em> paste this into the faucet):</p>
+            <div class="pay">${pay.address}</div>`;
         } else {
-          payHtml = `<p>Send <strong>${sats(quote.amount_sats)}</strong> Tachi coins to desk <code>${pay.pay_to}</code></p>
-            <p class="hint">${quote.hint || ""}</p>`;
+          payHtml = `<p>After the desk locks bitcoin, send Tachi coins to <code>${pay.pay_to}</code></p>`;
+          if (pay.lock && pay.lock.address) {
+            payHtml += `<p>Desk HTLC (they fund this first):</p><div class="pay">${pay.lock.address}</div>`;
+          }
         }
         $("quoteBox").innerHTML = `
           <p>Desk <strong>${quote.lp_id}</strong> · fee ${sats(quote.fee_sats)} · you receive <strong>${sats(quote.receive_sats)}</strong></p>
-          <p>Ready in about ${quote.eta_seconds} seconds · quote expires ${quote.expires_at}</p>
+          <p class="ok">${quote.comparison || ""}</p>
+          <p class="hint">${quote.hint || ""}</p>
+          <p>Quote expires ${quote.expires_at}</p>
           ${payHtml}`;
         await refreshBooks();
       } catch (e) {
@@ -217,28 +308,93 @@
 
     $("btnOpen").onclick = async () => {
       if (!quote) return;
-      swap = await j("/v1/swaps", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ quote_id: quote.id }),
-      });
-      $("swapHint").textContent = "Swap " + swap.id + " is " + swap.status + ". Pay as quoted, then click Check if paid (or wait ~8s).";
-      $("status").textContent = JSON.stringify(swap, null, 2);
-      refreshSwaps();
+      try {
+        showSwap(await j("/v1/swaps", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ quote_id: quote.id }),
+        }));
+        refreshSwaps();
+      } catch (e) {
+        $("swapHint").innerHTML = "<span class='warn'>" + e.message + "</span>";
+      }
+    };
+
+    $("btnFund").onclick = async () => {
+      if (!swap) return;
+      $("swapHint").textContent = "Asking the faucet, then paying the lock…";
+      try {
+        showSwap(await j("/v1/swaps/" + swap.id + "/fund", { method: "POST" }));
+        startPoll();
+        refreshSwaps();
+      } catch (e) {
+        $("swapHint").innerHTML = "<span class='warn'>" + e.message + "</span>";
+      }
+    };
+
+    $("btnPayOut").onclick = async () => {
+      if (!swap || !keys) return;
+      $("swapHint").textContent = "Sending Tachi coins to the desk…";
+      try {
+        showSwap(await j("/v1/swaps/" + swap.id + "/pay-vtxo", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ secret_hex: keys.secret_hex }),
+        }));
+        refreshBooks();
+        refreshSwaps();
+      } catch (e) {
+        $("swapHint").innerHTML = "<span class='warn'>" + e.message + "</span>";
+      }
     };
 
     $("btnSync").onclick = async () => {
       if (!swap) return;
-      const s = await j("/v1/swaps/" + swap.id + "/sync", { method: "POST" });
-      $("status").textContent = JSON.stringify(s, null, 2);
-      if (s.status && s.status !== "waiting") {
-        swap = s;
-        $("swapHint").innerHTML = "<span class='ok'>Status: " + s.status + "</span>";
+      try {
+        const s = await j("/v1/swaps/" + swap.id + "/sync", { method: "POST" });
+        if (s.status && s.status !== "waiting") showSwap(s);
+        else showSwap(await j("/v1/swaps/" + swap.id));
+        refreshBooks();
+        refreshSwaps();
+      } catch (e) {
+        $("swapHint").innerHTML = "<span class='warn'>" + e.message + "</span>";
       }
-      refreshBooks();
-      refreshSwaps();
     };
 
+    $("btnRefund").onclick = async () => {
+      if (!swap || !keys) return;
+      if (!confirm("Cancel this swap, or refund your lock if its timeout has passed?")) return;
+      try {
+        showSwap(await j("/v1/swaps/" + swap.id + "/refund", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ secret_hex: keys.secret_hex }),
+        }));
+        refreshBooks();
+        refreshSwaps();
+      } catch (e) {
+        $("swapHint").innerHTML = "<span class='warn'>" + e.message + "</span>";
+      }
+    };
+
+    function startPoll() {
+      if (poll) clearInterval(poll);
+      poll = setInterval(async () => {
+        if (!swap) return;
+        try {
+          const s = await j("/v1/swaps/" + swap.id);
+          showSwap(s);
+          if (s.status === "claimed" || s.status === "failed" || s.status === "refunded") {
+            clearInterval(poll);
+            poll = null;
+          }
+          refreshBooks();
+          refreshSwaps();
+        } catch {}
+      }, 5000);
+    }
+
+    ensureKeys();
     refreshMeta();
     refreshBooks();
     refreshSwaps();

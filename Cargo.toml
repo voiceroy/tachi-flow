@@ -7,7 +7,6 @@ description = "OP_Freedom bounty #10 PoC: Tachi on-chain ↔ VTXO liquidity engi
 license = "MIT"
 
 [dependencies]
-actix-cors = "0.7"
 actix-web = { version = "4.15", features = ["macros"] }
 bitcoin = { version = "0.32.102", features = ["rand-std", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

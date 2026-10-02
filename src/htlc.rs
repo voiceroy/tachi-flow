@@ -1,4 +1,5 @@
-//! P2WSH HTLC: LP claims with preimage, user refunds after CLTV.
+//! P2WSH HTLC: claimer spends with preimage; other party refunds after CLTV.
+//! Inbound: LP claims, user refunds. Outbound: user claims, LP refunds.
 
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::encode::serialize_hex;
@@ -37,6 +38,13 @@ pub fn generate_keypair() -> Keypair {
     Keypair { secret, public }
 }
 
+pub fn p2wpkh_address(secret: &SecretKey, network: Network) -> Address {
+    let secp = Secp256k1::new();
+    let public = PublicKey::new(secp256k1::PublicKey::from_secret_key(&secp, secret));
+    let compressed = bitcoin::CompressedPublicKey::try_from(public).expect("compressed");
+    Address::p2wpkh(&compressed, KnownHrp::from(network))
+}
+
 pub fn pubkey_from_hex(hex: &str) -> Result<PublicKey, Error> {
     let bytes = hex::decode(hex.trim()).map_err(|e| Error::Invalid(e.to_string()))?;
     PublicKey::from_slice(&bytes).map_err(|e| Error::Bitcoin(e.to_string()))
@@ -47,12 +55,12 @@ pub fn payment_hash(preimage: &[u8; 32]) -> sha256::Hash {
 }
 
 /// Standard swap HTLC redeem script:
-/// `OP_IF OP_SHA256 <hash> OP_EQUALVERIFY <lp> OP_CHECKSIG
-///  OP_ELSE <lock> OP_CLTV OP_DROP <user> OP_CHECKSIG OP_ENDIF`
+/// `OP_IF OP_SHA256 <hash> OP_EQUALVERIFY <claimer> OP_CHECKSIG
+///  OP_ELSE <lock> OP_CLTV OP_DROP <refunder> OP_CHECKSIG OP_ENDIF`
 pub fn redeem_script(
     payment_hash: &sha256::Hash,
-    lp_pubkey: &PublicKey,
-    user_pubkey: &PublicKey,
+    claimer: &PublicKey,
+    refunder: &PublicKey,
     timeout: LockTime,
 ) -> ScriptBuf {
     Builder::new()
@@ -60,13 +68,13 @@ pub fn redeem_script(
         .push_opcode(OP_SHA256)
         .push_slice(payment_hash.to_byte_array())
         .push_opcode(OP_EQUALVERIFY)
-        .push_key(lp_pubkey)
+        .push_key(claimer)
         .push_opcode(OP_CHECKSIG)
         .push_opcode(OP_ELSE)
         .push_lock_time(timeout)
         .push_opcode(OP_CHECKLOCKTIMEVERIFY)
         .push_opcode(OP_DROP)
-        .push_key(user_pubkey)
+        .push_key(refunder)
         .push_opcode(OP_CHECKSIG)
         .push_opcode(OP_ENDIF)
         .into_script()
@@ -81,30 +89,77 @@ pub fn random_preimage() -> [u8; 32] {
     sk.secret_bytes()
 }
 
-/// Sign a P2WSH claim (IF branch: preimage + LP signature).
+/// Sign a P2WSH claim (IF branch: preimage + claimer signature).
 pub fn claim_tx_hex(
     funding: OutPoint,
     value_sats: u64,
     fee_sats: u64,
     redeem: &ScriptBuf,
     preimage: &[u8; 32],
-    lp_secret: &SecretKey,
+    claimer_secret: &SecretKey,
     destination: &Address,
 ) -> Result<String, Error> {
+    spend_htlc(
+        funding,
+        value_sats,
+        fee_sats,
+        redeem,
+        claimer_secret,
+        destination,
+        LockTime::ZERO,
+        Sequence::MAX,
+        &[preimage.as_slice(), &[1u8]],
+    )
+}
+
+/// Sign a P2WSH refund (ELSE branch: refunder signature after the CLTV timeout).
+pub fn refund_tx_hex(
+    funding: OutPoint,
+    value_sats: u64,
+    fee_sats: u64,
+    redeem: &ScriptBuf,
+    timeout: LockTime,
+    refunder_secret: &SecretKey,
+    destination: &Address,
+) -> Result<String, Error> {
+    // Empty push selects OP_ELSE (MINIMALIF). nLockTime must reach the CLTV
+    // value and the input must not be final, or CLTV fails.
+    spend_htlc(
+        funding,
+        value_sats,
+        fee_sats,
+        redeem,
+        refunder_secret,
+        destination,
+        timeout,
+        Sequence::ENABLE_LOCKTIME_NO_RBF,
+        &[&[]],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spend_htlc(
+    funding: OutPoint,
+    value_sats: u64,
+    fee_sats: u64,
+    redeem: &ScriptBuf,
+    secret: &SecretKey,
+    destination: &Address,
+    lock_time: LockTime,
+    sequence: Sequence,
+    branch: &[&[u8]],
+) -> Result<String, Error> {
     if value_sats <= fee_sats {
-        return Err(Error::Invalid("claim fee exceeds value".into()));
+        return Err(Error::Invalid("HTLC spend fee exceeds value".into()));
     }
-
     let secp = Secp256k1::new();
-    let lp_pub = PublicKey::new(secp256k1::PublicKey::from_secret_key(&secp, lp_secret));
-
     let mut tx = Transaction {
         version: bitcoin::transaction::Version::TWO,
-        lock_time: LockTime::ZERO,
+        lock_time,
         input: vec![TxIn {
             previous_output: funding,
             script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
+            sequence,
             witness: Witness::new(),
         }],
         output: vec![TxOut {
@@ -124,19 +179,27 @@ pub fn claim_tx_hex(
         .map_err(|e| Error::Bitcoin(e.to_string()))?;
 
     let msg = Message::from_digest(sighash.to_byte_array());
-    let sig = secp.sign_ecdsa(&msg, lp_secret);
+    let sig = secp.sign_ecdsa(&msg, secret);
     let mut sig_bytes = sig.serialize_der().to_vec();
     sig_bytes.push(EcdsaSighashType::All as u8);
 
     let mut witness = Witness::new();
     witness.push(sig_bytes);
-    witness.push(preimage);
-    witness.push([1u8]);
+    for item in branch {
+        witness.push(item);
+    }
     witness.push(redeem.as_bytes());
     tx.input[0].witness = witness;
 
-    let _ = lp_pub;
     Ok(serialize_hex(&tx))
+}
+
+/// Txid of a raw transaction, so a re-broadcast can be recognised as the same tx.
+pub fn txid_of_hex(hex_tx: &str) -> Result<Txid, Error> {
+    let bytes = hex::decode(hex_tx).map_err(|e| Error::Invalid(e.to_string()))?;
+    let tx: Transaction = bitcoin::consensus::deserialize(&bytes)
+        .map_err(|e| Error::Bitcoin(e.to_string()))?;
+    Ok(tx.compute_txid())
 }
 
 /// Sign a P2WPKH payment from `lp_secret` (the LP claim address).
@@ -207,8 +270,7 @@ pub fn p2wpkh_send_hex(
 }
 
 pub fn parse_txid(hex: &str) -> Result<Txid, Error> {
-    hex.parse::<Txid>()
-        .map_err(|e| Error::Bitcoin(e.to_string()))
+    hex.parse::<Txid>().map_err(|e| Error::Bitcoin(e.to_string()))
 }
 
 #[cfg(test)]
@@ -227,5 +289,29 @@ mod tests {
         let s = addr.to_string();
         assert!(s.starts_with("tb1"), "{s}");
         assert_eq!(addr.address_type(), Some(bitcoin::AddressType::P2wsh));
+    }
+
+    #[test]
+    fn refund_spends_else_branch_after_timeout() {
+        let lp = generate_keypair();
+        let user = generate_keypair();
+        let hash = payment_hash(&random_preimage());
+        let timeout = LockTime::from_height(15_000).expect("height");
+        let script = redeem_script(&hash, &lp.public, &user.public, timeout);
+        let dest = p2wpkh_address(&user.secret, Network::Regtest);
+        let funding = OutPoint {
+            txid: parse_txid(&"ab".repeat(32)).unwrap(),
+            vout: 0,
+        };
+        let hex = refund_tx_hex(funding, 20_000, 500, &script, timeout, &user.secret, &dest).unwrap();
+        let tx: Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&hex).unwrap()).unwrap();
+        assert_eq!(tx.lock_time, timeout);
+        assert!(tx.input[0].sequence.enables_absolute_lock_time());
+        let w: Vec<&[u8]> = tx.input[0].witness.iter().collect();
+        assert_eq!(w.len(), 3);
+        assert!(w[1].is_empty(), "ELSE branch selector must be empty");
+        assert_eq!(w[2], script.as_bytes());
+        assert_eq!(txid_of_hex(&hex).unwrap(), tx.compute_txid());
     }
 }

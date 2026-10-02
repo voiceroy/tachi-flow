@@ -19,6 +19,8 @@ pub enum SwapStatus {
     Claimed,
     Refunded,
     Failed,
+    /// Too close to the HTLC timeout to settle safely. Funds go back via refund.
+    Expired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +37,12 @@ pub struct LiquidityProvider {
     pub l1_address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Desk float sits behind a TAURUS-style 1008-block unilateral exit if
+    /// you used the vault instead of this swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_exit_blocks: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +61,16 @@ pub struct Quote {
     /// Plain-language refund / next-step copy for the UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// TAURUS unilateral exit (~a week). Swap exists to skip this.
+    #[serde(default)]
+    pub vault_exit_blocks: u32,
+    #[serde(default)]
+    pub swap_timeout_blocks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<String>,
+    /// Compressed pubkey the user controls (refund key `in`, claim key `out`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_pubkey_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +85,38 @@ pub enum PayInstructions {
     TachiVtxo {
         pay_to: String,
         memo: String,
+        /// Outbound: LP funds this HTLC first; user claims with preimage after paying VTXOs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lock: Option<HtlcLock>,
     },
+}
+
+impl PayInstructions {
+    /// The L1 HTLC behind this swap: the user's lock (`in`) or the desk's (`out`).
+    pub fn htlc(&self) -> Option<HtlcLock> {
+        match self {
+            Self::L1Htlc {
+                address,
+                payment_hash_hex,
+                timeout_height,
+                redeem_script_hex,
+            } => Some(HtlcLock {
+                address: address.clone(),
+                payment_hash_hex: payment_hash_hex.clone(),
+                timeout_height: *timeout_height,
+                redeem_script_hex: redeem_script_hex.clone(),
+            }),
+            Self::TachiVtxo { lock, .. } => lock.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HtlcLock {
+    pub address: String,
+    pub payment_hash_hex: String,
+    pub timeout_height: u32,
+    pub redeem_script_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +138,22 @@ pub struct Swap {
     pub claim_tx_hex: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Faucet drip that funded the ephemeral P2WPKH (demo helper).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faucet_txid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fund_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demo_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_pubkey_hex: Option<String>,
+    /// L1 refund of the HTLC after its timeout (user for `in`, desk for `out`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refund_txid: Option<String>,
+    /// Outbound: revealed once the desk sees your VTXOs, so you can claim the
+    /// desk's lock with any wallet, not only through this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preimage_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +172,7 @@ pub struct CreateSwapRequest {
     pub quote_id: Uuid,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObserveLockRequest {
     pub txid: String,
     pub vout: u32,
