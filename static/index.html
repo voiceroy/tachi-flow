@@ -187,6 +187,21 @@
         <div><div id="advBox" class="hint"></div></div>
       </div>
     </section>
+    <section>
+      <h2>Lightning</h2>
+      <p class="hint" id="lnStatus">Checking whether this desk has a Lightning node…</p>
+      <div class="row">
+        <div>
+          <label>Lightning → Tachi coins (sats)</label>
+          <input id="lnInAmount" type="number" value="20000" min="10000" />
+          <button id="btnLnIn">Get invoice</button>
+          <label>Tachi coins → Lightning (paste your invoice)</label>
+          <input id="lnInvoice" placeholder="lnbcrt…" />
+          <button id="btnLnOut" class="ghost">Quote and pay with my Tachi coins</button>
+        </div>
+        <div><div id="lnBox" class="hint"></div></div>
+      </div>
+    </section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
@@ -279,6 +294,9 @@
       const m = await j("/v1/meta");
       $("meta").textContent = m.bounty + " · " + m.network + " · " + m.tachi + " · block " + m.height +
         (liveUp() ? " · live" : "");
+      $("lnStatus").textContent = m.lightning
+        ? "This desk runs a Lightning node. Lightning → Tachi uses a hold invoice: your payment is only taken once your Tachi coins are sent."
+        : "This desk has no Lightning node configured (set LND_REST_URL). The buttons below will say so.";
     }
 
     async function refreshBooks() {
@@ -478,10 +496,10 @@
       }
     };
 
-    // Live updates: one server-sent event stream for every swap and advance.
-    // Polling is only a fallback if the stream is down.
+    // Live updates: one server-sent event stream for every swap, advance and
+    // Lightning swap. Polling is only a fallback if the stream is down.
     let live = null, listTimer = null;
-    let plan = null, advance = null, csvLock = null;
+    let plan = null, advance = null, csvLock = null, lnSwap = null;
 
     function refreshListsSoon() {
       clearTimeout(listTimer);
@@ -499,6 +517,10 @@
       live.addEventListener("advance", (m) => {
         const a = JSON.parse(m.data).data;
         if (advance && a.id === advance.id) showAdvance(a);
+      });
+      live.addEventListener("ln", (m) => {
+        const l = JSON.parse(m.data).data;
+        if (lnSwap && l.id === lnSwap.id) showLn(l);
       });
     }
 
@@ -603,6 +625,53 @@
         }));
       } catch (e) {
         $("advBox").innerHTML += `<p class="warn">${e.message}</p>`;
+      }
+    };
+
+    function showLn(l) {
+      lnSwap = l;
+      $("lnBox").innerHTML = `<p>${l.direction === "in" ? "Lightning → Tachi" : "Tachi → Lightning"} <strong>${l.status}</strong> via ${l.lp_id} · fee ${sats(l.fee_sats)} · you receive ${sats(l.receive_sats)}</p>` +
+        (l.direction === "in" ? `<p>Pay this invoice:</p><div class="pay">${l.invoice}</div>` : "") +
+        `<p class="hint">${l.note || ""}</p>`;
+    }
+
+    $("btnLnIn").onclick = async () => {
+      if (!keys) return;
+      try {
+        showLn(await j("/v1/ln/quotes", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            direction: "in",
+            amount_sats: Number($("lnInAmount").value),
+            user_tachi_address: keys.tachi_xonly_hex,
+          }),
+        }));
+      } catch (e) {
+        $("lnBox").innerHTML = `<p class="warn">${e.message}</p>`;
+      }
+    };
+
+    $("btnLnOut").onclick = async () => {
+      if (!keys) return;
+      try {
+        const q = await j("/v1/ln/quotes", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            direction: "out",
+            invoice: $("lnInvoice").value.trim(),
+            user_tachi_address: keys.tachi_xonly_hex,
+          }),
+        });
+        showLn(q);
+        showLn(await j("/v1/ln/swaps/" + q.id + "/pay-vtxo", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ secret_hex: keys.secret_hex }),
+        }));
+      } catch (e) {
+        $("lnBox").innerHTML += `<p class="warn">${e.message}</p>`;
       }
     };
 

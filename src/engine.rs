@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bitcoin::absolute::LockTime;
+use bitcoin::hashes::Hash as _;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::{Address, Network, OutPoint, PublicKey, ScriptBuf};
 use chrono::{Duration, Utc};
@@ -23,11 +24,12 @@ use crate::htlc::{
     p2wsh_address, parse_txid,
     payment_hash, pubkey_from_hex, random_preimage, redeem_script, refund_tx_hex, txid_of_hex,
 };
+use crate::lightning::{InvoiceState, LightningNode};
 use crate::model::{
     Advance, AdvanceAcceptRequest, AdvanceQuoteRequest, AdvanceStatus, CreatePlanRequest,
-    CreateQuoteRequest, ExitPlan, HtlcLock, LiquidityProvider, ObserveLockRequest,
-    ObserveVtxoRequest, PayInstructions, PriceBreakdown, Quote, Side, Swap, SwapStatus,
-    WebhookRequest, fee_sats,
+    CreateQuoteRequest, ExitPlan, HtlcLock, LiquidityProvider, LnDirection, LnQuoteRequest,
+    LnStatus, LnSwap, ObserveLockRequest, ObserveVtxoRequest, PayInstructions, PriceBreakdown,
+    Quote, Side, Swap, SwapStatus, WebhookRequest, fee_sats,
 };
 use crate::tachi::TachiClient;
 use crate::tachi_tx::{
@@ -64,8 +66,10 @@ const MIN_ROUTING_SCORE_PPM: u64 = 400_000;
 const DEFAULT_PENALTY_PPM: u64 = 10_000;
 /// ...but at least this much (capped by the bond itself).
 const MIN_COMPENSATION_SATS: u64 = 500;
-/// How long a claim-advance quote holds.
+/// How long a claim-advance or Lightning quote holds.
 const SIDE_QUOTE_TTL_SECS: i64 = 10 * 60;
+/// Most a desk pays in Lightning routing fees for an `out` swap.
+const LN_MAX_ROUTING_FEE_SATS: u64 = 100;
 
 /// Knobs for [`price`]. All values are parts per million.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -131,6 +135,7 @@ struct Inner {
     advances: HashMap<Uuid, Advance>,
     /// Signed advance payouts, by advance id, so a retry re-sends, never re-pays.
     pending_advance_txs: HashMap<Uuid, String>,
+    ln_swaps: HashMap<Uuid, LnSwap>,
     webhooks: Vec<WebhookRequest>,
 }
 
@@ -222,6 +227,7 @@ pub struct Engine {
     escrow: SecretKey,
     events: tokio::sync::broadcast::Sender<Event>,
     webhook_http: reqwest::Client,
+    lightning: Option<LightningNode>,
 }
 
 impl Engine {
@@ -321,6 +327,7 @@ impl Engine {
             escrow: generate_keypair().secret,
             events,
             webhook_http: crate::events::webhook_client(),
+            lightning: None,
         }
     }
 
@@ -334,8 +341,17 @@ impl Engine {
         self
     }
 
+    pub fn with_lightning(mut self, node: Option<LightningNode>) -> Self {
+        self.lightning = node;
+        self
+    }
+
     pub fn escrow_pubkey_hex(&self) -> String {
         hex::encode(xonly_from_secret(&self.escrow))
+    }
+
+    pub fn lightning_enabled(&self) -> bool {
+        self.lightning.is_some()
     }
 
     /// Tachi keys whose credits matter to us (desks + escrow), for the push stream.
@@ -449,6 +465,7 @@ impl Engine {
         inner.reputation = file.reputation;
         inner.advances = file.advances.into_iter().map(|a| (a.id, a)).collect();
         inner.pending_advance_txs = file.pending_advance_txs;
+        inner.ln_swaps = file.ln_swaps.into_iter().map(|l| (l.id, l)).collect();
         inner.webhooks = file.webhooks;
         apply_desk_stats(&mut inner);
         tracing::info!(
@@ -1814,7 +1831,7 @@ impl Engine {
         Ok(swap)
     }
 
-    /// Pay VTXOs exactly once for `id` (a swap or a compensation) from
+    /// Pay VTXOs exactly once for `id` (a swap, LN swap, or compensation) from
     /// a desk wallet or the escrow. The signed tx is persisted before
     /// broadcast; a retry re-sends it, or confirms it already landed, and only
     /// re-signs when the old tx provably cannot land.
@@ -2492,6 +2509,7 @@ impl Engine {
             }
         }
         self.sync_advances().await;
+        self.sync_ln_swaps().await;
         Ok(updated)
     }
 
@@ -3112,6 +3130,381 @@ impl Engine {
     }
 }
 
+/// VTXO ↔ Lightning swaps (#9).
+impl Engine {
+    fn ln(&self) -> Result<&LightningNode, Error> {
+        self.lightning.as_ref().ok_or_else(|| {
+            Error::Invalid("Lightning is not configured on this desk (set LND_REST_URL)".into())
+        })
+    }
+
+    pub async fn list_ln_swaps(&self) -> Vec<LnSwap> {
+        let mut v: Vec<_> = self.inner.read().await.ln_swaps.values().cloned().collect();
+        v.sort_by_key(|l| std::cmp::Reverse(l.updated_at));
+        v
+    }
+
+    pub async fn get_ln_swap(&self, id: Uuid) -> Result<LnSwap, Error> {
+        self.inner
+            .read()
+            .await
+            .ln_swaps
+            .get(&id)
+            .cloned()
+            .ok_or(Error::SwapNotFound)
+    }
+
+    async fn update_ln(&self, id: Uuid, f: impl FnOnce(&mut LnSwap)) -> Result<LnSwap, Error> {
+        let out = {
+            let mut inner = self.inner.write().await;
+            let l = inner.ln_swaps.get_mut(&id).ok_or(Error::SwapNotFound)?;
+            f(l);
+            l.updated_at = Utc::now();
+            l.clone()
+        };
+        self.save_state().await;
+        self.publish(Event::Ln(Box::new(out.clone()))).await;
+        Ok(out)
+    }
+
+    pub async fn ln_quote(&self, req: LnQuoteRequest) -> Result<LnSwap, Error> {
+        let ln = self.ln()?.clone();
+        let id = Uuid::now_v7();
+        let now = Utc::now();
+        let expires_at = now + Duration::seconds(SIDE_QUOTE_TTL_SECS);
+        let user_tachi = req
+            .user_tachi_address
+            .clone()
+            .filter(|a| self.test_mode || looks_like_tachi_owner(a))
+            .ok_or_else(|| Error::Invalid("user_tachi_address must be a Tachi key".into()))?;
+        let swap = match req.direction {
+            LnDirection::In => {
+                let amount = req
+                    .amount_sats
+                    .ok_or_else(|| Error::Invalid("amount_sats is required for in".into()))?;
+                if !(MIN_SWAP_SATS..=MAX_SWAP_SATS).contains(&amount) {
+                    return Err(Error::Invalid(format!(
+                        "amount_sats must be {MIN_SWAP_SATS}..={MAX_SWAP_SATS}"
+                    )));
+                }
+                let (lp_id, fee) = {
+                    let mut inner = self.inner.write().await;
+                    let (lp_id, fee) = inner
+                        .lps
+                        .iter()
+                        .filter(|lp| can_fill(lp, Side::In, amount))
+                        .map(|lp| {
+                            let p = price(&self.pricing, lp, Side::In, amount, SIDE_QUOTE_TTL_SECS as u64, 0);
+                            (lp.id.clone(), fee_sats(amount, p.fee_ppm, MIN_FEE_SATS))
+                        })
+                        .min_by_key(|(_, fee)| *fee)
+                        .ok_or(Error::NoLiquidity {
+                            side: Side::In,
+                            amount_sats: amount,
+                        })?;
+                    debit_lp(&mut inner.lps, &lp_id, Side::In, amount - fee)?;
+                    (lp_id, fee)
+                };
+                let preimage = random_preimage();
+                let hash = payment_hash(&preimage).to_byte_array();
+                let invoice = match ln
+                    .add_hold_invoice(&hash, amount, &format!("tachi-flow {id}"), SIDE_QUOTE_TTL_SECS as u64)
+                    .await
+                {
+                    Ok(inv) => inv,
+                    Err(err) => {
+                        credit_lp(&mut self.inner.write().await.lps, &lp_id, Side::In, amount - fee);
+                        return Err(err);
+                    }
+                };
+                self.inner.write().await.preimages.insert(id, preimage);
+                LnSwap {
+                    id,
+                    direction: LnDirection::In,
+                    status: LnStatus::Waiting,
+                    lp_id,
+                    amount_sats: amount,
+                    fee_sats: fee,
+                    receive_sats: amount - fee,
+                    payment_hash_hex: hex::encode(hash),
+                    invoice,
+                    tachi_address: user_tachi,
+                    refund_tachi_address: None,
+                    vtxo_payment_id: None,
+                    note: Some("Pay this invoice. Your payment is only held until the desk has sent your VTXOs; if it never does, the invoice is cancelled and Lightning returns your funds.".into()),
+                    expires_at,
+                    created_at: now,
+                    updated_at: now,
+                }
+            }
+            LnDirection::Out => {
+                let invoice = req
+                    .invoice
+                    .clone()
+                    .ok_or_else(|| Error::Invalid("invoice is required for out".into()))?;
+                let decoded = ln.decode(&invoice).await?;
+                if decoded.amount_sats < 1_000 {
+                    return Err(Error::Invalid(
+                        "invoice must carry an amount of at least 1000 sats".into(),
+                    ));
+                }
+                let lp = {
+                    let inner = self.inner.read().await;
+                    inner
+                        .lps
+                        .iter()
+                        .filter(|lp| routable(lp))
+                        .min_by_key(|lp| lp.fee_ppm)
+                        .cloned()
+                        .ok_or(Error::NoLiquidity {
+                            side: Side::Out,
+                            amount_sats: decoded.amount_sats,
+                        })?
+                };
+                let fee = fee_sats(decoded.amount_sats, lp.fee_ppm, MIN_FEE_SATS)
+                    + LN_MAX_ROUTING_FEE_SATS;
+                let pay_to = hex::encode(xonly_from_secret(&self.lp_wallet(&lp.id)?.secret));
+                LnSwap {
+                    id,
+                    direction: LnDirection::Out,
+                    status: LnStatus::Waiting,
+                    lp_id: lp.id,
+                    amount_sats: decoded.amount_sats + fee,
+                    fee_sats: fee,
+                    receive_sats: decoded.amount_sats,
+                    payment_hash_hex: hex::encode(decoded.payment_hash),
+                    invoice,
+                    tachi_address: pay_to,
+                    refund_tachi_address: Some(user_tachi),
+                    vtxo_payment_id: None,
+                    note: Some(format!(
+                        "Send {} sats of VTXOs to the desk key; it then pays your invoice. If the payment fails outright, your VTXOs come back.",
+                        decoded.amount_sats + fee
+                    )),
+                    expires_at,
+                    created_at: now,
+                    updated_at: now,
+                }
+            }
+        };
+        self.inner.write().await.ln_swaps.insert(id, swap.clone());
+        self.save_state().await;
+        self.publish(Event::Ln(Box::new(swap.clone()))).await;
+        Ok(swap)
+    }
+
+    /// `out`: credit the user's VTXO payment, then pay their invoice.
+    pub async fn ln_paid(&self, id: Uuid, vtxo_id: &str) -> Result<LnSwap, Error> {
+        let _guard = self.lock_swap(id).await;
+        let s = self.get_ln_swap(id).await?;
+        if s.direction != LnDirection::Out || s.status != LnStatus::Waiting {
+            return Err(Error::Invalid(format!("Lightning swap is {:?}", s.status)));
+        }
+        {
+            let inner = self.inner.read().await;
+            let credited = inner
+                .swaps
+                .values()
+                .filter_map(|x| x.vtxo_payment_id.as_deref())
+                .chain(inner.ln_swaps.values().filter_map(|x| x.vtxo_payment_id.as_deref()))
+                .any(|v| v == vtxo_id);
+            if credited || inner.own_vtxos.contains(vtxo_id) {
+                return Err(Error::Invalid(format!("vtxo {vtxo_id} is not a fresh payment")));
+            }
+        }
+        if !self.test_mode {
+            let vtxo = self.tachi.get_vtxo(vtxo_id).await?;
+            if !vtxo.owner.eq_ignore_ascii_case(&s.tachi_address) || vtxo.amount < s.amount_sats {
+                return Err(Error::Invalid(format!(
+                    "vtxo {vtxo_id} must pay at least {} sats to {}",
+                    s.amount_sats, s.tachi_address
+                )));
+            }
+        }
+        let v = vtxo_id.to_string();
+        self.update_ln(id, |l| {
+            l.status = LnStatus::Accepted;
+            l.vtxo_payment_id = Some(v);
+            l.note = Some("Desk has your VTXOs and is paying your invoice.".into());
+        })
+        .await?;
+        self.ln_pay_out(id).await
+    }
+
+    /// Demo helper: pay an `out` swap from the user's demo key, then credit it.
+    pub async fn ln_pay_from_demo(&self, id: Uuid, secret_hex: &str) -> Result<LnSwap, Error> {
+        let s = self.get_ln_swap(id).await?;
+        if self.test_mode {
+            return self.ln_paid(id, &format!("sim-ln-{id}")).await;
+        }
+        let secret = parse_secret(secret_hex)?;
+        let mut spend = LpSpend::default();
+        let built = self
+            .build_transfer(&secret, &spend, &s.tachi_address, s.amount_sats)
+            .await?;
+        self.broadcast_transfer(&mut spend, &built).await?;
+        let paid = built.signed.output_vtxo_id;
+        for _ in 0..10 {
+            if self.tachi.find_vtxo(&paid).await?.is_some() {
+                return self.ln_paid(id, &paid).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        Err(Error::Tachi(format!(
+            "payment {paid} sent but not visible yet; report it with POST /v1/ln/{id}/paid"
+        )))
+    }
+
+    /// Pay an accepted `out` swap's invoice. Re-running is safe: a node never
+    /// pays the same payment hash twice.
+    async fn ln_pay_out(&self, id: Uuid) -> Result<LnSwap, Error> {
+        let ln = self.ln()?.clone();
+        let s = self.get_ln_swap(id).await?;
+        match ln.pay(&s.invoice, LN_MAX_ROUTING_FEE_SATS).await {
+            Ok(preimage) => {
+                let ok = hex::encode(payment_hash(&preimage).to_byte_array()) == s.payment_hash_hex;
+                self.record_fill(&s.lp_id).await;
+                self.update_ln(id, |l| {
+                    l.status = LnStatus::Completed;
+                    l.note = Some(if ok {
+                        format!("Invoice paid. Preimage {} is your receipt.", hex::encode(preimage))
+                    } else {
+                        "Invoice paid, but the node returned a preimage that does not match.".into()
+                    });
+                })
+                .await
+            }
+            Err(Error::TachiRejected(why)) => {
+                // The payment definitively failed: give the VTXOs back.
+                let refund = s.refund_tachi_address.clone().unwrap_or_default();
+                let back = if self.test_mode {
+                    format!("sim-ln-refund-{id}")
+                } else {
+                    self.settle_payout(id, &s.lp_id, &refund, s.amount_sats.saturating_sub(1))
+                        .await?
+                        .output_vtxo_id
+                };
+                self.inner.write().await.pending_payouts.remove(&id);
+                self.update_ln(id, |l| {
+                    l.status = LnStatus::Failed;
+                    l.note = Some(format!(
+                        "Lightning payment failed ({why}); your VTXOs were returned ({back})."
+                    ));
+                })
+                .await
+            }
+            Err(err) => {
+                let note = format!("Paying the invoice did not finish ({err}); retrying.");
+                self.update_ln(id, |l| l.note = Some(note)).await?;
+                Err(err)
+            }
+        }
+    }
+
+    async fn sync_ln_swaps(&self) {
+        if self.lightning.is_none() {
+            return;
+        }
+        let open: Vec<Uuid> = self
+            .inner
+            .read()
+            .await
+            .ln_swaps
+            .values()
+            .filter(|l| matches!(l.status, LnStatus::Waiting | LnStatus::Accepted))
+            .map(|l| l.id)
+            .collect();
+        for id in open {
+            let Ok(_guard) = self.swap_mutex(id).try_lock_owned() else {
+                continue;
+            };
+            if let Err(err) = self.sync_ln(id).await {
+                tracing::warn!(%err, %id, "sync lightning swap");
+            }
+        }
+    }
+
+    async fn sync_ln(&self, id: Uuid) -> Result<(), Error> {
+        let ln = self.ln()?.clone();
+        let s = self.get_ln_swap(id).await?;
+        match (s.direction, s.status) {
+            (LnDirection::In, LnStatus::Waiting | LnStatus::Accepted) => {
+                let hash: [u8; 32] = hex::decode(&s.payment_hash_hex)
+                    .ok()
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(|| Error::Invalid("stored payment hash".into()))?;
+                match ln.invoice_state(&hash).await? {
+                    InvoiceState::Accepted => {
+                        // The user's HTLC is held: pay VTXOs first, then settle.
+                        let paid = if self.test_mode {
+                            format!("sim-ln-vtxo-{id}")
+                        } else {
+                            self.settle_payout(id, &s.lp_id, &s.tachi_address, s.receive_sats)
+                                .await?
+                                .output_vtxo_id
+                        };
+                        let p = paid.clone();
+                        self.update_ln(id, |l| {
+                            l.status = LnStatus::Accepted;
+                            l.vtxo_payment_id = Some(p);
+                        })
+                        .await?;
+                        let preimage = self
+                            .inner
+                            .read()
+                            .await
+                            .preimages
+                            .get(&id)
+                            .copied()
+                            .ok_or_else(|| Error::Invalid("missing preimage".into()))?;
+                        ln.settle(&preimage).await?;
+                        self.inner.write().await.pending_payouts.remove(&id);
+                        self.record_fill(&s.lp_id).await;
+                        self.update_ln(id, |l| {
+                            l.status = LnStatus::Completed;
+                            l.note = Some(format!("VTXOs sent ({paid}); invoice settled."));
+                        })
+                        .await?;
+                    }
+                    InvoiceState::Settled => {
+                        self.update_ln(id, |l| l.status = LnStatus::Completed).await?;
+                    }
+                    InvoiceState::Canceled => self.ln_cancel(&s, "invoice cancelled").await?,
+                    InvoiceState::Open if s.expires_at < Utc::now() => {
+                        ln.cancel(&hash).await?;
+                        self.ln_cancel(&s, "invoice expired unpaid").await?;
+                    }
+                    InvoiceState::Open => {}
+                }
+            }
+            (LnDirection::Out, LnStatus::Accepted) => {
+                self.ln_pay_out(id).await?;
+            }
+            (LnDirection::Out, LnStatus::Waiting) if s.expires_at < Utc::now() => {
+                self.update_ln(id, |l| {
+                    l.status = LnStatus::Cancelled;
+                    l.note = Some("Expired before any VTXOs arrived. Do not pay now.".into());
+                })
+                .await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn ln_cancel(&self, s: &LnSwap, why: &str) -> Result<(), Error> {
+        credit_lp(&mut self.inner.write().await.lps, &s.lp_id, Side::In, s.receive_sats);
+        self.inner.write().await.preimages.remove(&s.id);
+        let why = why.to_string();
+        self.update_ln(s.id, |l| {
+            l.status = LnStatus::Cancelled;
+            l.note = Some(format!("Cancelled: {why}. Lightning returns any held payment."));
+        })
+        .await
+        .map(|_| ())
+    }
+}
+
 /// Pending-payout key for a default's compensation, distinct from the swap's own.
 fn comp_key(swap_id: Uuid) -> Uuid {
     Uuid::new_v5(&swap_id, b"compensation")
@@ -3205,12 +3598,22 @@ fn reserved(inner: &Inner, lp_id: &str) -> (u64, u64) {
             Side::Out => l1 += reserve_sats(side, receive),
         }
     }
-    // Claim advances promise L1.
+    // Claim advances promise L1; Lightning `in` swaps promise VTXOs.
     l1 += inner
         .advances
         .values()
         .filter(|a| a.lp_id == lp_id && a.status == AdvanceStatus::Quoted)
         .map(|a| a.advance_sats + CLAIM_FEE_SATS)
+        .sum::<u64>();
+    vtxo += inner
+        .ln_swaps
+        .values()
+        .filter(|l| {
+            l.lp_id == lp_id
+                && l.direction == LnDirection::In
+                && matches!(l.status, LnStatus::Waiting | LnStatus::Accepted)
+        })
+        .map(|l| l.receive_sats)
         .sum::<u64>();
     (vtxo, l1)
 }
@@ -3243,6 +3646,8 @@ struct PersistFile {
     advances: Vec<Advance>,
     #[serde(default)]
     pending_advance_txs: HashMap<Uuid, String>,
+    #[serde(default)]
+    ln_swaps: Vec<LnSwap>,
     #[serde(default)]
     webhooks: Vec<WebhookRequest>,
 }
@@ -3277,6 +3682,7 @@ impl From<&Inner> for PersistFile {
             reputation: inner.reputation.clone(),
             advances: inner.advances.values().cloned().collect(),
             pending_advance_txs: inner.pending_advance_txs.clone(),
+            ln_swaps: inner.ln_swaps.values().cloned().collect(),
             webhooks: inner.webhooks.clone(),
         }
     }
@@ -4581,5 +4987,93 @@ mod tests {
         }
         assert_eq!(seen.first(), Some(&SwapStatus::Quoted));
         assert_eq!(seen.last(), Some(&SwapStatus::LpSettled));
+    }
+
+    fn ln_engine() -> (Engine, Arc<crate::lightning::MockNode>) {
+        let mock = Arc::new(crate::lightning::MockNode::default());
+        let e = engine().with_lightning(Some(LightningNode::Mock(mock.clone())));
+        (e, mock)
+    }
+
+    #[tokio::test]
+    async fn lightning_in_holds_the_htlc_until_vtxos_are_paid() {
+        let (e, mock) = ln_engine();
+        let s = e
+            .ln_quote(LnQuoteRequest {
+                direction: LnDirection::In,
+                amount_sats: Some(50_000),
+                invoice: None,
+                user_tachi_address: Some("tb1ptest".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(s.status, LnStatus::Waiting);
+        let hash: [u8; 32] = hex::decode(&s.payment_hash_hex).unwrap().try_into().unwrap();
+
+        // Nothing happens until the payer's HTLC is held.
+        e.sync_all().await.unwrap();
+        assert_eq!(e.get_ln_swap(s.id).await.unwrap().status, LnStatus::Waiting);
+
+        mock.accept(&hash);
+        e.sync_all().await.unwrap();
+        let done = e.get_ln_swap(s.id).await.unwrap();
+        assert_eq!(done.status, LnStatus::Completed);
+        assert!(done.vtxo_payment_id.is_some());
+        // Settled with the desk's preimage only after the VTXOs went out.
+        assert_eq!(mock.state_of(&hash), Some(InvoiceState::Settled));
+    }
+
+    #[tokio::test]
+    async fn lightning_out_pays_after_vtxos_and_refunds_on_failure() {
+        let (e, mock) = ln_engine();
+        let preimage = [7u8; 32];
+        let hash = payment_hash(&preimage).to_byte_array();
+        let invoice = format!("mock:{}:20000", hex::encode(hash));
+        mock.payable.lock().unwrap().insert(hash, preimage);
+        let s = e
+            .ln_quote(LnQuoteRequest {
+                direction: LnDirection::Out,
+                amount_sats: None,
+                invoice: Some(invoice.clone()),
+                user_tachi_address: Some("tb1ptest".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(s.receive_sats, 20_000);
+        assert!(s.amount_sats > 20_000, "user covers fee + routing");
+        let done = e.ln_paid(s.id, "sim-pay-1").await.unwrap();
+        assert_eq!(done.status, LnStatus::Completed);
+        assert_eq!(mock.paid.lock().unwrap().as_slice(), [invoice]);
+        // The same VTXO cannot pay a second swap.
+        let unroutable = format!("mock:{}:20000", hex::encode([9u8; 32]));
+        let s2 = e
+            .ln_quote(LnQuoteRequest {
+                direction: LnDirection::Out,
+                amount_sats: None,
+                invoice: Some(unroutable),
+                user_tachi_address: Some("tb1ptest".into()),
+            })
+            .await
+            .unwrap();
+        assert!(e.ln_paid(s2.id, "sim-pay-1").await.is_err());
+        // No route: the payment fails outright and the VTXOs go back.
+        let failed = e.ln_paid(s2.id, "sim-pay-2").await.unwrap();
+        assert_eq!(failed.status, LnStatus::Failed);
+        assert!(failed.note.unwrap().contains("returned"));
+    }
+
+    #[tokio::test]
+    async fn lightning_routes_refuse_when_not_configured() {
+        let e = engine();
+        let err = e
+            .ln_quote(LnQuoteRequest {
+                direction: LnDirection::In,
+                amount_sats: Some(50_000),
+                invoice: None,
+                user_tachi_address: Some("tb1ptest".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
     }
 }

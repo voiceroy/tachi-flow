@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 actix-web = { version = "4.15", features = ["macros"] }
+base64 = "0.22"
 bitcoin = { version = "0.32.102", features = ["rand-std", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

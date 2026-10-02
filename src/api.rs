@@ -12,7 +12,7 @@ use crate::error::Error;
 use crate::htlc::{generate_keypair, p2wpkh_address};
 use crate::model::{
     AdvanceAcceptRequest, AdvanceQuoteRequest, CreatePlanRequest, CreateQuoteRequest,
-    CreateSwapRequest, ObserveLockRequest, ObserveVtxoRequest, Side,
+    CreateSwapRequest, LnQuoteRequest, ObserveLockRequest, ObserveVtxoRequest, Side,
     WebhookRequest,
 };
 use crate::tachi::Health;
@@ -61,6 +61,7 @@ struct Meta {
     deadline_presets: [u32; 6],
     /// Tachi key holding desk bonds (custodial escrow).
     escrow_pubkey: String,
+    lightning: bool,
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -98,7 +99,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(get_advance)
         .service(accept_advance)
         .service(demo_presign_advance)
-        .service(demo_csv_lock);
+        .service(demo_csv_lock)
+        .service(ln_quote)
+        .service(list_ln_swaps)
+        .service(get_ln_swap)
+        .service(ln_paid)
+        .service(ln_pay_vtxo);
 }
 
 #[get("/")]
@@ -123,6 +129,7 @@ async fn meta(engine: web::Data<Engine>) -> HttpResponse {
         pricing: engine.pricing(),
         deadline_presets: DEADLINE_PRESETS,
         escrow_pubkey: engine.escrow_pubkey_hex(),
+        lightning: engine.lightning_enabled(),
     })
 }
 
@@ -266,6 +273,49 @@ async fn demo_csv_lock(
     Ok(HttpResponse::Ok().json(
         engine
             .demo_csv_lock(&body.pubkey_hex, body.csv_blocks, body.amount_sats)
+            .await?,
+    ))
+}
+
+/// VTXO ↔ Lightning (#9). `in`: returns a hold invoice. `out`: takes yours.
+#[post("/v1/ln/quotes")]
+async fn ln_quote(
+    engine: web::Data<Engine>,
+    body: web::Json<LnQuoteRequest>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Created().json(engine.ln_quote(body.into_inner()).await?))
+}
+
+#[get("/v1/ln/swaps")]
+async fn list_ln_swaps(engine: web::Data<Engine>) -> HttpResponse {
+    HttpResponse::Ok().json(engine.list_ln_swaps().await)
+}
+
+#[get("/v1/ln/swaps/{id}")]
+async fn get_ln_swap(engine: web::Data<Engine>, path: web::Path<Uuid>) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(engine.get_ln_swap(path.into_inner()).await?))
+}
+
+/// `out`: report the VTXO you paid the desk with.
+#[post("/v1/ln/swaps/{id}/paid")]
+async fn ln_paid(
+    engine: web::Data<Engine>,
+    path: web::Path<Uuid>,
+    body: web::Json<ObserveVtxoRequest>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(engine.ln_paid(path.into_inner(), &body.vtxo_id).await?))
+}
+
+/// `out` demo helper: pay from the demo key, then credit the payment.
+#[post("/v1/ln/swaps/{id}/pay-vtxo")]
+async fn ln_pay_vtxo(
+    engine: web::Data<Engine>,
+    path: web::Path<Uuid>,
+    body: web::Json<SecretBody>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(
+        engine
+            .ln_pay_from_demo(path.into_inner(), &body.secret_hex)
             .await?,
     ))
 }

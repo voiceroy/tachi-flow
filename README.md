@@ -37,8 +37,9 @@ A TAURUS vault has one exit: the whole deposit, after a fixed ~1008-block CSV, a
 - **Batched exits.** Every outbound lock that is due, deadline or "now", is funded by the desk's next batch pass (each sync, ~8 s), one L1 tx per desk. Each swap records its `l1_lock_vout` and `lock_batch_size`.
 - **Split exits.** `POST /v1/exits` splits any amount (also above one swap's 2M limit or one desk's stock) into legs, cheapest marginal price first, never leaving a remainder too small to be its own leg. Every leg is a firm quote; `POST /v1/exits/{id}/accept` opens them all. If the desks can't cover the whole amount, nothing is reserved.
 - **Desk bonds and track record.** Desks post VTXOs to an escrow key (`POST /v1/lps/{id}/bond`, operator route). A desk *defaults* when it never locks bitcoin for an outbound swap, or never pays a funded inbound lock, before the timeout margin. Then the user gets 1% of the swap (at least 500 sats, at most what is bonded) in VTXOs from the bond. Each desk's score is `(fills + 1) / (fills + defaults + 2)`; below 40% it stops routing. The books show bond, fills, defaults and score.
-- **Live updates.** `GET /v1/events` is a server-sent event stream of every swap and advance change; the UI uses it instead of polling. `POST /v1/webhooks` (operator route) POSTs each event to a URL. The server also subscribes to Tachi's push stream (`/tachi_ws`) for every desk key, so a VTXO payment triggers a sync immediately rather than on the next tick.
+- **Live updates.** `GET /v1/events` is a server-sent event stream of every swap, advance and Lightning-swap change; the UI uses it instead of polling. `POST /v1/webhooks` (operator route) POSTs each event to a URL. The server also subscribes to Tachi's push stream (`/tachi_ws`) for every desk key, so a VTXO payment triggers a sync immediately rather than on the next tick.
 - **Claim advances.** Bitcoin stuck behind a timelock (like a vault refund waiting out its delay) can be sold for bitcoin now. The user hands the desk a spend of the output, signed now but valid only at maturity. The desk checks the script (`<csv> OP_CSV OP_DROP <pubkey> OP_CHECKSIG`, P2WSH), the outpoint, the CSV sequence, the payee and amount, and the signature, then pays `value − discount` immediately and broadcasts the spend at maturity. Discount: 0.5% + 0.002% per block left. `POST /v1/demo/csv-lock` makes such an output from the faucet.
+- **Lightning.** With an LND node (`LND_REST_URL`), Lightning → VTXOs uses a hold invoice on the desk's payment hash: the user's payment is only held until the desk has sent VTXOs, then settled; if the desk never pays, the invoice is cancelled and Lightning returns the funds. VTXOs → Lightning: the desk pays the user's invoice after it sees their VTXOs, and returns the VTXOs if the payment definitively fails.
 
 Defaults (ppm): skew ±10,000 at full imbalance, 3,000/hour of quote TTL, 80% max deadline discount, fee floor 500, cap 50,000 (`PricingConfig`).
 
@@ -58,6 +59,9 @@ Env:
 | `TACHI_FAUCET_URL` | `https://faucet.tachibtc.com` |
 | `TEST_MODE` | unset = live Tachi |
 | `ADMIN_TOKEN` | unset = read/create `tachi-flow-admin.token` (0600) |
+| `LND_REST_URL` | unset = Lightning off |
+| `LND_MACAROON_HEX` / `LND_MACAROON_PATH` | required with `LND_REST_URL` |
+| `LND_TLS_CERT_PATH` | LND's self-signed cert, if not publicly trusted |
 
 LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `tachi-lp.secret`). Bond escrow: `tachi-escrow.secret`.
 
@@ -75,6 +79,7 @@ LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `
 - `POST /v1/exits` · `GET /v1/exits/{id}` · `POST /v1/exits/{id}/accept` — split exits
 - `GET /v1/events` — server-sent events (`?swap_id=` to filter)
 - `POST /v1/advances/quote` · `GET /v1/advances` · `GET /v1/advances/{id}` · `POST /v1/advances/{id}/accept` — claim advances; `POST /v1/advances/{id}/demo-presign` and `POST /v1/demo/csv-lock` are demo helpers
+- `POST /v1/ln/quotes` · `GET /v1/ln/swaps` · `GET /v1/ln/swaps/{id}` · `POST /v1/ln/swaps/{id}/paid` · `POST /v1/ln/swaps/{id}/pay-vtxo` — Lightning
 
 Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>`): `/v1/vtxo/send`, `/v1/vtxo/deposit`, `/v1/swaps/{id}/observe/lock`, `/v1/swaps/{id}/observe/vtxo`, `/v1/swaps/{id}/claim`, `/v1/swaps/{id}/lp-default`, `/v1/lps/{id}/bond`, `/v1/webhooks`. There is no CORS layer; the UI is same-origin.
 
@@ -99,4 +104,5 @@ Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>
 - Tachi transfers carry no memo. Outbound payments are matched automatically only when unambiguous (exact amount, new coin, no other open swap on that desk waiting for the same amount); otherwise pay through `pay-vtxo`, which records the payment id.
 - **Bonds are custodial.** This server holds the escrow key, so a bond protects users only as far as the operator is honest. There is no bond withdrawal route yet.
 - **Claim advances carry a race.** At maturity the user's own key can also spend the output; whoever broadcasts first wins. The discount prices that risk, and a lost race shows as `lost`. Only the plain CSV script above is supported; Tachi's actual vault refund output would need its own template.
+- **Lightning is untested against a live node.** Tachi regtest has no Lightning node, so the LND client is exercised through a mock in the tests. Lightning → VTXOs is as trust-minimised as a hold invoice allows; VTXOs → Lightning trusts the desk to pay after receiving VTXOs (same as outbound swaps).
 - **Webhooks** are operator-only because the server makes outbound requests to whatever URL is registered.

@@ -7,6 +7,7 @@ pub mod error;
 pub mod events;
 pub mod faucet;
 pub mod htlc;
+pub mod lightning;
 pub mod model;
 pub mod tachi;
 pub mod tachi_tx;

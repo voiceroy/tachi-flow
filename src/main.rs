@@ -51,6 +51,12 @@ async fn main() -> std::io::Result<()> {
         .with_persist("tachi-flow-state.json")
         .unwrap_or_else(|err| panic!("{err}"))
     };
+    let lightning = tachi_flow::lightning::LightningNode::from_env()
+        .unwrap_or_else(|err| panic!("lightning config: {err}"));
+    if lightning.is_some() {
+        tracing::info!("Lightning enabled (LND REST)");
+    }
+    let engine = engine.with_lightning(lightning);
 
     // HTLC timeouts are absolute heights; never quote before we know the tip.
     engine.refresh_height().await;

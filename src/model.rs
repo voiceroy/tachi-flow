@@ -300,6 +300,70 @@ pub struct AdvanceAcceptRequest {
     pub presigned_tx_hex: String,
 }
 
+/// Swap between Tachi VTXOs and Lightning, through the desk's LN node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LnSwap {
+    pub id: Uuid,
+    pub direction: LnDirection,
+    pub status: LnStatus,
+    pub lp_id: String,
+    pub amount_sats: u64,
+    pub fee_sats: u64,
+    pub receive_sats: u64,
+    pub payment_hash_hex: String,
+    /// `in`: the hold invoice the user pays. `out`: the user's invoice the desk pays.
+    pub invoice: String,
+    /// `in`: where the desk sends VTXOs. `out`: where the user sends VTXOs.
+    pub tachi_address: String,
+    /// `out`: where VTXOs go back if the Lightning payment definitively fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refund_tachi_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vtxo_payment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LnDirection {
+    /// Lightning in, VTXOs out to the user.
+    In,
+    /// VTXOs in, Lightning payment out to the user.
+    Out,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LnStatus {
+    /// `in`: waiting for the user to pay the hold invoice. `out`: waiting for VTXOs.
+    Waiting,
+    /// `in`: the user's HTLC is held; desk is paying VTXOs.
+    Accepted,
+    /// `in`: VTXOs paid and invoice settled. `out`: invoice paid.
+    Completed,
+    /// `in`: invoice cancelled, the user's HTLC returned.
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LnQuoteRequest {
+    pub direction: LnDirection,
+    /// `in` only (the invoice amount). For `out` the amount comes from the invoice.
+    #[serde(default)]
+    pub amount_sats: Option<u64>,
+    /// `out`: the user's BOLT11 invoice. `in`: unused.
+    #[serde(default)]
+    pub invoice: Option<String>,
+    /// The user's Tachi key: receives VTXOs (`in`) or refunds (`out`).
+    #[serde(default)]
+    pub user_tachi_address: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookRequest {
     pub url: String,
