@@ -60,6 +60,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(health)
         .service(inventory)
         .service(create_quote)
+        .service(rfq)
         .service(open_swap)
         .service(list_swaps)
         .service(get_swap)
@@ -132,6 +133,17 @@ async fn create_quote(
 ) -> Result<HttpResponse, Error> {
     let quote = engine.create_quote(body.into_inner()).await?;
     Ok(HttpResponse::Created().json(quote))
+}
+
+/// Firm quotes from every desk that can fill, cheapest first. Accepting one
+/// (POST /v1/swaps) releases the others.
+#[post("/v1/rfq")]
+async fn rfq(
+    engine: web::Data<Engine>,
+    body: web::Json<CreateQuoteRequest>,
+) -> Result<HttpResponse, Error> {
+    let quotes = engine.request_quotes(body.into_inner()).await?;
+    Ok(HttpResponse::Created().json(quotes))
 }
 
 #[post("/v1/swaps")]
@@ -376,5 +388,29 @@ mod tests {
 
         let req = test::TestRequest::get().uri("/v1/meta").to_request();
         assert_eq!(test::call_service(&app, req).await.status(), 200);
+    }
+
+    #[actix_web::test]
+    async fn rfq_route_returns_every_desk() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_engine()))
+                .configure(configure),
+        )
+        .await;
+        let user = generate_keypair();
+        let req = test::TestRequest::post()
+            .uri("/v1/rfq")
+            .set_json(serde_json::json!({
+                "side": "out",
+                "amount_sats": 10_000,
+                "user_l1_address": "bcrt1qtest",
+                "user_refund_pubkey_hex": user.public.to_string(),
+            }))
+            .to_request();
+        let quotes: Vec<serde_json::Value> = test::call_and_read_body_json(&app, req).await;
+        assert_eq!(quotes.len(), 2, "both desks quote");
+        assert!(quotes[0]["fee_sats"].as_u64() <= quotes[1]["fee_sats"].as_u64());
+        assert_eq!(quotes[0]["rfq_id"], quotes[1]["rfq_id"]);
     }
 }

@@ -150,6 +150,7 @@ struct Leg {
     amount_sats: u64,
     fee_sats: u64,
     pricing: PriceBreakdown,
+    rfq_id: Option<Uuid>,
 }
 
 #[derive(Clone)]
@@ -619,8 +620,19 @@ impl Engine {
         ))
     }
 
-    /// Best quote across desks. Reserves only that desk's stock.
+    /// Best single quote across desks. Reserves only that desk's stock.
     pub async fn create_quote(&self, req: CreateQuoteRequest) -> Result<Quote, Error> {
+        let mut quotes = self.quote_desks(req, false).await?;
+        Ok(quotes.remove(0))
+    }
+
+    /// RFQ: firm quotes from every desk that can fill, cheapest first. Each
+    /// reserves stock until it expires; accepting one releases the others.
+    pub async fn request_quotes(&self, req: CreateQuoteRequest) -> Result<Vec<Quote>, Error> {
+        self.quote_desks(req, true).await
+    }
+
+    async fn quote_desks(&self, req: CreateQuoteRequest, all: bool) -> Result<Vec<Quote>, Error> {
         if req.amount_sats < MIN_SWAP_SATS {
             return Err(Error::AmountTooSmall(MIN_SWAP_SATS));
         }
@@ -655,16 +667,24 @@ impl Engine {
         // Cheapest in sats; when the minimum fee makes desks tie, the lower
         // rate wins, then the deeper book.
         offers.sort_by_key(|(lp, p, fee)| (*fee, p.fee_ppm, std::cmp::Reverse(book(lp, req.side))));
-        let (lp, pricing, fee) = offers.swap_remove(0);
-        let leg = Leg {
-            amount_sats: req.amount_sats,
-            fee_sats: fee,
-            pricing,
-        };
-        let quote = self.make_quote(&mut inner, &lp.id, &req, &terms, leg)?;
+        if !all {
+            offers.truncate(1);
+        }
+
+        let rfq_id = all.then(Uuid::now_v7);
+        let mut quotes = Vec::with_capacity(offers.len());
+        for (lp, pricing, fee) in offers {
+            let leg = Leg {
+                amount_sats: req.amount_sats,
+                fee_sats: fee,
+                pricing,
+                rfq_id,
+            };
+            quotes.push(self.make_quote(&mut inner, &lp.id, &req, &terms, leg)?);
+        }
         drop(inner);
         self.save_state().await;
-        Ok(quote)
+        Ok(quotes)
     }
 
     /// Validate a quote request and fix its timeouts against the current tip.
@@ -762,6 +782,7 @@ impl Engine {
             comparison: Some(quote_comparison(leg.fee_sats, &leg.pricing)),
             user_pubkey_hex: terms.user_pk.map(|p| p.to_string()),
             pricing: Some(leg.pricing),
+            rfq_id: leg.rfq_id,
         };
         debit_lp(
             &mut inner.lps,
@@ -841,6 +862,20 @@ impl Engine {
             drop(inner);
             self.save_state().await;
             return Err(Error::QuoteExpired);
+        }
+        if let Some(rfq) = quote.rfq_id {
+            let siblings: Vec<Uuid> = inner
+                .quotes
+                .values()
+                .filter(|q| q.rfq_id == Some(rfq))
+                .map(|q| q.id)
+                .collect();
+            for id in siblings {
+                if let Some(q) = inner.quotes.remove(&id) {
+                    inner.preimages.remove(&id);
+                    credit_lp(&mut inner.lps, &q.lp_id, q.side, reserve_sats(q.side, q.receive_sats));
+                }
+            }
         }
 
         let now = Utc::now();
@@ -3239,11 +3274,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn priced_quote_routes_to_the_cheaper_desk_and_holds_its_ttl() {
+    async fn rfq_quotes_every_desk_and_accepting_releases_the_rest() {
         let e = priced_engine();
         let user = generate_keypair();
-        let q = e
-            .create_quote(CreateQuoteRequest {
+        let quotes = e
+            .request_quotes(CreateQuoteRequest {
                 side: Side::In,
                 amount_sats: 100_000,
                 user_tachi_address: Some("tb1ptest".into()),
@@ -3253,12 +3288,26 @@ mod tests {
             })
             .await
             .unwrap();
+        assert_eq!(quotes.len(), 2);
+        assert!(quotes[0].fee_sats <= quotes[1].fee_sats);
         // alpha is VTXO-rich and cheaper at base: it should win selling VTXOs.
-        assert_eq!(q.lp_id, "lp-alpha");
-        let p = q.pricing.expect("breakdown");
-        assert!(p.skew_ppm < 0, "selling the plentiful side is discounted: {p:?}");
-        assert_eq!(q.fee_sats, fee_sats(100_000, p.fee_ppm, MIN_FEE_SATS));
-        let ttl = (q.expires_at - Utc::now()).num_seconds();
+        assert_eq!(quotes[0].lp_id, "lp-alpha");
+        assert!(quotes.iter().all(|q| q.rfq_id.is_some() && q.rfq_id == quotes[0].rfq_id));
+        let ttl = (quotes[0].expires_at - Utc::now()).num_seconds();
         assert!((100..=120).contains(&ttl), "ttl {ttl}");
+
+        let bravo_book = |books: &[LiquidityProvider]| {
+            books.iter().find(|lp| lp.id == "lp-bravo").unwrap().vtxo_sats
+        };
+        assert_eq!(
+            bravo_book(&e.inventory().await),
+            5_000_000 - quotes[1].receive_sats,
+            "every RFQ quote is firm, so each reserves stock"
+        );
+
+        e.open_swap(quotes[0].id).await.unwrap();
+        assert_eq!(bravo_book(&e.inventory().await), 5_000_000);
+        let err = e.open_swap(quotes[1].id).await.expect_err("sibling released");
+        assert!(matches!(err, Error::QuoteNotFound));
     }
 }

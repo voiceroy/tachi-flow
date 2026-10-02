@@ -73,6 +73,9 @@ pub struct Quote {
     pub user_pubkey_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<PriceBreakdown>,
+    /// Set when this quote came from an RFQ. Accepting one releases the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rfq_id: Option<Uuid>,
 }
 
 /// How a quote's fee was built. All figures are parts per million of the amount,

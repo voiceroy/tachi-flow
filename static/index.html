@@ -131,10 +131,10 @@
             <option value="600" selected>10 minutes</option>
             <option value="3600">1 hour</option>
           </select>
-          <button id="btnQuote">Quote</button>
+          <button id="btnQuote">Get quotes from every desk</button>
         </div>
         <div>
-          <div id="quoteBox" class="hint">A quote shows fee, what you receive, who pays you, and when you can take bitcoin back if the desk stalls.</div>
+          <div id="quoteBox" class="hint">Every desk that can fill sends a firm quote, cheapest first. Pick one; the others are released when you accept.</div>
         </div>
       </div>
     </section>
@@ -282,6 +282,8 @@
       return s + ` = <strong>${feePct(p.fee_ppm)}</strong>`;
     }
 
+    let offers = [];
+
     function showQuote(q) {
       quote = q;
       const pay = quote.pay || {};
@@ -295,13 +297,25 @@
           payHtml += `<p>Desk HTLC (they fund this first):</p><div class="pay">${pay.lock.address}</div>`;
         }
       }
+      const table = offers.length > 1 ? "<table><thead><tr><th></th><th>Desk</th><th>Fee</th><th>You receive</th><th>Pricing</th></tr></thead><tbody>" +
+        offers.map((o, i) => `<tr>
+          <td><input type="radio" name="offer" data-i="${i}" ${o.id === quote.id ? "checked" : ""}></td>
+          <td>${o.lp_id}</td>
+          <td>${sats(o.fee_sats)}</td>
+          <td>${sats(o.receive_sats)}</td>
+          <td>${breakdown(o.pricing)}</td>
+        </tr>`).join("") + "</tbody></table>" : "";
       $("quoteBox").innerHTML = `
+        ${table}
         <p>Desk <strong>${quote.lp_id}</strong> · fee ${sats(quote.fee_sats)} · you receive <strong>${sats(quote.receive_sats)}</strong></p>
         <p class="hint">${breakdown(quote.pricing)}</p>
         <p class="ok">${quote.comparison || ""}</p>
         <p class="hint">${quote.hint || ""}</p>
         <p>Price firm until ${quote.expires_at}</p>
         ${payHtml}`;
+      document.querySelectorAll("input[name=offer]").forEach(r => {
+        r.onchange = () => showQuote(offers[Number(r.dataset.i)]);
+      });
     }
 
     $("btnQuote").onclick = async () => {
@@ -315,11 +329,12 @@
           user_l1_address: $("l1Dest").value || null,
           ttl_secs: Number($("ttl").value),
         };
-        showQuote(await j("/v1/quotes", {
+        offers = await j("/v1/rfq", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
-        }));
+        });
+        showQuote(offers[0]);
         await refreshBooks();
       } catch (e) {
         $("quoteBox").innerHTML = `<p class="warn">${e.message}</p>`;
@@ -334,6 +349,7 @@
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ quote_id: quote.id }),
         }));
+        offers = [];
         refreshBooks();
         refreshSwaps();
       } catch (e) {

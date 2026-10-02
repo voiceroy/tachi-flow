@@ -16,7 +16,7 @@ cargo run
 ```
 
 1. Open `http://127.0.0.1:8080`. The page creates a **demo identity** and keeps it in the browser.
-2. Direction: **I have bitcoin, I want Tachi coins**. Amount `20000`. Quote → Accept quote.
+2. Direction: **I have bitcoin, I want Tachi coins**. Amount `20000`. **Get quotes from every desk** → pick a desk → Accept quote.
 3. Click **Fund with faucet**.  
    Do **not** paste the lock address into https://faucet.tachibtc.com — that faucet rejects P2WSH lock addresses (`unknown output kind: p2wsh`). The desk faucets a normal wallet and forwards coins into the lock.
 4. Status moves to **claimed**. VTXOs sit on the Tachi key shown at the top.
@@ -31,7 +31,8 @@ Swaps survive `cargo run` restarts (`tachi-flow-state.json`, gitignored). Empty 
 
 A TAURUS vault has one exit: the whole deposit, after a fixed ~1008-block CSV, at no fee. The desks turn that wait into a priced market:
 
-- **Inventory-skew pricing.** Each desk's fee moves with its books. A swap that drains a desk's scarce side costs more; one that refills it costs less. The skew is averaged over the swap's before/after effect on the desk's VTXO share, so big swaps pay for their own impact. Every quote carries a `pricing` breakdown (base, inventory, firm-quote cost). A quote stays firm for `ttl_secs` (30 s–1 h); holding a price longer costs more.
+- **Inventory-skew pricing.** Each desk's fee moves with its books. A swap that drains a desk's scarce side costs more; one that refills it costs less. The skew is averaged over the swap's before/after effect on the desk's VTXO share, so big swaps pay for their own impact. Every quote carries a `pricing` breakdown (base, inventory, firm-quote cost).
+- **RFQ with firm, expiring quotes.** `POST /v1/rfq` returns a firm quote from every desk that can fill, cheapest first. Each one reserves stock until it expires (`ttl_secs`, 30 s–1 h; holding a price longer costs more). Accepting one releases the rest.
 
 Defaults (ppm): skew ±10,000 at full imbalance, 3,000/hour of quote TTL, fee floor 500, cap 50,000 (`PricingConfig`).
 
@@ -57,7 +58,8 @@ LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `
 ## API
 
 - `GET /` — UI
-- `POST /v1/quotes` — best quote across desks; optional `ttl_secs`
+- `POST /v1/rfq` — firm quotes from every desk; body like `/v1/quotes` plus optional `ttl_secs`
+- `POST /v1/quotes` — best single quote (same body)
 - `POST /v1/swaps` · `POST /v1/sync` · `POST /v1/swaps/{id}/sync`
 - `POST /v1/swaps/{id}/fund` — faucet helper for inbound
 - `POST /v1/swaps/{id}/pay-vtxo` — `{ "secret_hex": "..." }` for outbound from the demo key (idempotent)
