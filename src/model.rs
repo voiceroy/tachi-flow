@@ -186,6 +186,9 @@ pub struct Swap {
     /// Output index of the desk's lock (batched locks share one tx).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub l1_lock_vout: Option<u32>,
+    /// How many outbound locks shared the desk's funding tx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_batch_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

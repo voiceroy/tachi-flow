@@ -962,6 +962,7 @@ impl Engine {
             preimage_hex: None,
             lock_by_height: quote.lock_by_height,
             l1_lock_vout: None,
+            lock_batch_size: None,
         };
 
         if let Some(preimage) = inner.preimages.remove(&quote.id) {
@@ -981,23 +982,15 @@ impl Engine {
                 }
                 Err(err) => tracing::warn!(%err, %swap_id, "outbound baseline"),
             }
-            if let Some(by) = quote.lock_by_height {
-                self.update_swap(swap_id, |s| {
-                    s.demo_note = Some(format!(
-                        "The desk locks bitcoin for you by block {by}, batched with other exits. Send Tachi coins only after the lock is up."
-                    ));
-                })
-                .await?;
-            }
-            if let Err(err) = self.fund_outbound_lock(swap_id).await {
-                tracing::warn!(%err, %swap_id, "outbound LP lock");
-                self.update_swap(swap_id, |s| {
-                    s.demo_note = Some(format!(
-                        "Desk could not lock bitcoin yet ({err}). It retries in the background. Do not send Tachi coins until the lock is up."
-                    ));
-                })
-                .await?;
-            }
+            // Locks are funded by the batch pass (every sync, ~8 s), so exits
+            // opened together share one L1 tx and its fee.
+            let note = match quote.lock_by_height {
+                Some(by) => format!(
+                    "The desk locks bitcoin for you by block {by}, batched with other exits. Send Tachi coins only after the lock is up."
+                ),
+                None => "The desk locks bitcoin in its next batch (seconds), shared with other exits opened now. Send Tachi coins only after the lock is up.".into(),
+            };
+            self.update_swap(swap_id, |s| s.demo_note = Some(note)).await?;
         }
         self.save_state().await;
         self.get_swap(swap_id).await
@@ -1061,6 +1054,7 @@ impl Engine {
             self.update_swap(swap.id, |s| {
                 s.l1_lock_txid = Some(txid);
                 s.l1_lock_vout = Some(vout as u32);
+                s.lock_batch_size = Some(n as u32);
                 s.demo_note = Some(if n > 1 {
                     format!("Desk locked bitcoin first (HTLC), batched with {} other exits in one tx. Send VTXOs only after this.", n - 1)
                 } else {
@@ -2169,6 +2163,10 @@ impl Engine {
 
     pub async fn sync_swap(&self, id: Uuid) -> Result<Option<Swap>, Error> {
         self.refresh_height().await;
+        if !self.test_mode {
+            // A due lock goes out with whatever else is due, not on its own.
+            self.fund_due_outbound_locks().await;
+        }
         let _guard = self.lock_swap(id).await;
         self.sync_locked(id).await
     }
