@@ -19,8 +19,9 @@ use crate::htlc::{
     payment_hash, pubkey_from_hex, random_preimage, redeem_script, refund_tx_hex, txid_of_hex,
 };
 use crate::model::{
-    CreateQuoteRequest, HtlcLock, LiquidityProvider, ObserveLockRequest, ObserveVtxoRequest,
-    PayInstructions, PriceBreakdown, Quote, Side, Swap, SwapStatus, fee_sats,
+    CreatePlanRequest, CreateQuoteRequest, ExitPlan, HtlcLock, LiquidityProvider,
+    ObserveLockRequest, ObserveVtxoRequest, PayInstructions, PriceBreakdown, Quote, Side, Swap,
+    SwapStatus, fee_sats,
 };
 use crate::tachi::TachiClient;
 use crate::tachi_tx::{
@@ -106,6 +107,7 @@ struct Inner {
     pending_payouts: HashMap<Uuid, PendingPayout>,
     /// Signed outbound L1 locks, by swap id, re-broadcast until visible.
     pending_locks: HashMap<Uuid, String>,
+    plans: HashMap<Uuid, ExitPlan>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -157,12 +159,13 @@ struct QuoteTerms {
     lock_by_height: Option<u32>,
 }
 
-/// One desk's priced quote for a request.
+/// One desk's share of a quote request (the whole amount, or a plan leg).
 struct Leg {
     amount_sats: u64,
     fee_sats: u64,
     pricing: PriceBreakdown,
     rfq_id: Option<Uuid>,
+    plan_id: Option<Uuid>,
 }
 
 #[derive(Clone)]
@@ -356,6 +359,7 @@ impl Engine {
         inner.fund_keys = fund_keys;
         inner.pending_payouts = file.pending_payouts;
         inner.pending_locks = file.pending_locks;
+        inner.plans = file.plans.into_iter().map(|p| (p.id, p)).collect();
         tracing::info!(
             quotes = inner.quotes.len(),
             swaps = inner.swaps.len(),
@@ -679,7 +683,7 @@ impl Engine {
         }
         if req.amount_sats > MAX_SWAP_SATS {
             return Err(Error::Invalid(format!(
-                "amount must be at most {MAX_SWAP_SATS} sats"
+                "amount must be at most {MAX_SWAP_SATS} sats (POST /v1/exits splits larger amounts across desks)"
             )));
         }
         let terms = self.quote_terms(&req).await?;
@@ -720,12 +724,140 @@ impl Engine {
                 fee_sats: fee,
                 pricing,
                 rfq_id,
+                plan_id: None,
             };
             quotes.push(self.make_quote(&mut inner, &lp.id, &req, &terms, leg)?);
         }
         drop(inner);
         self.save_state().await;
         Ok(quotes)
+    }
+
+    /// Split one amount across desks, cheapest marginal price first. Every leg
+    /// is a firm quote; `accept_plan` opens them all. Bigger than any single
+    /// desk (or `MAX_SWAP_SATS`) is fine: that is the point.
+    pub async fn plan_exit(&self, req: CreatePlanRequest) -> Result<ExitPlan, Error> {
+        let max_leg = req.max_leg_sats.unwrap_or(MAX_SWAP_SATS).min(MAX_SWAP_SATS);
+        let req = req.quote;
+        if req.amount_sats < MIN_SWAP_SATS {
+            return Err(Error::AmountTooSmall(MIN_SWAP_SATS));
+        }
+        if max_leg < MIN_SWAP_SATS {
+            return Err(Error::Invalid(format!("max_leg_sats must be at least {MIN_SWAP_SATS}")));
+        }
+        let terms = self.quote_terms(&req).await?;
+        let plan_id = Uuid::now_v7();
+
+        let mut inner = self.inner.write().await;
+        release_expired_quotes(&mut inner);
+        let mut legs: Vec<Quote> = Vec::new();
+        let mut remaining = req.amount_sats;
+        while remaining > 0 {
+            let best = inner
+                .lps
+                .iter()
+                .filter_map(|lp| {
+                    let mut chunk = remaining.min(capacity(lp, req.side)).min(max_leg);
+                    // Never strand a remainder too small to be its own leg.
+                    let rest = remaining - chunk;
+                    if rest > 0 && rest < MIN_SWAP_SATS {
+                        chunk = chunk.saturating_sub(MIN_SWAP_SATS - rest);
+                    }
+                    if chunk < MIN_SWAP_SATS {
+                        return None;
+                    }
+                    let p = price(&self.pricing, lp, req.side, chunk, terms.ttl_secs, terms.deadline);
+                    let fee = fee_sats(chunk, p.fee_ppm, MIN_FEE_SATS);
+                    (fee < chunk).then(|| (lp.id.clone(), chunk, p, fee))
+                })
+                .min_by_key(|(_, chunk, p, fee)| {
+                    // Cheapest per sat moved, then the bigger leg (fewer legs).
+                    (fee * 1_000_000 / chunk, p.fee_ppm, std::cmp::Reverse(*chunk))
+                });
+            let Some((lp_id, chunk, pricing, fee)) = best else {
+                // Give back what the earlier legs reserved.
+                for leg in &legs {
+                    if let Some(q) = inner.quotes.remove(&leg.id) {
+                        inner.preimages.remove(&leg.id);
+                        credit_lp(&mut inner.lps, &q.lp_id, q.side, reserve_sats(q.side, q.receive_sats));
+                    }
+                }
+                return Err(Error::NoLiquidity {
+                    side: req.side,
+                    amount_sats: req.amount_sats,
+                });
+            };
+            let leg = Leg {
+                amount_sats: chunk,
+                fee_sats: fee,
+                pricing,
+                rfq_id: None,
+                plan_id: Some(plan_id),
+            };
+            legs.push(self.make_quote(&mut inner, &lp_id, &req, &terms, leg)?);
+            remaining -= chunk;
+        }
+        let plan = ExitPlan {
+            id: plan_id,
+            side: req.side,
+            amount_sats: req.amount_sats,
+            fee_sats: legs.iter().map(|q| q.fee_sats).sum(),
+            receive_sats: legs.iter().map(|q| q.receive_sats).sum(),
+            legs,
+            swap_ids: Vec::new(),
+        };
+        inner.plans.insert(plan_id, plan.clone());
+        drop(inner);
+        self.save_state().await;
+        Ok(plan)
+    }
+
+    /// Open every leg of a plan. Legs that already expired are reported, the
+    /// rest still open (each leg is an independent swap).
+    pub async fn accept_plan(&self, plan_id: Uuid) -> Result<ExitPlan, Error> {
+        let plan = self
+            .inner
+            .read()
+            .await
+            .plans
+            .get(&plan_id)
+            .cloned()
+            .ok_or(Error::QuoteNotFound)?;
+        if !plan.swap_ids.is_empty() {
+            return Ok(plan);
+        }
+        let mut swap_ids = Vec::new();
+        let mut failed = Vec::new();
+        for leg in &plan.legs {
+            match self.open_swap(leg.id).await {
+                Ok(s) => swap_ids.push(s.id),
+                Err(err) => failed.push(format!("{} via {}: {err}", leg.amount_sats, leg.lp_id)),
+            }
+        }
+        if swap_ids.is_empty() {
+            return Err(Error::Invalid(format!("no leg could open: {}", failed.join("; "))));
+        }
+        let plan = {
+            let mut inner = self.inner.write().await;
+            let p = inner.plans.get_mut(&plan_id).ok_or(Error::QuoteNotFound)?;
+            p.swap_ids = swap_ids;
+            p.clone()
+        };
+        self.save_state().await;
+        if !failed.is_empty() {
+            tracing::warn!(%plan_id, ?failed, "plan legs did not open");
+        }
+        Ok(plan)
+    }
+
+    pub async fn get_plan(&self, plan_id: Uuid) -> Result<ExitPlan, Error> {
+        self.inner
+            .read()
+            .await
+            .plans
+            .get(&plan_id)
+            .cloned()
+            .ok_or(Error::QuoteNotFound)
     }
 
     /// Validate a quote request and fix its timeouts against the current tip.
@@ -840,6 +972,7 @@ impl Engine {
             pricing: Some(leg.pricing),
             rfq_id: leg.rfq_id,
             lock_by_height: terms.lock_by_height,
+            plan_id: leg.plan_id,
         };
         debit_lp(
             &mut inner.lps,
@@ -963,6 +1096,7 @@ impl Engine {
             lock_by_height: quote.lock_by_height,
             l1_lock_vout: None,
             lock_batch_size: None,
+            plan_id: quote.plan_id,
         };
 
         if let Some(preimage) = inner.preimages.remove(&quote.id) {
@@ -2462,6 +2596,8 @@ struct PersistFile {
     pending_payouts: HashMap<Uuid, PendingPayout>,
     #[serde(default)]
     pending_locks: HashMap<Uuid, String>,
+    #[serde(default)]
+    plans: Vec<ExitPlan>,
 }
 
 impl From<&Inner> for PersistFile {
@@ -2489,6 +2625,7 @@ impl From<&Inner> for PersistFile {
                 .collect(),
             pending_payouts: inner.pending_payouts.clone(),
             pending_locks: inner.pending_locks.clone(),
+            plans: inner.plans.values().cloned().collect(),
         }
     }
 }
@@ -2595,6 +2732,18 @@ fn can_fill(lp: &LiquidityProvider, side: Side, amount_sats: u64) -> bool {
     !lp.defaulted
         && amount_sats <= lp.max_swap_sats
         && book(lp, side) >= reserve_sats(side, amount_sats)
+}
+
+/// Largest amount a desk can take on `side` right now (0 if it cannot route).
+fn capacity(lp: &LiquidityProvider, side: Side) -> u64 {
+    if lp.defaulted {
+        return 0;
+    }
+    let book = match side {
+        Side::In => book(lp, side),
+        Side::Out => book(lp, side).saturating_sub(2 * CLAIM_FEE_SATS),
+    };
+    book.min(lp.max_swap_sats)
 }
 
 /// Whether an outbound lock should be funded at `height` (deadline swaps wait
@@ -3578,5 +3727,67 @@ mod tests {
         assert!(err.to_string().contains("out swaps"), "{err}");
         let err = e.create_quote(req(VAULT_EXIT_BLOCKS + 1)).await.expect_err("cap");
         assert!(err.to_string().contains("at most"), "{err}");
+    }
+
+    fn plan_req(side: Side, amount_sats: u64, max_leg_sats: Option<u64>) -> CreatePlanRequest {
+        let user = generate_keypair();
+        CreatePlanRequest {
+            quote: CreateQuoteRequest {
+                side,
+                amount_sats,
+                user_tachi_address: Some("tb1ptest".into()),
+                user_l1_address: Some("tb1qtest".into()),
+                user_refund_pubkey_hex: Some(user.public.to_string()),
+                ttl_secs: None,
+                deadline_blocks: None,
+            },
+            max_leg_sats,
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_plan_splits_past_single_swap_limit_and_opens_every_leg() {
+        let e = engine();
+        // 3M is over MAX_SWAP_SATS: a single quote must refuse, a plan splits.
+        let single = e.create_quote(plan_req(Side::Out, 3_000_000, None).quote).await;
+        assert!(single.is_err());
+
+        let plan = e.plan_exit(plan_req(Side::Out, 3_000_000, None)).await.unwrap();
+        assert!(plan.legs.len() >= 2);
+        assert_eq!(plan.legs.iter().map(|q| q.amount_sats).sum::<u64>(), 3_000_000);
+        assert!(plan.legs.iter().all(|q| q.amount_sats <= MAX_SWAP_SATS));
+        assert!(plan.legs.iter().all(|q| q.plan_id == Some(plan.id)));
+        assert_eq!(plan.fee_sats, plan.legs.iter().map(|q| q.fee_sats).sum::<u64>());
+
+        let opened = e.accept_plan(plan.id).await.unwrap();
+        assert_eq!(opened.swap_ids.len(), plan.legs.len());
+        for id in &opened.swap_ids {
+            assert_eq!(e.get_swap(*id).await.unwrap().plan_id, Some(plan.id));
+        }
+        // Accepting twice is a no-op, not a second set of swaps.
+        assert_eq!(e.accept_plan(plan.id).await.unwrap().swap_ids, opened.swap_ids);
+    }
+
+    #[tokio::test]
+    async fn exit_plan_never_strands_a_tiny_remainder() {
+        let e = engine();
+        let plan = e.plan_exit(plan_req(Side::In, 25_000, Some(20_000))).await.unwrap();
+        let mut legs: Vec<u64> = plan.legs.iter().map(|q| q.amount_sats).collect();
+        legs.sort();
+        assert_eq!(legs, vec![10_000, 15_000]);
+    }
+
+    #[tokio::test]
+    async fn exit_plan_without_enough_stock_reserves_nothing() {
+        let e = engine();
+        let before = e.inventory().await;
+        // Both desks together hold 25M VTXOs.
+        let err = e.plan_exit(plan_req(Side::In, 30_000_000, None)).await.unwrap_err();
+        assert!(matches!(err, Error::NoLiquidity { .. }), "{err}");
+        let after = e.inventory().await;
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(a.vtxo_sats, b.vtxo_sats, "{} book leaked", a.id);
+        }
+        assert!(e.inner.read().await.quotes.is_empty());
     }
 }

@@ -162,6 +162,15 @@
       <h2>Recent swaps</h2>
       <div id="swaps">—</div>
     </section>
+    <section>
+      <h2>Split a big exit across desks</h2>
+      <p class="hint">A vault exit takes the whole deposit. Here any amount is split into legs, cheapest desk first, each its own swap. Uses the direction, amount and deadline above.</p>
+      <label>Largest leg per desk (sats, optional)</label>
+      <input id="maxLeg" type="number" placeholder="desk limit" />
+      <button id="btnPlan">Plan split</button>
+      <button id="btnPlanAccept" class="ghost">Accept all legs</button>
+      <div id="planBox" class="hint"></div>
+    </section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
@@ -444,6 +453,47 @@
         refreshSwaps();
       } catch (e) {
         $("swapHint").innerHTML = "<span class='warn'>" + e.message + "</span>";
+      }
+    };
+
+    let plan = null;
+
+    $("btnPlan").onclick = async () => {
+      try {
+        const side = $("side").value;
+        const maxLeg = Number($("maxLeg").value) || null;
+        plan = await j("/v1/exits", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            side,
+            amount_sats: Number($("amount").value),
+            user_tachi_address: $("tachiDest").value || null,
+            user_refund_pubkey_hex: $("refundPk").value || null,
+            user_l1_address: $("l1Dest").value || null,
+            ttl_secs: Number($("ttl").value),
+            deadline_blocks: side === "out" ? Number($("deadline").value) : 0,
+            max_leg_sats: maxLeg,
+          }),
+        });
+        $("planBox").innerHTML = `<p>${plan.legs.length} legs · fee ${sats(plan.fee_sats)} · you receive <strong>${sats(plan.receive_sats)}</strong></p>` +
+          "<table><thead><tr><th>Desk</th><th>Amount</th><th>Fee</th><th>Pricing</th></tr></thead><tbody>" +
+          plan.legs.map(q => `<tr><td>${q.lp_id}</td><td>${sats(q.amount_sats)}</td><td>${sats(q.fee_sats)}</td><td>${breakdown(q.pricing)}</td></tr>`).join("") +
+          "</tbody></table>";
+        refreshBooks();
+      } catch (e) {
+        $("planBox").innerHTML = `<p class="warn">${e.message}</p>`;
+      }
+    };
+
+    $("btnPlanAccept").onclick = async () => {
+      if (!plan) return;
+      try {
+        plan = await j("/v1/exits/" + plan.id + "/accept", { method: "POST" });
+        $("planBox").innerHTML += `<p class="ok">Opened ${plan.swap_ids.length} swaps. Track them under Recent swaps; ${plan.side === "out" ? "send Tachi coins for each once its lock is up" : "fund each lock"}.</p>`;
+        refreshSwaps();
+      } catch (e) {
+        $("planBox").innerHTML += `<p class="warn">${e.message}</p>`;
       }
     };
 

@@ -35,6 +35,7 @@ A TAURUS vault has one exit: the whole deposit, after a fixed ~1008-block CSV, a
 - **RFQ with firm, expiring quotes.** `POST /v1/rfq` returns a firm quote from every desk that can fill, cheapest first. Each one reserves stock until it expires (`ttl_secs`, 30 s–1 h; holding a price longer costs more). Accepting one releases the rest.
 - **Pick your deadline (outbound).** `deadline_blocks` (0–1008) says how long the desk may wait before locking your bitcoin. Later is cheaper, down to 80% off at a full vault-exit wait. `GET /v1/price-curve` shows fee by deadline for each desk.
 - **Batched exits.** Every outbound lock that is due, deadline or "now", is funded by the desk's next batch pass (each sync, ~8 s), one L1 tx per desk. Each swap records its `l1_lock_vout` and `lock_batch_size`.
+- **Split exits.** `POST /v1/exits` splits any amount (also above one swap's 2M limit or one desk's stock) into legs, cheapest marginal price first, never leaving a remainder too small to be its own leg. Every leg is a firm quote; `POST /v1/exits/{id}/accept` opens them all. If the desks can't cover the whole amount, nothing is reserved.
 
 Defaults (ppm): skew ±10,000 at full imbalance, 3,000/hour of quote TTL, 80% max deadline discount, fee floor 500, cap 50,000 (`PricingConfig`).
 
@@ -68,6 +69,7 @@ LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `
 - `POST /v1/swaps/{id}/pay-vtxo` — `{ "secret_hex": "..." }` for outbound from the demo key (idempotent)
 - `POST /v1/swaps/{id}/refund` — `{ "secret_hex": "..." }`; cancel, or on-chain refund after the timeout
 - `POST /v1/demo/keys` — refund pubkey, Tachi x-only, L1 `bcrt1q…`
+- `POST /v1/exits` · `GET /v1/exits/{id}` · `POST /v1/exits/{id}/accept` — split exits
 
 Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>`): `/v1/vtxo/send`, `/v1/vtxo/deposit`, `/v1/swaps/{id}/observe/lock`, `/v1/swaps/{id}/observe/vtxo`, `/v1/swaps/{id}/claim`, `/v1/swaps/{id}/lp-default`. There is no CORS layer; the UI is same-origin.
 

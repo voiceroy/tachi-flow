@@ -79,6 +79,32 @@ pub struct Quote {
     /// Outbound with a deadline: the desk locks bitcoin by this height.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_by_height: Option<u32>,
+    /// Set when this quote is one leg of a split exit plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<Uuid>,
+}
+
+/// One amount split across desks: each leg is an ordinary quote, then swap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExitPlan {
+    pub id: Uuid,
+    pub side: Side,
+    pub amount_sats: u64,
+    pub fee_sats: u64,
+    pub receive_sats: u64,
+    pub legs: Vec<Quote>,
+    /// Filled in once the plan is accepted.
+    #[serde(default)]
+    pub swap_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatePlanRequest {
+    #[serde(flatten)]
+    pub quote: CreateQuoteRequest,
+    /// Largest leg to send any one desk (default: the desk's own limit).
+    #[serde(default)]
+    pub max_leg_sats: Option<u64>,
 }
 
 /// How a quote's fee was built. All figures are parts per million of the amount,
@@ -189,6 +215,8 @@ pub struct Swap {
     /// How many outbound locks shared the desk's funding tx.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_batch_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

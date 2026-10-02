@@ -11,7 +11,8 @@ use crate::engine::{
 use crate::error::Error;
 use crate::htlc::{generate_keypair, p2wpkh_address};
 use crate::model::{
-    CreateQuoteRequest, CreateSwapRequest, ObserveLockRequest, ObserveVtxoRequest, Side,
+    CreatePlanRequest, CreateQuoteRequest, CreateSwapRequest, ObserveLockRequest,
+    ObserveVtxoRequest, Side,
 };
 use crate::tachi::Health;
 use crate::tachi_tx::xonly_from_secret;
@@ -82,7 +83,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(sync_all)
         .service(sync_swap)
         .service(fund_inbound)
-        .service(pay_outbound);
+        .service(pay_outbound)
+        .service(plan_exit)
+        .service(get_plan)
+        .service(accept_plan);
 }
 
 #[get("/")]
@@ -107,6 +111,28 @@ async fn meta(engine: web::Data<Engine>) -> HttpResponse {
         pricing: engine.pricing(),
         deadline_presets: DEADLINE_PRESETS,
     })
+}
+
+/// Split one amount across desks (#5). Legs are firm quotes; accept opens all.
+#[post("/v1/exits")]
+async fn plan_exit(
+    engine: web::Data<Engine>,
+    body: web::Json<CreatePlanRequest>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Created().json(engine.plan_exit(body.into_inner()).await?))
+}
+
+#[get("/v1/exits/{id}")]
+async fn get_plan(engine: web::Data<Engine>, path: web::Path<Uuid>) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(engine.get_plan(path.into_inner()).await?))
+}
+
+#[post("/v1/exits/{id}/accept")]
+async fn accept_plan(
+    engine: web::Data<Engine>,
+    path: web::Path<Uuid>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(engine.accept_plan(path.into_inner()).await?))
 }
 
 #[get("/v1/swaps")]
