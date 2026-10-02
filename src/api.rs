@@ -11,8 +11,9 @@ use crate::engine::{
 use crate::error::Error;
 use crate::htlc::{generate_keypair, p2wpkh_address};
 use crate::model::{
-    CreatePlanRequest, CreateQuoteRequest, CreateSwapRequest, ObserveLockRequest,
-    ObserveVtxoRequest, Side, WebhookRequest,
+    AdvanceAcceptRequest, AdvanceQuoteRequest, CreatePlanRequest, CreateQuoteRequest,
+    CreateSwapRequest, ObserveLockRequest, ObserveVtxoRequest, Side,
+    WebhookRequest,
 };
 use crate::tachi::Health;
 use crate::tachi_tx::xonly_from_secret;
@@ -91,7 +92,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(accept_plan)
         .service(post_bond)
         .service(events)
-        .service(add_webhook);
+        .service(add_webhook)
+        .service(quote_advance)
+        .service(list_advances)
+        .service(get_advance)
+        .service(accept_advance)
+        .service(demo_presign_advance)
+        .service(demo_csv_lock);
 }
 
 #[get("/")]
@@ -163,7 +170,7 @@ struct EventsQuery {
     swap_id: Option<Uuid>,
 }
 
-/// Server-sent events (#7): every swap change.
+/// Server-sent events (#7): every swap / advance / Lightning-swap change.
 #[get("/v1/events")]
 async fn events(engine: web::Data<Engine>, q: web::Query<EventsQuery>) -> HttpResponse {
     use tokio::sync::broadcast::error::RecvError;
@@ -198,6 +205,69 @@ async fn add_webhook(
 ) -> Result<HttpResponse, Error> {
     let n = engine.add_webhook(body.into_inner()).await?;
     Ok(HttpResponse::Created().json(serde_json::json!({ "webhooks": n })))
+}
+
+/// Price an advance on a maturing CSV output (#8).
+#[post("/v1/advances/quote")]
+async fn quote_advance(
+    engine: web::Data<Engine>,
+    body: web::Json<AdvanceQuoteRequest>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Created().json(engine.quote_advance(body.into_inner()).await?))
+}
+
+#[get("/v1/advances")]
+async fn list_advances(engine: web::Data<Engine>) -> HttpResponse {
+    HttpResponse::Ok().json(engine.list_advances().await)
+}
+
+#[get("/v1/advances/{id}")]
+async fn get_advance(engine: web::Data<Engine>, path: web::Path<Uuid>) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(engine.get_advance(path.into_inner()).await?))
+}
+
+/// Hand over the pre-signed spend; the desk verifies it and pays the advance.
+#[post("/v1/advances/{id}/accept")]
+async fn accept_advance(
+    engine: web::Data<Engine>,
+    path: web::Path<Uuid>,
+    body: web::Json<AdvanceAcceptRequest>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(engine.accept_advance(path.into_inner(), body.into_inner()).await?))
+}
+
+/// Demo: sign the advance's spend with the demo key (a wallet does this).
+#[post("/v1/advances/{id}/demo-presign")]
+async fn demo_presign_advance(
+    engine: web::Data<Engine>,
+    path: web::Path<Uuid>,
+    body: web::Json<SecretBody>,
+) -> Result<HttpResponse, Error> {
+    let hex = engine
+        .demo_presign_advance(path.into_inner(), &body.secret_hex)
+        .await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "presigned_tx_hex": hex })))
+}
+
+#[derive(serde::Deserialize)]
+struct CsvLockBody {
+    pubkey_hex: String,
+    csv_blocks: u32,
+    amount_sats: u64,
+}
+
+/// Demo: faucet coins into a CSV-locked output (a stand-in for a vault refund
+/// still waiting out its delay).
+#[post("/v1/demo/csv-lock")]
+async fn demo_csv_lock(
+    engine: web::Data<Engine>,
+    body: web::Json<CsvLockBody>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(
+        engine
+            .demo_csv_lock(&body.pubkey_hex, body.csv_blocks, body.amount_sats)
+            .await?,
+    ))
 }
 
 #[get("/v1/swaps")]

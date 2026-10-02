@@ -239,6 +239,67 @@ pub struct Swap {
     pub compensation_vtxo_id: Option<String>,
 }
 
+/// A desk buying a maturing timelocked output for bitcoin now (claim advance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Advance {
+    pub id: Uuid,
+    pub lp_id: String,
+    pub status: AdvanceStatus,
+    pub outpoint_txid: String,
+    pub outpoint_vout: u32,
+    pub value_sats: u64,
+    pub witness_script_hex: String,
+    /// The output's CSV delay and the height it becomes spendable.
+    pub csv_blocks: u32,
+    pub mature_height: u32,
+    /// Where the user's pre-signed spend must pay, and at least how much.
+    pub desk_address: String,
+    pub min_desk_sats: u64,
+    pub discount_sats: u64,
+    pub advance_sats: u64,
+    pub user_l1_address: String,
+    pub expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance_txid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presigned_tx_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collect_txid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvanceStatus {
+    /// Priced; waiting for the user's pre-signed spend.
+    Quoted,
+    /// Desk paid the advance; waiting for the output to mature.
+    Advanced,
+    /// Desk broadcast the pre-signed spend after maturity.
+    Collected,
+    /// The output was spent elsewhere first (the risk the discount prices).
+    Lost,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvanceQuoteRequest {
+    pub txid: String,
+    pub vout: u32,
+    /// `<csv> OP_CSV OP_DROP <pubkey> OP_CHECKSIG` behind the P2WSH output.
+    pub witness_script_hex: String,
+    pub user_l1_address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvanceAcceptRequest {
+    /// Spend of the output to `desk_address`, signed by the user.
+    pub presigned_tx_hex: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookRequest {
     pub url: String,

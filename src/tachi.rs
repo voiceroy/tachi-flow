@@ -295,6 +295,30 @@ impl TachiClient {
         }))
     }
 
+    /// Confirmed-only `gettxout` with what a claim advance needs to price the
+    /// output: value, confirmations, and the scriptPubKey it pays.
+    pub async fn confirmed_tx_out(&self, txid: &str, vout: u32) -> Result<Option<TxOutInfo>, Error> {
+        let result = self
+            .bitcoin_rpc("gettxout", serde_json::json!([txid, vout, false]))
+            .await?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        let btc = result.get("value").and_then(Value::as_f64).unwrap_or(0.0);
+        Ok(Some(TxOutInfo {
+            value_sats: (btc * 100_000_000.0).round() as u64,
+            confirmations: result
+                .get("confirmations")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+            script_pubkey_hex: result
+                .pointer("/scriptPubKey/hex")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }))
+    }
+
     pub async fn send_raw_tx(&self, hex_tx: &str) -> Result<String, Error> {
         let txid = self
             .bitcoin_rpc("sendrawtransaction", serde_json::json!([hex_tx]))
@@ -310,4 +334,11 @@ pub struct ChainUtxo {
     pub txid: String,
     pub vout: u32,
     pub value_sats: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxOutInfo {
+    pub value_sats: u64,
+    pub confirmations: u32,
+    pub script_pubkey_hex: String,
 }

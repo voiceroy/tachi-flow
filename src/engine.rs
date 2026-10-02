@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedMutexGuard, RwLock};
 use uuid::Uuid;
 
+use crate::advance::{
+    ExpectedSpend, MAX_SPEND_FEE_SATS, csv_script, discount_sats, p2wsh, parse_csv_script,
+    presign_spend, verify_presigned,
+};
 use crate::error::Error;
 use crate::events::{Event, MAX_WEBHOOKS, validate_webhook_url};
 use crate::htlc::{
@@ -20,9 +24,10 @@ use crate::htlc::{
     payment_hash, pubkey_from_hex, random_preimage, redeem_script, refund_tx_hex, txid_of_hex,
 };
 use crate::model::{
-    CreatePlanRequest, CreateQuoteRequest, ExitPlan, HtlcLock, LiquidityProvider,
-    ObserveLockRequest, ObserveVtxoRequest, PayInstructions, PriceBreakdown, Quote, Side, Swap,
-    SwapStatus, WebhookRequest, fee_sats,
+    Advance, AdvanceAcceptRequest, AdvanceQuoteRequest, AdvanceStatus, CreatePlanRequest,
+    CreateQuoteRequest, ExitPlan, HtlcLock, LiquidityProvider, ObserveLockRequest,
+    ObserveVtxoRequest, PayInstructions, PriceBreakdown, Quote, Side, Swap, SwapStatus,
+    WebhookRequest, fee_sats,
 };
 use crate::tachi::TachiClient;
 use crate::tachi_tx::{
@@ -59,6 +64,8 @@ const MIN_ROUTING_SCORE_PPM: u64 = 400_000;
 const DEFAULT_PENALTY_PPM: u64 = 10_000;
 /// ...but at least this much (capped by the bond itself).
 const MIN_COMPENSATION_SATS: u64 = 500;
+/// How long a claim-advance quote holds.
+const SIDE_QUOTE_TTL_SECS: i64 = 10 * 60;
 
 /// Knobs for [`price`]. All values are parts per million.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -121,6 +128,9 @@ struct Inner {
     bonds: HashMap<String, u64>,
     /// (fills, defaults) per desk.
     reputation: HashMap<String, (u64, u64)>,
+    advances: HashMap<Uuid, Advance>,
+    /// Signed advance payouts, by advance id, so a retry re-sends, never re-pays.
+    pending_advance_txs: HashMap<Uuid, String>,
     webhooks: Vec<WebhookRequest>,
 }
 
@@ -437,6 +447,8 @@ impl Engine {
         inner.plans = file.plans.into_iter().map(|p| (p.id, p)).collect();
         inner.bonds = file.bonds;
         inner.reputation = file.reputation;
+        inner.advances = file.advances.into_iter().map(|a| (a.id, a)).collect();
+        inner.pending_advance_txs = file.pending_advance_txs;
         inner.webhooks = file.webhooks;
         apply_desk_stats(&mut inner);
         tracing::info!(
@@ -1452,20 +1464,7 @@ impl Engine {
             }
         };
         let from = p2wpkh_address(&sk, self.network);
-
-        let mut utxo = None;
-        'poll: for _ in 0..25 {
-            for vout in 0..4u32 {
-                if let Ok(Some(u)) = self.tachi.get_tx_out(&faucet_txid, vout).await {
-                    utxo = Some(u);
-                    break 'poll;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        }
-        let u = utxo.ok_or_else(|| {
-            Error::Tachi("faucet paid but the coin is not visible on RPC yet — try again".into())
-        })?;
+        let u = self.wait_for_faucet_coin(&faucet_txid).await?;
         let fee = 300u64;
         if u.value_sats <= swap.amount_sats + fee {
             return Err(Error::Invalid(format!(
@@ -2492,6 +2491,7 @@ impl Engine {
                 Err(err) => tracing::warn!(%id, %err, "sync swap"),
             }
         }
+        self.sync_advances().await;
         Ok(updated)
     }
 
@@ -2706,6 +2706,410 @@ impl Engine {
             Err(err) => Err(err),
         }
     }
+
+    /// The hosted faucet's payout, once bitcoind shows it (mempool-aware).
+    async fn wait_for_faucet_coin(&self, faucet_txid: &str) -> Result<crate::tachi::ChainUtxo, Error> {
+        for _ in 0..25 {
+            for vout in 0..4u32 {
+                if let Ok(Some(u)) = self.tachi.get_tx_out(faucet_txid, vout).await {
+                    return Ok(u);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        Err(Error::Tachi(
+            "faucet paid but the coin is not visible on RPC yet — try again".into(),
+        ))
+    }
+}
+
+/// Claim advances (#8): the desk buys a maturing timelocked output.
+impl Engine {
+    pub async fn list_advances(&self) -> Vec<Advance> {
+        let mut v: Vec<_> = self.inner.read().await.advances.values().cloned().collect();
+        v.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+        v
+    }
+
+    pub async fn get_advance(&self, id: Uuid) -> Result<Advance, Error> {
+        self.inner
+            .read()
+            .await
+            .advances
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::Invalid(format!("unknown advance {id}")))
+    }
+
+    async fn update_advance(&self, id: Uuid, f: impl FnOnce(&mut Advance)) -> Result<Advance, Error> {
+        let out = {
+            let mut inner = self.inner.write().await;
+            let a = inner
+                .advances
+                .get_mut(&id)
+                .ok_or_else(|| Error::Invalid(format!("unknown advance {id}")))?;
+            f(a);
+            a.updated_at = Utc::now();
+            a.clone()
+        };
+        self.save_state().await;
+        self.publish(Event::Advance(Box::new(out.clone()))).await;
+        Ok(out)
+    }
+
+    /// Price an advance on a confirmed CSV output. Reserves the desk's L1.
+    pub async fn quote_advance(&self, req: AdvanceQuoteRequest) -> Result<Advance, Error> {
+        if self.test_mode {
+            return Err(Error::Invalid("claim advances need a live chain".into()));
+        }
+        let script = redeem_from_hex(&req.witness_script_hex)?;
+        let (csv_blocks, _) = parse_csv_script(&script).ok_or_else(|| {
+            Error::Invalid(
+                "unsupported script: expected <csv> OP_CSV OP_DROP <pubkey> OP_CHECKSIG".into(),
+            )
+        })?;
+        let user_l1 = req
+            .user_l1_address
+            .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+            .map_err(|_| Error::Invalid("user_l1_address is not a bitcoin address".into()))?
+            .require_network(self.network)
+            .map_err(|e| Error::Invalid(format!("user_l1_address: {e}")))?;
+        let info = self
+            .tachi
+            .confirmed_tx_out(&req.txid, req.vout)
+            .await?
+            .ok_or_else(|| {
+                Error::Invalid("output not found: unconfirmed, spent, or never existed".into())
+            })?;
+        if info.script_pubkey_hex != hex::encode(p2wsh(&script, self.network).script_pubkey().as_bytes()) {
+            return Err(Error::Invalid("witness script does not match the output".into()));
+        }
+        parse_txid(&req.txid)?;
+        let tip = self.fresh_height().await?;
+        // BIP68: the spend can be mined at `confirm_height + csv`.
+        let mature_height = tip + 1 - info.confirmations + csv_blocks;
+        let blocks_left = mature_height.saturating_sub(tip + 1);
+        let min_desk_sats = info.value_sats.saturating_sub(MAX_SPEND_FEE_SATS);
+        let discount = discount_sats(info.value_sats, blocks_left);
+        let advance_sats = min_desk_sats
+            .saturating_sub(discount)
+            .saturating_sub(CLAIM_FEE_SATS);
+        if advance_sats < MIN_SWAP_SATS {
+            return Err(Error::AmountTooSmall(MIN_SWAP_SATS + discount + MAX_SPEND_FEE_SATS));
+        }
+
+        let id = Uuid::now_v7();
+        let now = Utc::now();
+        let advance = {
+            let mut inner = self.inner.write().await;
+            if inner.advances.values().any(|a| {
+                a.outpoint_txid == req.txid
+                    && a.outpoint_vout == req.vout
+                    && matches!(a.status, AdvanceStatus::Quoted | AdvanceStatus::Advanced)
+            }) {
+                return Err(Error::Invalid("this output already has an open advance".into()));
+            }
+            let lp = inner
+                .lps
+                .iter()
+                .filter(|lp| routable(lp) && lp.l1_sats >= advance_sats + CLAIM_FEE_SATS)
+                .max_by_key(|lp| lp.l1_sats)
+                .cloned()
+                .ok_or(Error::NoLiquidity {
+                    side: Side::Out,
+                    amount_sats: advance_sats,
+                })?;
+            let w = self.lp_wallet(&lp.id)?;
+            let advance = Advance {
+                id,
+                lp_id: lp.id.clone(),
+                status: AdvanceStatus::Quoted,
+                outpoint_txid: req.txid.clone(),
+                outpoint_vout: req.vout,
+                value_sats: info.value_sats,
+                witness_script_hex: req.witness_script_hex.clone(),
+                csv_blocks,
+                mature_height,
+                desk_address: w.claim_address.to_string(),
+                min_desk_sats,
+                discount_sats: discount,
+                advance_sats,
+                user_l1_address: user_l1.to_string(),
+                expires_at: now + Duration::seconds(SIDE_QUOTE_TTL_SECS),
+                advance_txid: None,
+                presigned_tx_hex: None,
+                collect_txid: None,
+                note: Some(format!(
+                    "Sign a spend of {}:{} paying at least {min_desk_sats} sats to {}, with sequence {csv_blocks}. The desk pays you {advance_sats} sats now and broadcasts your spend at block {mature_height}.",
+                    req.txid, req.vout, w.claim_address
+                )),
+                created_at: now,
+                updated_at: now,
+            };
+            debit_lp(&mut inner.lps, &lp.id, Side::Out, advance_sats + CLAIM_FEE_SATS)?;
+            inner.advances.insert(id, advance.clone());
+            advance
+        };
+        self.save_state().await;
+        self.publish(Event::Advance(Box::new(advance.clone()))).await;
+        Ok(advance)
+    }
+
+    /// Verify the user's pre-signed spend, then pay the advance.
+    pub async fn accept_advance(&self, id: Uuid, req: AdvanceAcceptRequest) -> Result<Advance, Error> {
+        let _guard = self.lock_swap(id).await;
+        let a = self.get_advance(id).await?;
+        if a.status != AdvanceStatus::Quoted {
+            return Err(Error::Invalid(format!("advance is {:?}", a.status)));
+        }
+        if a.expires_at < Utc::now() {
+            self.expire_advance(&a).await?;
+            return Err(Error::QuoteExpired);
+        }
+        let script = redeem_from_hex(&a.witness_script_hex)?;
+        let (csv_blocks, owner) =
+            parse_csv_script(&script).ok_or_else(|| Error::Invalid("stored script".into()))?;
+        let desk_address = a
+            .desk_address
+            .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+            .map_err(|_| Error::Invalid("desk address".into()))?
+            .assume_checked();
+        let outpoint = OutPoint {
+            txid: parse_txid(&a.outpoint_txid)?,
+            vout: a.outpoint_vout,
+        };
+        verify_presigned(
+            &req.presigned_tx_hex,
+            &ExpectedSpend {
+                outpoint,
+                value_sats: a.value_sats,
+                script: &script,
+                csv_blocks,
+                owner: &owner,
+                desk_address: &desk_address,
+                min_desk_sats: a.min_desk_sats,
+            },
+        )?;
+        if self
+            .tachi
+            .confirmed_tx_out(&a.outpoint_txid, a.outpoint_vout)
+            .await?
+            .is_none()
+        {
+            return Err(Error::Invalid("the output was already spent".into()));
+        }
+
+        let (hex, inputs) = self
+            .sign_l1_payment(&a.lp_id, &[(a.user_l1_address.clone(), a.advance_sats)])
+            .await?;
+        let txid = txid_of_hex(&hex)?.to_string();
+        // Recorded before broadcast: a lost reply must not lead to paying twice.
+        self.inner.write().await.pending_advance_txs.insert(id, hex.clone());
+        let presigned = req.presigned_tx_hex.trim().to_string();
+        let t = txid.clone();
+        let a = self
+            .update_advance(id, |a| {
+                a.status = AdvanceStatus::Advanced;
+                a.advance_txid = Some(t);
+                a.presigned_tx_hex = Some(presigned);
+                a.note = Some(format!(
+                    "Desk paid {} sats now. It collects your output at block {}.",
+                    a.advance_sats, a.mature_height
+                ));
+            })
+            .await?;
+        match self.broadcast_l1(&hex).await {
+            Ok(_) => {}
+            Err(Error::TachiRejected(why)) => {
+                {
+                    let mut spend = self.lp_spend(&a.lp_id).await?;
+                    for op in &inputs {
+                        spend.l1.remove(op);
+                    }
+                }
+                self.inner.write().await.pending_advance_txs.remove(&id);
+                let note = format!("Desk payout was rejected ({why}); try again.");
+                self.update_advance(id, |a| {
+                    a.status = AdvanceStatus::Quoted;
+                    a.advance_txid = None;
+                    a.presigned_tx_hex = None;
+                    a.note = Some(note);
+                })
+                .await?;
+                return Err(Error::TachiRejected(why));
+            }
+            // Unknown outcome: the signed payout is kept and re-sent by sync.
+            Err(err) => tracing::warn!(%err, %id, "advance payout broadcast"),
+        }
+        Ok(a)
+    }
+
+    /// Sign the user's spend for an advance with their demo key (a wallet's job).
+    pub async fn demo_presign_advance(&self, id: Uuid, secret_hex: &str) -> Result<String, Error> {
+        let a = self.get_advance(id).await?;
+        let secret = parse_secret(secret_hex)?;
+        let script = redeem_from_hex(&a.witness_script_hex)?;
+        let desk = a
+            .desk_address
+            .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+            .map_err(|_| Error::Invalid("desk address".into()))?
+            .assume_checked();
+        presign_spend(
+            OutPoint {
+                txid: parse_txid(&a.outpoint_txid)?,
+                vout: a.outpoint_vout,
+            },
+            a.value_sats,
+            &script,
+            a.csv_blocks,
+            &secret,
+            &desk,
+            a.min_desk_sats,
+        )
+    }
+
+    /// Demo: faucet coins into a CSV-locked output owned by `pubkey_hex` — a
+    /// stand-in for a vault refund still waiting out its delay.
+    pub async fn demo_csv_lock(
+        &self,
+        pubkey_hex: &str,
+        csv_blocks: u32,
+        amount_sats: u64,
+    ) -> Result<serde_json::Value, Error> {
+        if self.test_mode {
+            return Err(Error::Invalid("needs the live faucet".into()));
+        }
+        if !(1..=VAULT_EXIT_BLOCKS).contains(&csv_blocks) {
+            return Err(Error::Invalid(format!("csv_blocks must be 1..={VAULT_EXIT_BLOCKS}")));
+        }
+        if !(20_000..=200_000).contains(&amount_sats) {
+            return Err(Error::Invalid("amount_sats must be 20000..=200000".into()));
+        }
+        let owner = pubkey_from_hex(pubkey_hex)?;
+        let script = csv_script(csv_blocks, &owner);
+        let lock = p2wsh(&script, self.network);
+        let sk = generate_keypair().secret;
+        let from = p2wpkh_address(&sk, self.network);
+        let drip = (amount_sats + 20_000) as f64 / 100_000_000.0;
+        let faucet_txid = crate::faucet::drip(&from.to_string(), drip).await?;
+        let u = self.wait_for_faucet_coin(&faucet_txid).await?;
+        let hex = p2wpkh_send_hex(
+            &[(
+                OutPoint {
+                    txid: parse_txid(&u.txid)?,
+                    vout: u.vout,
+                },
+                u.value_sats,
+            )],
+            &lock,
+            amount_sats,
+            300,
+            &from,
+            &sk,
+            self.network,
+        )?;
+        let txid = self.broadcast_l1(&hex).await?;
+        Ok(serde_json::json!({
+            "txid": txid,
+            "vout": 0,
+            "value_sats": amount_sats,
+            "address": lock.to_string(),
+            "csv_blocks": csv_blocks,
+            "witness_script_hex": hex::encode(script.as_bytes()),
+            "note": "Quote an advance once this confirms (next block).",
+        }))
+    }
+
+    async fn expire_advance(&self, a: &Advance) -> Result<(), Error> {
+        {
+            let mut inner = self.inner.write().await;
+            credit_lp(&mut inner.lps, &a.lp_id, Side::Out, a.advance_sats + CLAIM_FEE_SATS);
+        }
+        self.update_advance(a.id, |a| {
+            a.status = AdvanceStatus::Expired;
+            a.note = Some("Quote expired before a signed spend arrived.".into());
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Expire stale quotes, re-send unconfirmed payouts, collect at maturity.
+    async fn sync_advances(&self) {
+        let open: Vec<Advance> = self
+            .inner
+            .read()
+            .await
+            .advances
+            .values()
+            .filter(|a| matches!(a.status, AdvanceStatus::Quoted | AdvanceStatus::Advanced))
+            .cloned()
+            .collect();
+        if open.is_empty() || self.test_mode {
+            return;
+        }
+        let Ok(h) = self.known_height().await else {
+            return;
+        };
+        for a in open {
+            let Ok(_guard) = self.swap_mutex(a.id).try_lock_owned() else {
+                continue;
+            };
+            if let Err(err) = self.sync_advance(a, h).await {
+                tracing::warn!(%err, "sync advance");
+            }
+        }
+    }
+
+    async fn sync_advance(&self, a: Advance, h: u32) -> Result<(), Error> {
+        let a = self.get_advance(a.id).await?;
+        match a.status {
+            AdvanceStatus::Quoted if a.expires_at < Utc::now() => self.expire_advance(&a).await,
+            AdvanceStatus::Advanced => {
+                let pending = self.inner.read().await.pending_advance_txs.get(&a.id).cloned();
+                if let (Some(hex), Some(txid)) = (pending, a.advance_txid.as_deref()) {
+                    if self.tachi.get_tx_out(txid, 0).await?.is_some() {
+                        self.inner.write().await.pending_advance_txs.remove(&a.id);
+                    } else if let Err(err) = self.broadcast_l1(&hex).await {
+                        tracing::warn!(%err, id = %a.id, "advance payout re-send");
+                    }
+                }
+                if h + 1 < a.mature_height {
+                    return Ok(());
+                }
+                let presigned = a.presigned_tx_hex.clone().unwrap_or_default();
+                match self.broadcast_l1(&presigned).await {
+                    Ok(txid) => {
+                        self.record_fill(&a.lp_id).await;
+                        self.update_advance(a.id, |a| {
+                            a.status = AdvanceStatus::Collected;
+                            a.collect_txid = Some(txid.clone());
+                            a.note = Some(format!("Desk collected the output ({txid})."));
+                        })
+                        .await?;
+                    }
+                    Err(Error::TachiRejected(why)) => {
+                        let gone = self
+                            .tachi
+                            .confirmed_tx_out(&a.outpoint_txid, a.outpoint_vout)
+                            .await?
+                            .is_none();
+                        if gone {
+                            self.update_advance(a.id, |a| {
+                                a.status = AdvanceStatus::Lost;
+                                a.note = Some(format!(
+                                    "The output was spent elsewhere before the desk collected ({why})."
+                                ));
+                            })
+                            .await?;
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Pending-payout key for a default's compensation, distinct from the swap's own.
@@ -2801,6 +3205,13 @@ fn reserved(inner: &Inner, lp_id: &str) -> (u64, u64) {
             Side::Out => l1 += reserve_sats(side, receive),
         }
     }
+    // Claim advances promise L1.
+    l1 += inner
+        .advances
+        .values()
+        .filter(|a| a.lp_id == lp_id && a.status == AdvanceStatus::Quoted)
+        .map(|a| a.advance_sats + CLAIM_FEE_SATS)
+        .sum::<u64>();
     (vtxo, l1)
 }
 
@@ -2828,6 +3239,10 @@ struct PersistFile {
     bonds: HashMap<String, u64>,
     #[serde(default)]
     reputation: HashMap<String, (u64, u64)>,
+    #[serde(default)]
+    advances: Vec<Advance>,
+    #[serde(default)]
+    pending_advance_txs: HashMap<Uuid, String>,
     #[serde(default)]
     webhooks: Vec<WebhookRequest>,
 }
@@ -2860,6 +3275,8 @@ impl From<&Inner> for PersistFile {
             plans: inner.plans.values().cloned().collect(),
             bonds: inner.bonds.clone(),
             reputation: inner.reputation.clone(),
+            advances: inner.advances.values().cloned().collect(),
+            pending_advance_txs: inner.pending_advance_txs.clone(),
             webhooks: inner.webhooks.clone(),
         }
     }
@@ -4157,7 +4574,7 @@ mod tests {
         .unwrap();
         let mut seen = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            let Event::Swap(sw) = &ev;
+            let Event::Swap(sw) = &ev else { continue };
             assert_eq!(sw.id, s.id);
             assert!(ev.sse_frame().starts_with("event: swap\ndata: {"));
             seen.push(sw.status);

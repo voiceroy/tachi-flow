@@ -1,5 +1,6 @@
 //! Tachi-flow: on-chain BTC ↔ Tachi VTXO liquidity engine (bounty #10 PoC).
 
+pub mod advance;
 pub mod api;
 pub mod engine;
 pub mod error;
