@@ -31,15 +31,30 @@ impl FromRequest for Admin {
     type Future = Ready<Result<Self, Error>>;
 
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
-        let header = |name| req.headers().get(name).and_then(|v| v.to_str().ok());
-        let given = header("x-admin-token")
-            .or_else(|| header("authorization").and_then(|v| v.strip_prefix("Bearer ")));
-        let ok = req
-            .app_data::<web::Data<AdminToken>>()
-            .zip(given)
-            .is_some_and(|(want, got)| constant_time_eq(want.0.as_bytes(), got.trim().as_bytes()));
-        ready(if ok { Ok(Admin) } else { Err(Error::Unauthorized) })
+        ready(if is_admin(req) { Ok(Admin) } else { Err(Error::Unauthorized) })
     }
+}
+
+fn is_admin(req: &HttpRequest) -> bool {
+    let header = |name| req.headers().get(name).and_then(|v| v.to_str().ok());
+    let given = header("x-admin-token")
+        .or_else(|| header("authorization").and_then(|v| v.strip_prefix("Bearer ")));
+    req.app_data::<web::Data<AdminToken>>()
+        .zip(given)
+        .is_some_and(|(want, got)| constant_time_eq(want.0.as_bytes(), got.trim().as_bytes()))
+}
+
+/// Who a quote request counts against for the anti-griefing caps: the peer
+/// IP. Operator requests (admin token) are not capped.
+fn quote_client(req: &HttpRequest) -> Option<String> {
+    if is_admin(req) {
+        return None;
+    }
+    Some(
+        req.peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "unknown".into()),
+    )
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -136,10 +151,15 @@ async fn meta(engine: web::Data<Engine>) -> HttpResponse {
 /// Split one amount across desks (#5). Legs are firm quotes; accept opens all.
 #[post("/v1/exits")]
 async fn plan_exit(
+    req: HttpRequest,
     engine: web::Data<Engine>,
     body: web::Json<CreatePlanRequest>,
 ) -> Result<HttpResponse, Error> {
-    Ok(HttpResponse::Created().json(engine.plan_exit(body.into_inner()).await?))
+    let plan = match quote_client(&req) {
+        Some(client) => engine.plan_exit_for(&client, body.into_inner()).await?,
+        None => engine.plan_exit(body.into_inner()).await?,
+    };
+    Ok(HttpResponse::Created().json(plan))
 }
 
 #[get("/v1/exits/{id}")]
@@ -346,10 +366,14 @@ async fn inventory(engine: web::Data<Engine>) -> HttpResponse {
 
 #[post("/v1/quotes")]
 async fn create_quote(
+    req: HttpRequest,
     engine: web::Data<Engine>,
     body: web::Json<CreateQuoteRequest>,
 ) -> Result<HttpResponse, Error> {
-    let quote = engine.create_quote(body.into_inner()).await?;
+    let quote = match quote_client(&req) {
+        Some(client) => engine.create_quote_for(&client, body.into_inner()).await?,
+        None => engine.create_quote(body.into_inner()).await?,
+    };
     Ok(HttpResponse::Created().json(quote))
 }
 
@@ -357,10 +381,14 @@ async fn create_quote(
 /// (POST /v1/swaps) releases the others.
 #[post("/v1/rfq")]
 async fn rfq(
+    req: HttpRequest,
     engine: web::Data<Engine>,
     body: web::Json<CreateQuoteRequest>,
 ) -> Result<HttpResponse, Error> {
-    let quotes = engine.request_quotes(body.into_inner()).await?;
+    let quotes = match quote_client(&req) {
+        Some(client) => engine.request_quotes_for(&client, body.into_inner()).await?,
+        None => engine.request_quotes(body.into_inner()).await?,
+    };
     Ok(HttpResponse::Created().json(quotes))
 }
 

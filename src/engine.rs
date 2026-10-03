@@ -70,6 +70,18 @@ const MIN_COMPENSATION_SATS: u64 = 500;
 const SIDE_QUOTE_TTL_SECS: i64 = 10 * 60;
 /// Most a desk pays in Lightning routing fees for an `out` swap.
 const LN_MAX_ROUTING_FEE_SATS: u64 = 100;
+/// Anti-griefing: open quotes plus unpaid swaps one client may hold...
+const MAX_OPEN_PER_CLIENT: usize = 6;
+/// ...and how much desk stock they may tie up between them.
+const MAX_HELD_SATS_PER_CLIENT: u64 = 4_000_000;
+/// A quote for more than this share of a desk's free stock only stays firm
+/// for `LARGE_QUOTE_MAX_TTL_SECS`, so a big hold cannot sit for an hour.
+const LARGE_QUOTE_SHARE_PPM: u64 = 250_000;
+const LARGE_QUOTE_MAX_TTL_SECS: u64 = 120;
+/// An opened swap nobody pays releases its stock after this long.
+const UNPAID_SWAP_SECS: i64 = 60 * 60;
+/// Deadline swaps are only "unpaid" this many blocks past their deadline.
+const UNPAID_SWAP_BLOCKS: u32 = 6;
 
 /// Knobs for [`price`]. All values are parts per million.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -137,6 +149,9 @@ struct Inner {
     pending_advance_txs: HashMap<Uuid, String>,
     ln_swaps: HashMap<Uuid, LnSwap>,
     webhooks: Vec<WebhookRequest>,
+    /// Who asked for each open quote / unpaid swap (by id), for the
+    /// per-client caps. Not persisted: holds expire within the hour anyway.
+    clients: HashMap<Uuid, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -195,6 +210,13 @@ struct Leg {
     pricing: PriceBreakdown,
     rfq_id: Option<Uuid>,
     plan_id: Option<Uuid>,
+}
+
+impl Leg {
+    /// How long this leg stays firm (`firm_ttl` may have shortened it).
+    fn ttl_secs(&self) -> u64 {
+        self.pricing.ttl_secs
+    }
 }
 
 #[derive(Clone)]
@@ -750,14 +772,29 @@ impl Engine {
 
     /// Best single quote across desks. Reserves only that desk's stock.
     pub async fn create_quote(&self, req: CreateQuoteRequest) -> Result<Quote, Error> {
-        let mut quotes = self.quote_desks(req, false).await?;
+        let mut quotes = self.quote_desks(req, false, None).await?;
+        Ok(quotes.remove(0))
+    }
+
+    /// [`Self::create_quote`] on behalf of an outside client, within its caps.
+    pub async fn create_quote_for(&self, client: &str, req: CreateQuoteRequest) -> Result<Quote, Error> {
+        let mut quotes = self.quote_desks(req, false, Some(client)).await?;
         Ok(quotes.remove(0))
     }
 
     /// RFQ: firm quotes from every desk that can fill, cheapest first. Each
     /// reserves stock until it expires; accepting one releases the others.
     pub async fn request_quotes(&self, req: CreateQuoteRequest) -> Result<Vec<Quote>, Error> {
-        self.quote_desks(req, true).await
+        self.quote_desks(req, true, None).await
+    }
+
+    /// [`Self::request_quotes`] on behalf of an outside client, within its caps.
+    pub async fn request_quotes_for(
+        &self,
+        client: &str,
+        req: CreateQuoteRequest,
+    ) -> Result<Vec<Quote>, Error> {
+        self.quote_desks(req, true, Some(client)).await
     }
 
     /// Fee by deadline for each desk at its current books. Reserves nothing.
@@ -789,7 +826,12 @@ impl Engine {
             .collect()
     }
 
-    async fn quote_desks(&self, req: CreateQuoteRequest, all: bool) -> Result<Vec<Quote>, Error> {
+    async fn quote_desks(
+        &self,
+        req: CreateQuoteRequest,
+        all: bool,
+        client: Option<&str>,
+    ) -> Result<Vec<Quote>, Error> {
         if req.amount_sats < MIN_SWAP_SATS {
             return Err(Error::AmountTooSmall(MIN_SWAP_SATS));
         }
@@ -807,7 +849,8 @@ impl Engine {
             .iter()
             .filter(|lp| can_fill(lp, req.side, req.amount_sats))
             .map(|lp| {
-                let p = price(&self.pricing, lp, req.side, req.amount_sats, terms.ttl_secs, terms.deadline);
+                let ttl = firm_ttl(lp, req.side, req.amount_sats, terms.ttl_secs);
+                let p = price(&self.pricing, lp, req.side, req.amount_sats, ttl, terms.deadline);
                 (lp.clone(), p, fee_sats(req.amount_sats, p.fee_ppm, MIN_FEE_SATS))
             })
             .collect();
@@ -827,6 +870,11 @@ impl Engine {
         if !all {
             offers.truncate(1);
         }
+        let held: u64 = offers
+            .iter()
+            .map(|(_, _, fee)| reserve_sats(req.side, req.amount_sats - fee))
+            .sum();
+        check_client(&inner, client, offers.len(), held)?;
 
         let rfq_id = all.then(Uuid::now_v7);
         let mut quotes = Vec::with_capacity(offers.len());
@@ -838,7 +886,11 @@ impl Engine {
                 rfq_id,
                 plan_id: None,
             };
-            quotes.push(self.make_quote(&mut inner, &lp.id, &req, &terms, leg)?);
+            let quote = self.make_quote(&mut inner, &lp.id, &req, &terms, leg)?;
+            if let Some(client) = client {
+                inner.clients.insert(quote.id, client.to_string());
+            }
+            quotes.push(quote);
         }
         drop(inner);
         self.save_state().await;
@@ -849,6 +901,19 @@ impl Engine {
     /// is a firm quote; `accept_plan` opens them all. Bigger than any single
     /// desk (or `MAX_SWAP_SATS`) is fine: that is the point.
     pub async fn plan_exit(&self, req: CreatePlanRequest) -> Result<ExitPlan, Error> {
+        self.plan_exit_inner(req, None).await
+    }
+
+    /// [`Self::plan_exit`] on behalf of an outside client, within its caps.
+    pub async fn plan_exit_for(&self, client: &str, req: CreatePlanRequest) -> Result<ExitPlan, Error> {
+        self.plan_exit_inner(req, Some(client)).await
+    }
+
+    async fn plan_exit_inner(
+        &self,
+        req: CreatePlanRequest,
+        client: Option<&str>,
+    ) -> Result<ExitPlan, Error> {
         let max_leg = req.max_leg_sats.unwrap_or(MAX_SWAP_SATS).min(MAX_SWAP_SATS);
         let req = req.quote;
         if req.amount_sats < MIN_SWAP_SATS {
@@ -878,7 +943,8 @@ impl Engine {
                     if chunk < MIN_SWAP_SATS {
                         return None;
                     }
-                    let p = price(&self.pricing, lp, req.side, chunk, terms.ttl_secs, terms.deadline);
+                    let ttl = firm_ttl(lp, req.side, chunk, terms.ttl_secs);
+                    let p = price(&self.pricing, lp, req.side, chunk, ttl, terms.deadline);
                     let fee = fee_sats(chunk, p.fee_ppm, MIN_FEE_SATS);
                     (fee < chunk).then(|| (lp.id.clone(), chunk, p, fee))
                 })
@@ -887,13 +953,7 @@ impl Engine {
                     (fee * 1_000_000 / chunk, p.fee_ppm, std::cmp::Reverse(*chunk))
                 });
             let Some((lp_id, chunk, pricing, fee)) = best else {
-                // Give back what the earlier legs reserved.
-                for leg in &legs {
-                    if let Some(q) = inner.quotes.remove(&leg.id) {
-                        inner.preimages.remove(&leg.id);
-                        credit_lp(&mut inner.lps, &q.lp_id, q.side, reserve_sats(q.side, q.receive_sats));
-                    }
-                }
+                release_quotes(&mut inner, &legs);
                 return Err(Error::NoLiquidity {
                     side: req.side,
                     amount_sats: req.amount_sats,
@@ -908,6 +968,18 @@ impl Engine {
             };
             legs.push(self.make_quote(&mut inner, &lp_id, &req, &terms, leg)?);
             remaining -= chunk;
+        }
+        // The legs are not tagged with the client yet, so the caps see only
+        // its earlier holds plus these.
+        let held: u64 = legs.iter().map(|q| reserve_sats(q.side, q.receive_sats)).sum();
+        if let Err(err) = check_client(&inner, client, legs.len(), held) {
+            release_quotes(&mut inner, &legs);
+            return Err(err);
+        }
+        if let Some(client) = client {
+            for q in &legs {
+                inner.clients.insert(q.id, client.to_string());
+            }
         }
         let plan = ExitPlan {
             id: plan_id,
@@ -1072,7 +1144,7 @@ impl Engine {
             receive_sats: leg.amount_sats - leg.fee_sats,
             lp_id: lp_id.to_string(),
             eta_seconds: if req.side == Side::In { 120 } else { 30 },
-            expires_at: Utc::now() + Duration::seconds(terms.ttl_secs as i64),
+            expires_at: Utc::now() + Duration::seconds(leg.ttl_secs() as i64),
             user_tachi_address: req.user_tachi_address.clone(),
             user_l1_address: req.user_l1_address.clone(),
             pay,
@@ -1216,6 +1288,10 @@ impl Engine {
 
         if let Some(preimage) = inner.preimages.remove(&quote.id) {
             inner.preimages.insert(swap_id, preimage);
+        }
+        // The unpaid swap keeps counting against its client's caps.
+        if let Some(client) = inner.clients.remove(&quote.id) {
+            inner.clients.insert(swap_id, client);
         }
         inner.swaps.insert(swap_id, swap.clone());
         drop(inner);
@@ -2480,11 +2556,80 @@ impl Engine {
     /// Background pass: settle what was paid, claim what was settled, expire
     /// what is too close to its timeout, and reclaim unpaid outbound locks.
     /// Swaps someone else is working on right now are skipped, not waited on.
+    /// Opened but never paid: after `UNPAID_SWAP_SECS` the swap stops holding
+    /// desk stock. An inbound lock nobody funded, or an outbound swap whose
+    /// lock is up (and past any deadline) with no VTXOs sent.
+    async fn release_unpaid_swaps(&self) {
+        let cutoff = Utc::now() - Duration::seconds(UNPAID_SWAP_SECS);
+        let h = self.cached_height();
+        let stale: Vec<Swap> = self
+            .inner
+            .read()
+            .await
+            .swaps
+            .values()
+            .filter(|s| s.status == SwapStatus::Quoted && s.created_at < cutoff)
+            .filter(|s| match s.side {
+                Side::In => s.l1_lock_txid.is_none() && s.faucet_txid.is_none(),
+                Side::Out => {
+                    s.vtxo_payment_id.is_none()
+                        && s.l1_lock_txid.is_some()
+                        && s.lock_by_height.is_none_or(|by| h >= by + UNPAID_SWAP_BLOCKS)
+                }
+            })
+            .cloned()
+            .collect();
+        for swap in stale {
+            let Ok(_guard) = self.swap_mutex(swap.id).try_lock_owned() else {
+                continue;
+            };
+            // A lock paid by an outside wallet only shows on chain; never
+            // release a swap whose user did pay.
+            if swap.side == Side::In && !self.test_mode {
+                match self.scan_htlc(&swap).await {
+                    Ok(None) => {}
+                    _ => continue,
+                }
+            }
+            let Ok(current) = self.get_swap(swap.id).await else {
+                continue;
+            };
+            if current.status != SwapStatus::Quoted || current.updated_at != swap.updated_at {
+                continue;
+            }
+            credit_lp(
+                &mut self.inner.write().await.lps,
+                &swap.lp_id,
+                swap.side,
+                reserve_sats(swap.side, swap.receive_sats),
+            );
+            let timeout = swap.pay.htlc().map(|l| l.timeout_height).unwrap_or_default();
+            let note = match swap.side {
+                Side::In => format!(
+                    "Nobody paid the lock within an hour, so the desk released the stock. If you pay it anyway, refund it after block {timeout}."
+                ),
+                Side::Out => format!(
+                    "No Tachi coins arrived within an hour, so the swap expired. Do not send them now; the desk takes its lock back after block {timeout}."
+                ),
+            };
+            if let Err(err) = self
+                .update_swap(swap.id, |s| {
+                    s.status = SwapStatus::Expired;
+                    s.demo_note = Some(note);
+                })
+                .await
+            {
+                tracing::warn!(%err, id = %swap.id, "release unpaid swap");
+            }
+        }
+    }
+
     pub async fn sync_all(&self) -> Result<Vec<Swap>, Error> {
         let released = release_expired_quotes(&mut *self.inner.write().await);
         if released {
             self.save_state().await;
         }
+        self.release_unpaid_swaps().await;
         if !self.test_mode {
             self.fund_due_outbound_locks().await;
         }
@@ -3923,7 +4068,79 @@ fn release_expired_quotes(inner: &mut Inner) -> bool {
             );
         }
     }
+    // Forget clients whose holds are gone (quote expired/accepted, swap paid).
+    let (quotes, swaps) = (&inner.quotes, &inner.swaps);
+    inner.clients.retain(|id, _| {
+        quotes.contains_key(id) || swaps.get(id).is_some_and(|s| s.status == SwapStatus::Quoted)
+    });
     !expired.is_empty()
+}
+
+/// Drop not-yet-accepted quotes and give their stock back.
+fn release_quotes(inner: &mut Inner, quotes: &[Quote]) {
+    for leg in quotes {
+        if let Some(q) = inner.quotes.remove(&leg.id) {
+            inner.preimages.remove(&leg.id);
+            credit_lp(&mut inner.lps, &q.lp_id, q.side, reserve_sats(q.side, q.receive_sats));
+        }
+    }
+}
+
+/// Per-client caps on open quotes + unpaid swaps and the stock they hold.
+/// `None` (operator / internal callers) is never capped.
+fn check_client(
+    inner: &Inner,
+    client: Option<&str>,
+    new_holds: usize,
+    new_sats: u64,
+) -> Result<(), Error> {
+    let Some(client) = client else {
+        return Ok(());
+    };
+    let (mut open, mut held) = (0usize, 0u64);
+    for (id, who) in &inner.clients {
+        if who != client {
+            continue;
+        }
+        let hold = inner
+            .quotes
+            .get(id)
+            .map(|q| (q.side, q.receive_sats))
+            .or_else(|| {
+                inner
+                    .swaps
+                    .get(id)
+                    .filter(|s| s.status == SwapStatus::Quoted)
+                    .map(|s| (s.side, s.receive_sats))
+            });
+        if let Some((side, receive)) = hold {
+            open += 1;
+            held += reserve_sats(side, receive);
+        }
+    }
+    if open + new_holds > MAX_OPEN_PER_CLIENT {
+        return Err(Error::RateLimited(format!(
+            "at most {MAX_OPEN_PER_CLIENT} open quotes or unpaid swaps per client (you hold {open}); accept, pay or let some expire first"
+        )));
+    }
+    if held + new_sats > MAX_HELD_SATS_PER_CLIENT {
+        return Err(Error::RateLimited(format!(
+            "at most {MAX_HELD_SATS_PER_CLIENT} sats of desk stock held per client (you hold {held})"
+        )));
+    }
+    Ok(())
+}
+
+/// How long a quote may stay firm: as requested, unless it would tie up more
+/// than `LARGE_QUOTE_SHARE_PPM` of the desk's free stock.
+fn firm_ttl(lp: &LiquidityProvider, side: Side, amount_sats: u64, requested: u64) -> u64 {
+    let large = u128::from(amount_sats) * 1_000_000
+        > u128::from(book(lp, side)) * u128::from(LARGE_QUOTE_SHARE_PPM);
+    if large {
+        requested.min(LARGE_QUOTE_MAX_TTL_SECS)
+    } else {
+        requested
+    }
 }
 
 #[cfg(test)]
@@ -5075,5 +5292,91 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not configured"), "{err}");
+    }
+
+    fn in_req(amount_sats: u64, ttl_secs: Option<u64>) -> CreateQuoteRequest {
+        CreateQuoteRequest {
+            side: Side::In,
+            amount_sats,
+            user_tachi_address: Some("tb1ptest".into()),
+            user_l1_address: None,
+            user_refund_pubkey_hex: Some(generate_keypair().public.to_string()),
+            ttl_secs,
+            deadline_blocks: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn clients_are_capped_on_open_holds_including_unpaid_swaps() {
+        let e = engine();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_OPEN_PER_CLIENT {
+            ids.push(e.create_quote_for("1.2.3.4", in_req(10_000, None)).await.unwrap().id);
+        }
+        let err = e.create_quote_for("1.2.3.4", in_req(10_000, None)).await.unwrap_err();
+        assert!(matches!(err, Error::RateLimited(_)), "{err}");
+        // Someone else is unaffected, and the operator is never capped.
+        e.create_quote_for("5.6.7.8", in_req(10_000, None)).await.unwrap();
+        e.create_quote(in_req(10_000, None)).await.unwrap();
+
+        // Accepting a quote does not free the slot: the unpaid swap still holds stock.
+        e.open_swap(ids[0]).await.unwrap();
+        assert!(e.create_quote_for("1.2.3.4", in_req(10_000, None)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rfq_counts_every_quote_and_held_sats_are_capped() {
+        let e = engine();
+        for _ in 0..MAX_OPEN_PER_CLIENT - 1 {
+            e.create_quote_for("9.9.9.9", in_req(10_000, None)).await.unwrap();
+        }
+        // Both desks would quote: two holds where only one slot is left.
+        let err = e.request_quotes_for("9.9.9.9", in_req(10_000, None)).await.unwrap_err();
+        assert!(matches!(err, Error::RateLimited(_)), "{err}");
+
+        // 2M quotes hold ~1.98M each: the third would pass the 4M cap.
+        e.create_quote_for("4.4.4.4", in_req(2_000_000, None)).await.unwrap();
+        e.create_quote_for("4.4.4.4", in_req(2_000_000, None)).await.unwrap();
+        let err = e.create_quote_for("4.4.4.4", in_req(2_000_000, None)).await.unwrap_err();
+        assert!(err.to_string().contains("sats of desk stock"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn big_holds_only_stay_firm_briefly() {
+        let e = engine();
+        // 2M is 10% of alpha's 20M VTXOs but 40% of bravo's 5M.
+        let quotes = e.request_quotes(in_req(2_000_000, Some(3_600))).await.unwrap();
+        let ttl = |lp: &str| {
+            let q = quotes.iter().find(|q| q.lp_id == lp).unwrap();
+            (q.expires_at - Utc::now()).num_seconds()
+        };
+        assert!(ttl("lp-alpha") > 3_000, "alpha keeps the hour");
+        assert!(ttl("lp-bravo") <= LARGE_QUOTE_MAX_TTL_SECS as i64, "bravo is capped");
+        let bravo = quotes.iter().find(|q| q.lp_id == "lp-bravo").unwrap();
+        assert_eq!(bravo.pricing.unwrap().ttl_secs, LARGE_QUOTE_MAX_TTL_SECS);
+    }
+
+    #[tokio::test]
+    async fn unpaid_swaps_release_their_stock() {
+        let e = engine();
+        let q = e.create_quote_for("1.2.3.4", in_req(100_000, None)).await.unwrap();
+        let swap = e.open_swap(q.id).await.unwrap();
+        let book = |lps: Vec<LiquidityProvider>| lps.into_iter().find(|l| l.id == "lp-alpha").unwrap().vtxo_sats;
+        let held = book(e.inventory().await);
+
+        // Not stale yet: nothing happens.
+        e.sync_all().await.unwrap();
+        assert_eq!(e.get_swap(swap.id).await.unwrap().status, SwapStatus::Quoted);
+
+        e.inner.write().await.swaps.get_mut(&swap.id).unwrap().created_at -=
+            Duration::seconds(UNPAID_SWAP_SECS + 1);
+        e.sync_all().await.unwrap();
+        let s = e.get_swap(swap.id).await.unwrap();
+        assert_eq!(s.status, SwapStatus::Expired);
+        assert!(s.demo_note.unwrap().contains("released"));
+        assert_eq!(book(e.inventory().await), held + q.receive_sats);
+        // The client's slot is free again: it may hold the full allowance.
+        let inner = e.inner.read().await;
+        assert!(check_client(&inner, Some("1.2.3.4"), MAX_OPEN_PER_CLIENT, 0).is_ok());
     }
 }

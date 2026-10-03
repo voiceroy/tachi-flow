@@ -91,6 +91,7 @@ Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>
 - The desk stops settling 12 blocks before a lock's timeout. Such swaps become `expired`; the user refunds an inbound lock after the timeout, and the desk takes back an unpaid outbound lock.
 - Desk payouts (VTXOs and L1 locks) are signed and saved before broadcast. Retries re-send the same tx or confirm it landed, so a lost reply cannot pay twice.
 - Open quotes and unsettled swaps hold desk inventory; live books are chain balance minus those holds.
+- Holding stock is capped so nobody can freeze the desks for free. Per client (peer IP; the admin token is exempt): at most 6 open quotes or unpaid swaps and 4M sats of stock held, else `429`. A quote for more than a quarter of a desk's free stock stays firm for at most 120 s. An opened swap nobody pays within an hour (and 6 blocks past any deadline) expires and releases its stock.
 - State is written atomically. A corrupt `tachi-flow-state.json` stops startup instead of silently dropping preimages.
 
 ## Honest limits

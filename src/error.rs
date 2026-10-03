@@ -32,6 +32,8 @@ pub enum Error {
     TachiRejected(String),
     #[error("admin token required")]
     Unauthorized,
+    #[error("{0}")]
+    RateLimited(String),
 }
 
 #[derive(Serialize)]
@@ -52,6 +54,7 @@ impl ResponseError for Error {
             }
             Self::Tachi(_) | Self::TachiRejected(_) => StatusCode::BAD_GATEWAY,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
