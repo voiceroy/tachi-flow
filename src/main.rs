@@ -56,7 +56,16 @@ async fn main() -> std::io::Result<()> {
     if lightning.is_some() {
         tracing::info!("Lightning enabled (LND REST)");
     }
-    let engine = engine.with_lightning(lightning);
+    let unreceipted = matches!(
+        env::var("VAULT_ADVANCE_UNRECEIPTED").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+    if unreceipted {
+        tracing::warn!("advancing on vault refunds without a watchtower receipt (extra discount)");
+    }
+    let engine = engine
+        .with_lightning(lightning)
+        .with_unreceipted_vault_advances(unreceipted);
 
     // HTLC timeouts are absolute heights; never quote before we know the tip.
     engine.refresh_height().await;

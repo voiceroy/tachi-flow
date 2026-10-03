@@ -317,10 +317,13 @@ struct CsvLockBody {
     pubkey_hex: String,
     csv_blocks: u32,
     amount_sats: u64,
+    /// Build a vault refund (`to_local`) script instead of the plain CSV one.
+    #[serde(default)]
+    vault: bool,
 }
 
 /// Demo: faucet coins into a CSV-locked output (a stand-in for a vault refund
-/// still waiting out its delay).
+/// still waiting out its delay), or a `to_local` vault refund script.
 #[post("/v1/demo/csv-lock")]
 async fn demo_csv_lock(
     engine: web::Data<Engine>,
@@ -328,7 +331,7 @@ async fn demo_csv_lock(
 ) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Ok().json(
         engine
-            .demo_csv_lock(&body.pubkey_hex, body.csv_blocks, body.amount_sats)
+            .demo_csv_lock(&body.pubkey_hex, body.csv_blocks, body.amount_sats, body.vault)
             .await?,
     ))
 }

@@ -346,6 +346,41 @@ impl TachiClient {
         }))
     }
 
+    /// The validators' compressed keys: the quorum in every vault script.
+    pub async fn quorum_keys(&self) -> Result<Vec<bitcoin::PublicKey>, Error> {
+        let v: Value = self.get_json("/tachi_validators", &[]).await?;
+        v.get("validators")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Tachi("/tachi_validators: no validators".into()))?
+            .iter()
+            .map(|val| {
+                val.get("pub_key_hex")
+                    .and_then(Value::as_str)
+                    .and_then(|k| k.parse().ok())
+                    .ok_or_else(|| Error::Tachi("/tachi_validators: bad pub_key_hex".into()))
+            })
+            .collect()
+    }
+
+    /// Watchtower receipts for a vault (spends of its funding outpoint it has
+    /// classified `legitimate` / `stale` / `anomalous`).
+    pub async fn watchtower_receipts(&self, vault_id: &str) -> Result<Vec<Value>, Error> {
+        let v: Value = self
+            .get_json("/tachi_watchtower/receipts", &[("vault", vault_id)])
+            .await?;
+        Ok(v.get("receipts").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
+    /// Raw hex of a tx the node knows (mempool or chain).
+    pub async fn raw_tx(&self, txid: &str) -> Result<String, Error> {
+        let hex = self
+            .bitcoin_rpc("getrawtransaction", serde_json::json!([txid, false]))
+            .await?;
+        hex.as_str()
+            .map(str::to_string)
+            .ok_or_else(|| Error::Tachi(format!("getrawtransaction: {hex}")))
+    }
+
     pub async fn send_raw_tx(&self, hex_tx: &str) -> Result<String, Error> {
         let txid = self
             .bitcoin_rpc("sendrawtransaction", serde_json::json!([hex_tx]))

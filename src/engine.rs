@@ -27,13 +27,14 @@ use crate::htlc::{
 };
 use crate::lightning::{InvoiceState, LightningNode};
 use crate::model::{
-    Advance, AdvanceAcceptRequest, AdvanceQuoteRequest, AdvanceStatus, CreatePlanRequest,
+    Advance, AdvanceAcceptRequest, AdvanceKind, AdvanceQuoteRequest, AdvanceStatus, CreatePlanRequest,
     CreateQuoteRequest, ExitPlan, HtlcLock, LiquidityProvider, LnDirection, LnQuoteRequest,
     LnStatus, LnSwap, ObserveLockRequest, ObserveVtxoRequest, PayInstructions, PriceBreakdown,
     Quote, Rebalance, RebalanceStatus, Side, Swap, SwapStatus, WebhookRequest, fee_sats,
     Bond, BondStatus,
 };
 use crate::tachi::TachiClient;
+use crate::vault::{ExpectedToLocalSpend, ToLocal, parse_to_local, sorted_quorum, vault_id};
 use crate::tachi_tx::{
     SignedTransfer, TransferInput, TransferOutput, looks_like_tachi_owner, looks_like_vtxo_id,
     output_vtxo_id, parse_tachi_owner, parse_vtxo_id, select_vtxos, sign_deposit, sign_transfer,
@@ -70,6 +71,9 @@ const DEFAULT_PENALTY_PPM: u64 = 10_000;
 const MIN_COMPENSATION_SATS: u64 = 500;
 /// How long a claim-advance or Lightning quote holds.
 const SIDE_QUOTE_TTL_SECS: i64 = 10 * 60;
+/// Extra discount on a vault refund the watchtower has not vouched for: the
+/// quorum branch could still sweep it before the desk collects.
+const UNRECEIPTED_VAULT_DISCOUNT_PPM: u64 = 20_000;
 /// Most a desk pays in Lightning routing fees for an `out` swap.
 const LN_MAX_ROUTING_FEE_SATS: u64 = 100;
 /// Anti-griefing: open quotes plus unpaid swaps one client may hold...
@@ -438,6 +442,9 @@ pub struct Engine {
     events: tokio::sync::broadcast::Sender<Event>,
     webhook_http: reqwest::Client,
     lightning: Option<LightningNode>,
+    /// Advance on a vault refund the watchtower has no receipt for (at an
+    /// extra discount). Off by default.
+    unreceipted_vault_advances: bool,
 }
 
 impl Engine {
@@ -539,6 +546,7 @@ impl Engine {
             events,
             webhook_http: crate::events::webhook_client(),
             lightning: None,
+            unreceipted_vault_advances: false,
         }
     }
 
@@ -554,6 +562,11 @@ impl Engine {
 
     pub fn with_lightning(mut self, node: Option<LightningNode>) -> Self {
         self.lightning = node;
+        self
+    }
+
+    pub fn with_unreceipted_vault_advances(mut self, allow: bool) -> Self {
+        self.unreceipted_vault_advances = allow;
         self
     }
 
@@ -3756,11 +3769,8 @@ impl Engine {
             return Err(Error::Invalid("claim advances need a live chain".into()));
         }
         let script = redeem_from_hex(&req.witness_script_hex)?;
-        let (csv_blocks, _) = parse_csv_script(&script).ok_or_else(|| {
-            Error::Invalid(
-                "unsupported script: expected <csv> OP_CSV OP_DROP <pubkey> OP_CHECKSIG".into(),
-            )
-        })?;
+        let template = AdvanceTemplate::parse(&script)?;
+        let csv_blocks = template.csv_blocks();
         let user_l1 = req
             .user_l1_address
             .parse::<Address<bitcoin::address::NetworkUnchecked>>()
@@ -3774,16 +3784,24 @@ impl Engine {
             .ok_or_else(|| {
                 Error::Invalid("output not found: unconfirmed, spent, or never existed".into())
             })?;
-        if info.script_pubkey_hex != hex::encode(p2wsh(&script, self.network).script_pubkey().as_bytes()) {
+        if info.script_pubkey_hex != hex::encode(template.script_pubkey(&script, self.network).as_bytes()) {
             return Err(Error::Invalid("witness script does not match the output".into()));
         }
         parse_txid(&req.txid)?;
+        let (vault, watchtower, extra_ppm) = match &template {
+            AdvanceTemplate::Csv { .. } => (None, None, 0),
+            AdvanceTemplate::Vault(tl) => {
+                let (id, watch, ppm) = self.check_vault_refund(tl, &req.txid).await?;
+                (Some(id), Some(watch), ppm)
+            }
+        };
         let tip = self.fresh_height().await?;
         // BIP68: the spend can be mined at `confirm_height + csv`.
         let mature_height = tip + 1 - info.confirmations + csv_blocks;
         let blocks_left = mature_height.saturating_sub(tip + 1);
         let min_desk_sats = info.value_sats.saturating_sub(MAX_SPEND_FEE_SATS);
-        let discount = discount_sats(info.value_sats, blocks_left);
+        let discount = discount_sats(info.value_sats, blocks_left)
+            + (u128::from(info.value_sats) * u128::from(extra_ppm) / 1_000_000) as u64;
         let advance_sats = min_desk_sats
             .saturating_sub(discount)
             .saturating_sub(CLAIM_FEE_SATS);
@@ -3817,6 +3835,9 @@ impl Engine {
                 id,
                 lp_id: lp.id.clone(),
                 status: AdvanceStatus::Quoted,
+                kind: template.kind(),
+                vault_id: vault,
+                watchtower,
                 outpoint_txid: req.txid.clone(),
                 outpoint_vout: req.vout,
                 value_sats: info.value_sats,
@@ -3860,8 +3881,6 @@ impl Engine {
             return Err(Error::QuoteExpired);
         }
         let script = redeem_from_hex(&a.witness_script_hex)?;
-        let (csv_blocks, owner) =
-            parse_csv_script(&script).ok_or_else(|| Error::Invalid("stored script".into()))?;
         let desk_address = a
             .desk_address
             .parse::<Address<bitcoin::address::NetworkUnchecked>>()
@@ -3871,18 +3890,35 @@ impl Engine {
             txid: parse_txid(&a.outpoint_txid)?,
             vout: a.outpoint_vout,
         };
-        verify_presigned(
-            &req.presigned_tx_hex,
-            &ExpectedSpend {
-                outpoint,
-                value_sats: a.value_sats,
-                script: &script,
-                csv_blocks,
-                owner: &owner,
-                desk_address: &desk_address,
-                min_desk_sats: a.min_desk_sats,
-            },
-        )?;
+        match AdvanceTemplate::parse(&script)? {
+            AdvanceTemplate::Csv { csv_blocks, owner } => {
+                verify_presigned(
+                    &req.presigned_tx_hex,
+                    &ExpectedSpend {
+                        outpoint,
+                        value_sats: a.value_sats,
+                        script: &script,
+                        csv_blocks,
+                        owner: &owner,
+                        desk_address: &desk_address,
+                        min_desk_sats: a.min_desk_sats,
+                    },
+                )?;
+            }
+            AdvanceTemplate::Vault(tl) => {
+                crate::vault::verify_presigned(
+                    &req.presigned_tx_hex,
+                    &ExpectedToLocalSpend {
+                        outpoint,
+                        value_sats: a.value_sats,
+                        to_local: &tl,
+                        network: self.network,
+                        desk_address: &desk_address,
+                        min_desk_sats: a.min_desk_sats,
+                    },
+                )?;
+            }
+        }
         if self
             .tachi
             .confirmed_tx_out(&a.outpoint_txid, a.outpoint_vout)
@@ -3947,27 +3983,103 @@ impl Engine {
             .parse::<Address<bitcoin::address::NetworkUnchecked>>()
             .map_err(|_| Error::Invalid("desk address".into()))?
             .assume_checked();
-        presign_spend(
-            OutPoint {
-                txid: parse_txid(&a.outpoint_txid)?,
-                vout: a.outpoint_vout,
-            },
-            a.value_sats,
-            &script,
-            a.csv_blocks,
-            &secret,
-            &desk,
-            a.min_desk_sats,
+        let outpoint = OutPoint {
+            txid: parse_txid(&a.outpoint_txid)?,
+            vout: a.outpoint_vout,
+        };
+        match AdvanceTemplate::parse(&script)? {
+            AdvanceTemplate::Csv { .. } => presign_spend(
+                outpoint,
+                a.value_sats,
+                &script,
+                a.csv_blocks,
+                &secret,
+                &desk,
+                a.min_desk_sats,
+            ),
+            AdvanceTemplate::Vault(tl) => crate::vault::presign_spend(
+                &ExpectedToLocalSpend {
+                    outpoint,
+                    value_sats: a.value_sats,
+                    to_local: &tl,
+                    network: self.network,
+                    desk_address: &desk,
+                    min_desk_sats: a.min_desk_sats,
+                },
+                &secret,
+                a.min_desk_sats,
+            ),
+        }
+    }
+
+    /// A vault refund is only worth advancing on if it really is Tachi's and
+    /// the watchtower will not sweep it: the quorum must be today's validator
+    /// set (≥ 2/3 threshold), and the watchtower's receipt for the refund
+    /// must say `legitimate`. Returns (vault id, watchtower verdict, extra
+    /// discount ppm).
+    async fn check_vault_refund(&self, tl: &ToLocal, txid: &str) -> Result<(String, String, u64), Error> {
+        let live = sorted_quorum(&self.tachi.quorum_keys().await?);
+        if live != tl.quorum {
+            return Err(Error::Invalid(
+                "the refund's quorum is not Tachi's current validator set".into(),
+            ));
+        }
+        if usize::from(tl.threshold) * 3 <= tl.quorum.len() * 2 {
+            return Err(Error::Invalid("the refund's quorum threshold is below two thirds".into()));
+        }
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(
+            &hex::decode(self.tachi.raw_tx(txid).await?).map_err(|e| Error::Tachi(e.to_string()))?,
         )
+        .map_err(|e| Error::Bitcoin(e.to_string()))?;
+        let funding = tx
+            .input
+            .first()
+            .ok_or_else(|| Error::Invalid("refund tx has no inputs".into()))?
+            .previous_output;
+        let vault = vault_id(&funding.txid.to_string(), funding.vout)?;
+        let receipts = match self.tachi.watchtower_receipts(&vault).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(%err, %vault, "watchtower receipts");
+                Vec::new()
+            }
+        };
+        let verdicts: Vec<String> = receipts
+            .iter()
+            .filter(|r| {
+                r.get("spend_txid")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|t| t == txid)
+            })
+            .filter_map(|r| r.get("classification").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect();
+        if let Some(bad) = verdicts.iter().find(|c| *c != "legitimate") {
+            return Err(Error::Invalid(format!(
+                "Tachi's watchtower classifies this refund as {bad}; the quorum may sweep it"
+            )));
+        }
+        if !verdicts.is_empty() {
+            return Ok((vault, "legitimate".into(), 0));
+        }
+        if !self.unreceipted_vault_advances {
+            return Err(Error::Invalid(
+                "Tachi's watchtower has no receipt for this refund yet; the desk only advances on refunds it classified legitimate".into(),
+            ));
+        }
+        Ok((vault, "none".into(), UNRECEIPTED_VAULT_DISCOUNT_PPM))
     }
 
     /// Demo: faucet coins into a CSV-locked output owned by `pubkey_hex` — a
-    /// stand-in for a vault refund still waiting out its delay.
+    /// stand-in for a vault refund still waiting out its delay. With `vault`,
+    /// the output is a real `to_local` script under today's validator quorum
+    /// (only the delay is shorter, and no vault stands behind it).
     pub async fn demo_csv_lock(
         &self,
         pubkey_hex: &str,
         csv_blocks: u32,
         amount_sats: u64,
+        vault: bool,
     ) -> Result<serde_json::Value, Error> {
         if self.test_mode {
             return Err(Error::Invalid("needs the live faucet".into()));
@@ -3979,8 +4091,21 @@ impl Engine {
             return Err(Error::Invalid("amount_sats must be 20000..=200000".into()));
         }
         let owner = pubkey_from_hex(pubkey_hex)?;
-        let script = csv_script(csv_blocks, &owner);
-        let lock = p2wsh(&script, self.network);
+        let (script, lock) = if vault {
+            let quorum = sorted_quorum(&self.tachi.quorum_keys().await?);
+            let tl = ToLocal {
+                threshold: u8::try_from(quorum.len() * 2 / 3 + 1)
+                    .map_err(|_| Error::Tachi("quorum too large".into()))?,
+                quorum,
+                delay: csv_blocks as u16,
+                user: owner.inner.x_only_public_key().0,
+            };
+            (tl.script(), tl.address(self.network))
+        } else {
+            let script = csv_script(csv_blocks, &owner);
+            let lock = p2wsh(&script, self.network);
+            (script, lock)
+        };
         let sk = generate_keypair().secret;
         let from = p2wpkh_address(&sk, self.network);
         let drip = (amount_sats + 20_000) as f64 / 100_000_000.0;
@@ -4537,6 +4662,46 @@ fn compensation_owed(s: &Swap) -> bool {
         && s.compensation_sats.is_some()
         && s.compensation_vtxo_id.is_none()
         && s.compensation_txid.is_none()
+}
+
+/// The maturing outputs a claim advance can buy.
+enum AdvanceTemplate {
+    Csv { csv_blocks: u32, owner: PublicKey },
+    Vault(ToLocal),
+}
+
+impl AdvanceTemplate {
+    fn parse(script: &ScriptBuf) -> Result<Self, Error> {
+        if let Some((csv_blocks, owner)) = parse_csv_script(script) {
+            return Ok(Self::Csv { csv_blocks, owner });
+        }
+        parse_to_local(script).map(Self::Vault).ok_or_else(|| {
+            Error::Invalid(
+                "unsupported script: expected <csv> OP_CSV OP_DROP <pubkey> OP_CHECKSIG or a Tachi vault refund (to_local) leaf".into(),
+            )
+        })
+    }
+
+    fn csv_blocks(&self) -> u32 {
+        match self {
+            Self::Csv { csv_blocks, .. } => *csv_blocks,
+            Self::Vault(tl) => u32::from(tl.delay),
+        }
+    }
+
+    fn script_pubkey(&self, script: &ScriptBuf, network: Network) -> ScriptBuf {
+        match self {
+            Self::Csv { .. } => p2wsh(script, network).script_pubkey(),
+            Self::Vault(tl) => tl.address(network).script_pubkey(),
+        }
+    }
+
+    fn kind(&self) -> AdvanceKind {
+        match self {
+            Self::Csv { .. } => AdvanceKind::Csv,
+            Self::Vault(_) => AdvanceKind::VaultRefund,
+        }
+    }
 }
 
 /// A desk's total bond: active L1 bonds plus any older VTXO escrow bond.

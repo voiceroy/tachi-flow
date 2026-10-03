@@ -12,6 +12,7 @@ pub mod lightning;
 pub mod model;
 pub mod tachi;
 pub mod tachi_tx;
+pub mod vault;
 pub mod watch;
 
 pub use engine::Engine;

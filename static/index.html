@@ -184,6 +184,11 @@
           <input id="csvBlocks" type="number" value="144" min="1" max="1008" />
           <label>Amount (sats)</label>
           <input id="csvAmount" type="number" value="50000" min="20000" max="200000" />
+          <label>Output script</label>
+          <select id="csvKind">
+            <option value="csv">Plain CSV (P2WSH)</option>
+            <option value="vault">Vault refund (to_local, P2TR, live quorum)</option>
+          </select>
           <button id="btnCsvLock">1. Lock faucet coins behind the delay</button>
           <button id="btnAdvQuote" class="ghost">2. Quote an advance</button>
           <button id="btnAdvAccept" class="ghost">3. Sign the spend and take the advance</button>
@@ -596,6 +601,7 @@
     function showAdvance(a) {
       advance = a;
       $("advBox").innerHTML = `<p>Advance <strong>${a.status}</strong> via ${a.lp_id}: you get <strong>${sats(a.advance_sats)}</strong> now for ${sats(a.value_sats)} maturing at block ${a.mature_height} (discount ${sats(a.discount_sats)}).</p>` +
+        (a.kind === "vault_refund" ? `<p>Vault refund of vault <code>${(a.vault_id || "").slice(0, 16)}…</code> · watchtower: <strong>${a.watchtower}</strong></p>` : "") +
         (a.advance_txid ? `<p>Paid: ${a.advance_txid}</p>` : "") +
         (a.collect_txid ? `<p>Collected: ${a.collect_txid}</p>` : "") +
         `<p class="hint">${a.note || ""}</p>`;
@@ -612,6 +618,7 @@
             pubkey_hex: keys.pubkey_hex,
             csv_blocks: Number($("csvBlocks").value),
             amount_sats: Number($("csvAmount").value),
+            vault: $("csvKind").value === "vault",
           }),
         });
         $("advBox").innerHTML = `<p>Locked ${sats(csvLock.value_sats)} at ${csvLock.address} (${csvLock.txid}:0) behind ${csvLock.csv_blocks} blocks.</p><p class="hint">${csvLock.note}</p>`;

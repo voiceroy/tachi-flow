@@ -318,6 +318,14 @@ pub struct Advance {
     pub id: Uuid,
     pub lp_id: String,
     pub status: AdvanceStatus,
+    #[serde(default)]
+    pub kind: AdvanceKind,
+    /// Vault refunds: the vault the refund came from, and what Tachi's
+    /// watchtower said about the refund tx (`legitimate`, or `none`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchtower: Option<String>,
     pub outpoint_txid: String,
     pub outpoint_vout: u32,
     pub value_sats: u64,
@@ -358,11 +366,24 @@ pub enum AdvanceStatus {
     Expired,
 }
 
+/// Which kind of maturing output an advance buys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvanceKind {
+    /// P2WSH `<csv> OP_CSV OP_DROP <pubkey> OP_CHECKSIG`.
+    #[default]
+    Csv,
+    /// A Tachi vault refund (`to_local`, P2TR) waiting out its delay.
+    VaultRefund,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdvanceQuoteRequest {
     pub txid: String,
     pub vout: u32,
-    /// `<csv> OP_CSV OP_DROP <pubkey> OP_CHECKSIG` behind the P2WSH output.
+    /// The script behind the output: the P2WSH witness script
+    /// `<csv> OP_CSV OP_DROP <pubkey> OP_CHECKSIG`, or a vault refund's
+    /// `to_local` tapscript leaf.
     pub witness_script_hex: String,
     pub user_l1_address: String,
 }
