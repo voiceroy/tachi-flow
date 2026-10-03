@@ -166,7 +166,12 @@ struct PendingPayout {
 struct LpSpend {
     next_nonce: Option<u64>,
     vtxos: HashSet<String>,
+    /// L1 coins already spent by our own unconfirmed txs.
     l1: HashSet<OutPoint>,
+    /// Outputs our own broadcasts paid back to this desk (change, claims,
+    /// refunds) that are not confirmed yet. Spendable right away, so the
+    /// desk need not wait a block between exits.
+    pending: HashMap<OutPoint, u64>,
 }
 
 impl LpSpend {
@@ -184,6 +189,57 @@ impl LpSpend {
         self.next_nonce = None;
         self.vtxos.clear();
     }
+
+    /// Coins a new L1 payment may use: confirmed ones, then our own pending
+    /// change, minus anything an in-flight tx already spends. Pending coins
+    /// that have since confirmed are dropped from `pending` (no double count),
+    /// and spent markers for coins that are gone are forgotten.
+    fn spendable_l1(&mut self, confirmed: &[(OutPoint, u64)]) -> Vec<(OutPoint, u64)> {
+        let seen: HashSet<OutPoint> = confirmed.iter().map(|(op, _)| *op).collect();
+        self.pending.retain(|op, _| !seen.contains(op));
+        let pending = &self.pending;
+        self.l1.retain(|op| seen.contains(op) || pending.contains_key(op));
+        let mut first: Vec<_> = confirmed
+            .iter()
+            .filter(|(op, _)| !self.l1.contains(op))
+            .copied()
+            .collect();
+        first.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+        let mut then: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(op, _)| !self.l1.contains(op))
+            .map(|(op, v)| (*op, *v))
+            .collect();
+        then.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+        first.extend(then);
+        first
+    }
+}
+
+/// Outputs of `hex_tx` paying `spk`, as (outpoint, value).
+fn outputs_to(hex_tx: &str, spk: &ScriptBuf) -> Vec<(OutPoint, u64)> {
+    let Some(tx) = hex::decode(hex_tx)
+        .ok()
+        .and_then(|b| bitcoin::consensus::deserialize::<bitcoin::Transaction>(&b).ok())
+    else {
+        return Vec::new();
+    };
+    let txid = tx.compute_txid();
+    tx.output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| &o.script_pubkey == spk)
+        .map(|(vout, o)| {
+            (
+                OutPoint {
+                    txid,
+                    vout: vout as u32,
+                },
+                o.value.to_sat(),
+            )
+        })
+        .collect()
 }
 
 struct BuiltTransfer {
@@ -668,14 +724,21 @@ impl Engine {
             .sum()
     }
 
-    async fn live_l1_sats_for(&self, addr: &Address) -> u64 {
-        self.tachi
+    /// What the desk can spend on L1 right now: confirmed coins it has not
+    /// already spent in the mempool, plus its own unconfirmed change.
+    async fn live_l1_sats_for(&self, lp_id: &str, addr: &Address) -> u64 {
+        let confirmed: Vec<(OutPoint, u64)> = self
+            .tachi
             .scan_address(&addr.to_string())
             .await
             .unwrap_or_default()
-            .iter()
-            .map(|u| u.value_sats)
-            .sum()
+            .into_iter()
+            .filter_map(|u| Some((OutPoint { txid: parse_txid(&u.txid).ok()?, vout: u.vout }, u.value_sats)))
+            .collect();
+        match self.lp_spend(lp_id).await {
+            Ok(mut spend) => spend.spendable_l1(&confirmed).iter().map(|(_, v)| v).sum(),
+            Err(_) => confirmed.iter().map(|(_, v)| v).sum(),
+        }
     }
 
     /// Books = what the desk holds on chain minus what open quotes and swaps
@@ -689,7 +752,7 @@ impl Engine {
             books.push((
                 w.id.clone(),
                 self.live_vtxo_sats_for(&w.secret).await,
-                self.live_l1_sats_for(&w.claim_address).await,
+                self.live_l1_sats_for(&w.id, &w.claim_address).await,
             ));
         }
         let mut inner = self.inner.write().await;
@@ -2827,21 +2890,30 @@ impl Engine {
         let amount_sats: u64 = outputs.iter().map(|(_, v)| *v).sum();
         let mut spend = self.lp_spend(lp_id).await?;
         let w = self.lp_wallet(lp_id)?;
-        let mut utxos = self.tachi.scan_address(&w.claim_address.to_string()).await?;
-        utxos.sort_by_key(|u| std::cmp::Reverse(u.value_sats));
+        let confirmed = self
+            .tachi
+            .scan_address(&w.claim_address.to_string())
+            .await?
+            .into_iter()
+            .map(|u| Ok((OutPoint { txid: parse_txid(&u.txid)?, vout: u.vout }, u.value_sats)))
+            .collect::<Result<Vec<_>, Error>>()?;
         let need = amount_sats + CLAIM_FEE_SATS;
         let mut picked: Vec<(OutPoint, u64)> = Vec::new();
         let mut total = 0u64;
-        for u in utxos {
-            let op = OutPoint {
-                txid: parse_txid(&u.txid)?,
-                vout: u.vout,
-            };
-            if spend.l1.contains(&op) {
+        for (op, value) in spend.spendable_l1(&confirmed) {
+            // A pending coin must still be in the mempool: if its parent was
+            // dropped or it was spent elsewhere, forget it.
+            if spend.pending.contains_key(&op)
+                && !matches!(
+                    self.tachi.get_tx_out(&op.txid.to_string(), op.vout).await,
+                    Ok(Some(_))
+                )
+            {
+                spend.pending.remove(&op);
                 continue;
             }
-            picked.push((op, u.value_sats));
-            total += u.value_sats;
+            picked.push((op, value));
+            total += value;
             if total >= need {
                 break;
             }
@@ -2860,13 +2932,28 @@ impl Engine {
         Ok((hex, inputs))
     }
 
-    /// Broadcast via Tachi's bitcoind. A tx the node already has counts as sent.
+    /// Broadcast via Tachi's bitcoind. A tx the node already has counts as
+    /// sent. Any output paying a desk becomes that desk's pending coin.
     async fn broadcast_l1(&self, hex_tx: &str) -> Result<String, Error> {
         let txid = txid_of_hex(hex_tx)?.to_string();
-        match self.tachi.send_raw_tx(hex_tx).await {
-            Ok(sent) => Ok(sent),
-            Err(Error::TachiRejected(why)) if why.contains("already") => Ok(txid),
-            Err(err) => Err(err),
+        let sent = match self.tachi.send_raw_tx(hex_tx).await {
+            Ok(sent) => sent,
+            Err(Error::TachiRejected(why)) if why.contains("already") => txid,
+            Err(err) => return Err(err),
+        };
+        self.note_desk_outputs(hex_tx).await;
+        Ok(sent)
+    }
+
+    async fn note_desk_outputs(&self, hex_tx: &str) {
+        for w in &self.wallets {
+            let mine = outputs_to(hex_tx, &w.claim_address.script_pubkey());
+            if mine.is_empty() {
+                continue;
+            }
+            if let Ok(mut spend) = self.lp_spend(&w.id).await {
+                spend.pending.extend(mine);
+            }
         }
     }
 
@@ -5378,5 +5465,54 @@ mod tests {
         // The client's slot is free again: it may hold the full allowance.
         let inner = e.inner.read().await;
         assert!(check_client(&inner, Some("1.2.3.4"), MAX_OPEN_PER_CLIENT, 0).is_ok());
+    }
+
+    fn op(n: u8, vout: u32) -> OutPoint {
+        OutPoint {
+            txid: parse_txid(&format!("{n:02x}").repeat(32)).unwrap(),
+            vout,
+        }
+    }
+
+    #[test]
+    fn unconfirmed_change_is_spendable_without_double_counting() {
+        let mut spend = LpSpend::default();
+        let confirmed = vec![(op(1, 0), 50_000), (op(2, 0), 80_000)];
+        // One confirmed coin is already spent by our pending lock, whose
+        // change came back to us.
+        spend.l1.insert(op(2, 0));
+        spend.pending.insert(op(3, 1), 29_000);
+        let coins = spend.spendable_l1(&confirmed);
+        assert_eq!(coins, vec![(op(1, 0), 50_000), (op(3, 1), 29_000)]);
+
+        // Once the change confirms it shows in the scan: counted once, as confirmed.
+        let confirmed = vec![(op(1, 0), 50_000), (op(3, 1), 29_000)];
+        let coins = spend.spendable_l1(&confirmed);
+        assert_eq!(coins.len(), 2);
+        assert!(spend.pending.is_empty());
+        // The spent marker for the coin that left the UTXO set is forgotten.
+        assert!(spend.l1.is_empty());
+    }
+
+    #[test]
+    fn outputs_to_finds_desk_change() {
+        let desk = generate_keypair();
+        let desk_addr = p2wpkh_address(&desk.secret, Network::Regtest);
+        let user = p2wpkh_address(&generate_keypair().secret, Network::Regtest);
+        let hex = p2wpkh_send_hex(
+            &[(op(7, 0), 100_000)],
+            &user,
+            30_000,
+            500,
+            &desk_addr,
+            &desk.secret,
+            Network::Regtest,
+        )
+        .unwrap();
+        let mine = outputs_to(&hex, &desk_addr.script_pubkey());
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].0.vout, 1);
+        assert_eq!(mine[0].1, 100_000 - 30_000 - 500);
+        assert_eq!(mine[0].0.txid, txid_of_hex(&hex).unwrap());
     }
 }
