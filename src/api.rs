@@ -1,7 +1,7 @@
 use std::future::{Ready, ready};
 
 use actix_web::dev::Payload;
-use actix_web::{FromRequest, HttpRequest, HttpResponse, get, post, web};
+use actix_web::{FromRequest, HttpRequest, HttpResponse, delete, get, post, web};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -9,6 +9,7 @@ use crate::engine::{
     DEADLINE_PRESETS, Engine, HTLC_TIMEOUT_BLOCKS, PricingConfig, VAULT_EXIT_BLOCKS, parse_secret,
 };
 use crate::error::Error;
+use crate::hosted::RegisterDeskRequest;
 use crate::htlc::{generate_keypair, p2wpkh_address};
 use crate::model::{
     AdvanceAcceptRequest, AdvanceQuoteRequest, CreatePlanRequest, CreateQuoteRequest,
@@ -94,6 +95,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(list_rebalances)
         .service(create_quote)
         .service(rfq)
+        .service(market_quotes)
+        .service(list_hosted_desks)
+        .service(register_hosted_desk)
+        .service(remove_hosted_desk)
         .service(price_curve)
         .service(open_swap)
         .service(list_swaps)
@@ -429,7 +434,7 @@ async fn list_rebalances(engine: web::Data<Engine>) -> HttpResponse {
 /// Is this quote genuinely signed by the desk it names?
 #[post("/v1/quotes/verify")]
 async fn verify_quote(engine: web::Data<Engine>, body: web::Json<Quote>) -> HttpResponse {
-    HttpResponse::Ok().json(engine.verify_quote(&body))
+    HttpResponse::Ok().json(engine.verify_quote(&body).await)
 }
 
 /// Bring a signed quote: did the desk honour it, and did it default?
@@ -464,6 +469,43 @@ async fn rfq(
         None => engine.request_quotes(body.into_inner()).await?,
     };
     Ok(HttpResponse::Created().json(quotes))
+}
+
+/// RFQ across house desks and every registered hosted desk; hosted quotes
+/// are verified against their pinned keys before they are passed on.
+#[post("/v1/market/quotes")]
+async fn market_quotes(
+    req: HttpRequest,
+    engine: web::Data<Engine>,
+    body: web::Json<CreateQuoteRequest>,
+) -> Result<HttpResponse, Error> {
+    let client = quote_client(&req);
+    Ok(HttpResponse::Created().json(engine.market_quotes(body.into_inner(), client.as_deref()).await?))
+}
+
+#[get("/v1/desks/hosted")]
+async fn list_hosted_desks(engine: web::Data<Engine>) -> HttpResponse {
+    HttpResponse::Ok().json(engine.list_hosted_desks().await)
+}
+
+/// Register or update a third-party desk. Operator route.
+#[post("/v1/desks/hosted")]
+async fn register_hosted_desk(
+    _admin: Admin,
+    engine: web::Data<Engine>,
+    body: web::Json<RegisterDeskRequest>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(engine.register_hosted_desk(body.into_inner()).await?))
+}
+
+#[delete("/v1/desks/hosted/{id}")]
+async fn remove_hosted_desk(
+    _admin: Admin,
+    engine: web::Data<Engine>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, Error> {
+    engine.remove_hosted_desk(&path).await?;
+    Ok(HttpResponse::NoContent().finish())
 }
 
 #[derive(serde::Deserialize)]
@@ -684,6 +726,96 @@ mod tests {
             TachiClient::new("http://127.0.0.1:9").expect("client"),
             Network::Regtest,
         )
+    }
+
+    /// Serve `engine` on a free local port, as a hosted desk would run.
+    fn serve(engine: Engine) -> String {
+        let server = actix_web::HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(engine.clone()))
+                .configure(configure)
+        })
+        .workers(1)
+        .bind(("127.0.0.1", 0))
+        .unwrap();
+        let addr = server.addrs()[0];
+        actix_web::rt::spawn(server.run());
+        format!("http://{addr}")
+    }
+
+    #[actix_web::test]
+    async fn market_rfq_routes_to_verified_hosted_desks_only() {
+        let house = app_engine();
+        let remote = app_engine();
+        let remote_keys: Vec<String> = remote
+            .marketplace()
+            .iter()
+            .map(|d| d["tachi_pubkey"].as_str().unwrap().to_string())
+            .collect();
+        let endpoint = serve(remote);
+
+        // Honest desk: its own keys pinned.
+        house
+            .register_hosted_desk(RegisterDeskRequest {
+                id: "acme".into(),
+                name: "Acme Liquidity".into(),
+                endpoint: endpoint.clone(),
+                pubkeys: remote_keys.clone(),
+            })
+            .await
+            .unwrap();
+        // Impostor: same server, but it claims a key it does not sign with.
+        house
+            .register_hosted_desk(RegisterDeskRequest {
+                id: "impostor".into(),
+                name: "Impostor".into(),
+                endpoint,
+                pubkeys: vec![hex::encode(crate::tachi_tx::xonly_from_secret(&generate_keypair().secret))],
+            })
+            .await
+            .unwrap();
+        // A house key cannot be claimed.
+        let house_key = house.marketplace()[0]["tachi_pubkey"].as_str().unwrap().to_string();
+        assert!(house
+            .register_hosted_desk(RegisterDeskRequest {
+                id: "thief".into(),
+                name: "Thief".into(),
+                endpoint: "http://127.0.0.1:9".into(),
+                pubkeys: vec![house_key],
+            })
+            .await
+            .is_err());
+
+        let user = generate_keypair();
+        let req = CreateQuoteRequest {
+            side: crate::model::Side::In,
+            amount_sats: 50_000,
+            user_tachi_address: Some("tb1ptest".into()),
+            user_l1_address: None,
+            user_refund_pubkey_hex: Some(user.public.to_string()),
+            ttl_secs: None,
+            deadline_blocks: None,
+        };
+        let m = house.market_quotes(req, None).await.unwrap();
+        assert!(!m["house"].as_array().unwrap().is_empty());
+        let hosted = m["hosted"].as_array().unwrap();
+        assert_eq!(hosted.len(), 1, "{m}");
+        assert_eq!(hosted[0]["desk_id"], "acme");
+        let refused = m["refused"].as_array().unwrap();
+        assert_eq!(refused[0]["desk_id"], "impostor");
+        assert!(refused[0]["reason"].as_str().unwrap().contains("not a key registered"));
+        assert!(!m["best"].is_null());
+
+        // The hosted quote verifies here too, attributed to the hosted desk.
+        let q: crate::model::Quote = serde_json::from_value(hosted[0]["quote"].clone()).unwrap();
+        let v = house.verify_quote(&q).await;
+        assert_eq!((v["valid"].as_bool(), v["hosted_desk"].as_str()), (Some(true), Some("acme")));
+        let d = house.dispute(&q).await;
+        assert!(d["finding"].as_str().unwrap().contains("hosted desk acme"));
+
+        let desks = house.list_hosted_desks().await;
+        let acme = desks.iter().find(|d| d.id == "acme").unwrap();
+        assert_eq!((acme.quotes_ok, acme.quotes_refused), (1, 0));
     }
 
     #[actix_web::test]

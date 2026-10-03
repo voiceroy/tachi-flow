@@ -32,6 +32,9 @@ use crate::model::{
     Quote, Rebalance, RebalanceStatus, Side, Swap, SwapStatus, WebhookRequest, fee_sats,
     Bond, BondStatus,
 };
+use crate::hosted::{
+    HostedDesk, HostedQuote, MAX_HOSTED_DESKS, RegisterDeskRequest, fetch_quote,
+};
 use crate::store::Store;
 use crate::tachi::TachiClient;
 use crate::vault::{ExpectedToLocalSpend, ToLocal, parse_to_local, sorted_quorum, vault_id};
@@ -179,6 +182,8 @@ struct Inner {
     last_rebalance: Option<chrono::DateTime<Utc>>,
     /// Desk bonds locked on L1 (`bonds` above is the older VTXO escrow).
     l1_bonds: Vec<Bond>,
+    /// Third-party desks this server asks for quotes (they settle themselves).
+    hosted: Vec<HostedDesk>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -728,6 +733,7 @@ impl Engine {
         inner.webhooks = file.webhooks;
         inner.rebalances = file.rebalances;
         inner.l1_bonds = file.l1_bonds;
+        inner.hosted = file.hosted_desks;
         apply_desk_stats(&mut inner);
         tracing::info!(
             quotes = inner.quotes.len(),
@@ -1077,6 +1083,13 @@ impl Engine {
             },
             "fee_rate_sat_vb": self.fee_rate_msat_vb() as f64 / 1_000.0,
             "storage": self.storage_kind(),
+            "hosted_desks": inner.hosted.iter().map(|d| serde_json::json!({
+                "id": d.id,
+                "name": d.name,
+                "quotes_ok": d.quotes_ok,
+                "quotes_refused": d.quotes_refused,
+                "last_error": d.last_error,
+            })).collect::<Vec<_>>(),
         })
     }
 
@@ -1087,18 +1100,32 @@ impl Engine {
     }
 
     /// Is this a genuine quote from one of our desks?
-    pub fn verify_quote(&self, q: &Quote) -> serde_json::Value {
+    /// Is this a genuine quote from one of our desks, or a registered hosted desk?
+    pub async fn verify_quote(&self, q: &Quote) -> serde_json::Value {
         let signature = verify_quote_signature(q);
         let desk_key = self
             .lp_wallet(&q.lp_id)
             .ok()
             .map(|w| hex::encode(xonly_from_secret(&w.secret)));
-        let key_matches = desk_key.is_some() && desk_key.as_deref() == q.desk_pubkey.as_deref();
+        let house = desk_key.is_some() && desk_key.as_deref() == q.desk_pubkey.as_deref();
+        let hosted = match (&q.desk_pubkey, house) {
+            (Some(key), false) => self
+                .inner
+                .read()
+                .await
+                .hosted
+                .iter()
+                .find(|d| d.pubkeys.iter().any(|k| k.eq_ignore_ascii_case(key)))
+                .map(|d| d.id.clone()),
+            _ => None,
+        };
+        let key_matches = house || hosted.is_some();
         serde_json::json!({
             "valid": signature.is_ok() && key_matches,
             "signature_ok": signature.is_ok(),
             "signed_by_desk": key_matches,
             "desk": q.lp_id,
+            "hosted_desk": hosted,
             "reason": signature.err().or_else(|| (!key_matches).then(|| format!("key is not desk {}'s", q.lp_id))),
         })
     }
@@ -1107,7 +1134,7 @@ impl Engine {
     /// signature, then compares the swap opened from it with the signed terms
     /// and reports any recorded default.
     pub async fn dispute(&self, q: &Quote) -> serde_json::Value {
-        let mut verdict = self.verify_quote(q);
+        let mut verdict = self.verify_quote(q).await;
         let swap = self
             .inner
             .read()
@@ -1118,7 +1145,13 @@ impl Engine {
             .cloned();
         let Some(s) = swap else {
             verdict["swap"] = serde_json::Value::Null;
-            verdict["finding"] = "no swap was opened from this quote".into();
+            verdict["finding"] = match verdict["hosted_desk"].as_str() {
+                Some(desk) => format!(
+                    "signed by hosted desk {desk}, which settles on its own server; take this quote to it"
+                )
+                .into(),
+                None => "no swap was opened from this quote".into(),
+            };
             return verdict;
         };
         let pay_same = serde_json::to_value(&s.pay).ok() == serde_json::to_value(&q.pay).ok();
@@ -3765,6 +3798,155 @@ impl Engine {
     }
 }
 
+/// Hosted third-party desks: registry and the market-wide RFQ.
+impl Engine {
+    pub async fn list_hosted_desks(&self) -> Vec<HostedDesk> {
+        self.inner.read().await.hosted.clone()
+    }
+
+    /// Register (or update) a hosted desk. Operator route.
+    pub async fn register_hosted_desk(&self, req: RegisterDeskRequest) -> Result<HostedDesk, Error> {
+        req.validate()?;
+        if self.wallets.iter().any(|w| w.id == req.id) {
+            return Err(Error::Invalid(format!("{} is a house desk", req.id)));
+        }
+        let house_keys: Vec<String> = self
+            .wallets
+            .iter()
+            .map(|w| hex::encode(xonly_from_secret(&w.secret)))
+            .collect();
+        if req.pubkeys.iter().any(|k| house_keys.iter().any(|h| h.eq_ignore_ascii_case(k))) {
+            return Err(Error::Invalid("a hosted desk cannot claim a house desk's key".into()));
+        }
+        let desk = {
+            let mut inner = self.inner.write().await;
+            let taken = inner.hosted.iter().any(|d| {
+                d.id != req.id
+                    && d.pubkeys.iter().any(|k| req.pubkeys.iter().any(|r| r.eq_ignore_ascii_case(k)))
+            });
+            if taken {
+                return Err(Error::Invalid("one of these keys belongs to another hosted desk".into()));
+            }
+            let pubkeys = req.pubkeys.iter().map(|k| k.to_ascii_lowercase()).collect();
+            if let Some(d) = inner.hosted.iter_mut().find(|d| d.id == req.id) {
+                d.name = req.name;
+                d.endpoint = req.endpoint;
+                d.pubkeys = pubkeys;
+                d.last_error = None;
+                d.clone()
+            } else {
+                if inner.hosted.len() >= MAX_HOSTED_DESKS {
+                    return Err(Error::Invalid(format!("at most {MAX_HOSTED_DESKS} hosted desks")));
+                }
+                let d = HostedDesk {
+                    id: req.id,
+                    name: req.name,
+                    endpoint: req.endpoint,
+                    pubkeys,
+                    registered_at: Utc::now(),
+                    last_quote_at: None,
+                    last_error: None,
+                    quotes_ok: 0,
+                    quotes_refused: 0,
+                };
+                inner.hosted.push(d.clone());
+                d
+            }
+        };
+        self.save_state().await;
+        Ok(desk)
+    }
+
+    pub async fn remove_hosted_desk(&self, id: &str) -> Result<(), Error> {
+        let removed = {
+            let mut inner = self.inner.write().await;
+            let before = inner.hosted.len();
+            inner.hosted.retain(|d| d.id != id);
+            inner.hosted.len() != before
+        };
+        if !removed {
+            return Err(Error::Invalid(format!("unknown hosted desk {id}")));
+        }
+        self.save_state().await;
+        Ok(())
+    }
+
+    /// RFQ across the whole market: the house desks (stock reserved as in
+    /// `request_quotes`) plus every hosted desk, asked in parallel. Hosted
+    /// quotes are passed on only if they verify against the desk's pinned
+    /// keys and the terms asked for; the rest are listed as refused.
+    pub async fn market_quotes(
+        &self,
+        req: CreateQuoteRequest,
+        client: Option<&str>,
+    ) -> Result<serde_json::Value, Error> {
+        let desks = self.inner.read().await.hosted.clone();
+        let asks = futures_util::future::join_all(
+            desks.iter().map(|d| fetch_quote(&self.webhook_http, d, &req)),
+        );
+        let house = async {
+            match client {
+                Some(c) => self.request_quotes_for(c, req.clone()).await,
+                None => self.request_quotes(req.clone()).await,
+            }
+        };
+        let (answers, house) = tokio::join!(asks, house);
+
+        let mut hosted: Vec<HostedQuote> = Vec::new();
+        let mut refused = Vec::new();
+        {
+            let mut inner = self.inner.write().await;
+            for (desk, answer) in desks.iter().zip(answers) {
+                let Some(d) = inner.hosted.iter_mut().find(|d| d.id == desk.id) else {
+                    continue;
+                };
+                d.last_quote_at = Some(Utc::now());
+                match answer {
+                    Ok(q) => {
+                        d.quotes_ok += 1;
+                        d.last_error = None;
+                        hosted.push(q);
+                    }
+                    Err(why) => {
+                        d.quotes_refused += 1;
+                        d.last_error = Some(why.clone());
+                        refused.push(serde_json::json!({ "desk_id": desk.id, "reason": why }));
+                    }
+                }
+            }
+        }
+        self.save_state().await;
+
+        let (house, house_error) = match house {
+            Ok(q) => (q, None),
+            Err(err) if hosted.is_empty() => return Err(err),
+            Err(err) => (Vec::new(), Some(err.to_string())),
+        };
+        hosted.sort_by_key(|h| std::cmp::Reverse(h.quote.receive_sats));
+        let best_house = house.iter().max_by_key(|q| q.receive_sats);
+        let best_hosted = hosted.first();
+        let best = match (best_house, best_hosted) {
+            (Some(h), Some(x)) if x.quote.receive_sats > h.receive_sats => {
+                serde_json::json!({ "source": "hosted", "desk": x.desk_id, "quote_id": x.quote.id, "receive_sats": x.quote.receive_sats, "endpoint": x.endpoint })
+            }
+            (Some(h), _) => {
+                serde_json::json!({ "source": "house", "desk": h.lp_id, "quote_id": h.id, "receive_sats": h.receive_sats })
+            }
+            (None, Some(x)) => {
+                serde_json::json!({ "source": "hosted", "desk": x.desk_id, "quote_id": x.quote.id, "receive_sats": x.quote.receive_sats, "endpoint": x.endpoint })
+            }
+            (None, None) => serde_json::Value::Null,
+        };
+        Ok(serde_json::json!({
+            "house": house,
+            "house_error": house_error,
+            "hosted": hosted,
+            "refused": refused,
+            "best": best,
+        }))
+    }
+}
+
 /// Claim advances (#8): the desk buys a maturing timelocked output.
 impl Engine {
     pub async fn list_advances(&self) -> Vec<Advance> {
@@ -4846,6 +5028,8 @@ struct PersistFile {
     rebalances: Vec<Rebalance>,
     #[serde(default)]
     l1_bonds: Vec<Bond>,
+    #[serde(default)]
+    hosted_desks: Vec<HostedDesk>,
 }
 
 impl From<&Inner> for PersistFile {
@@ -4882,6 +5066,7 @@ impl From<&Inner> for PersistFile {
             webhooks: inner.webhooks.clone(),
             rebalances: inner.rebalances.clone(),
             l1_bonds: inner.l1_bonds.clone(),
+            hosted_desks: inner.hosted.clone(),
         }
     }
 }
@@ -6619,19 +6804,19 @@ mod tests {
         let q = e.create_quote(in_req(100_000, None)).await.unwrap();
         // What the user holds is the JSON the API returned.
         let back: Quote = serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
-        let v = e.verify_quote(&back);
+        let v = e.verify_quote(&back).await;
         assert_eq!(v["valid"], true, "{v}");
 
         let mut tampered = back.clone();
         tampered.fee_sats -= 1;
-        let v = e.verify_quote(&tampered);
+        let v = e.verify_quote(&tampered).await;
         assert_eq!(v["valid"], false);
         assert_eq!(v["signature_ok"], false);
 
         // A valid signature from the wrong key does not count as the desk's.
         let mut forged = back.clone();
         sign_quote(&mut forged, &generate_keypair().secret);
-        let v = e.verify_quote(&forged);
+        let v = e.verify_quote(&forged).await;
         assert_eq!(v["signature_ok"], true);
         assert_eq!(v["signed_by_desk"], false);
         assert_eq!(v["valid"], false);

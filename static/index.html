@@ -345,7 +345,8 @@
           <p>Average settle <strong>${duration(t.avg_settle_secs)}</strong> vs a TAURUS exit of ~${duration(t.vault_exit_secs)} (${t.vault_exit_blocks} blocks).</p>
           <p>Batching: ${b.outbound_locks} outbound locks in ${b.funding_txs} txs (${b.txs_saved} saved) · fee rate ${st.fee_rate_sat_vb} sat/vB</p>
           <p>Rebalances between desks: ${st.rebalances.done} (${sats(st.rebalances.moved_sats)} moved)${st.rebalances.pending_l1 ? ", " + st.rebalances.pending_l1 + " waiting on their L1 leg" : ""}</p>
-          <p>Advances: ${st.advances.total} (${st.advances.collected} collected) · Lightning swaps: ${st.lightning_swaps} · split exits: ${st.exit_plans}${sw.defaults_compensated_sats ? " · default compensation paid " + sats(sw.defaults_compensated_sats) : ""}</p>`;
+          <p>Advances: ${st.advances.total} (${st.advances.collected} collected) · Lightning swaps: ${st.lightning_swaps} · split exits: ${st.exit_plans}${sw.defaults_compensated_sats ? " · default compensation paid " + sats(sw.defaults_compensated_sats) : ""}</p>
+          <p>Hosted desks: ${st.hosted_desks.length ? st.hosted_desks.map(d => `${d.name} (${d.quotes_ok} quotes ok, ${d.quotes_refused} refused${d.last_error ? "; last: " + d.last_error : ""})`).join(" · ") : "none registered"} · storage: ${st.storage}</p>`;
       } catch { $("stats").textContent = "unavailable"; }
     }
 

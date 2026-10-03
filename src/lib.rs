@@ -7,6 +7,7 @@ pub mod engine;
 pub mod error;
 pub mod events;
 pub mod faucet;
+pub mod hosted;
 pub mod htlc;
 pub mod lightning;
 pub mod model;
