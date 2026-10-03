@@ -2,6 +2,7 @@
 
 pub mod advance;
 pub mod api;
+pub mod bond;
 pub mod engine;
 pub mod error;
 pub mod events;

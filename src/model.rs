@@ -244,6 +244,9 @@ pub struct Swap {
     pub compensation_sats: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compensation_vtxo_id: Option<String>,
+    /// L1 tx that paid the compensation out of the desk's bond.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensation_txid: Option<String>,
     /// Value of the user's inbound lock, kept so a stuck desk claim can be
     /// re-signed at a higher fee.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,6 +254,35 @@ pub struct Swap {
     /// The desk's inbound claim has at least one confirmation.
     #[serde(default)]
     pub claim_confirmed: bool,
+}
+
+/// A desk bond locked on L1 (see `bond.rs` for the script).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bond {
+    pub id: Uuid,
+    pub lp_id: String,
+    pub status: BondStatus,
+    pub address: String,
+    pub witness_script_hex: String,
+    pub csv_blocks: u16,
+    pub txid: String,
+    pub vout: u32,
+    pub value_sats: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spent_txid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BondStatus {
+    Active,
+    /// Spent by a slash; the remainder lives on as a new bond.
+    Slashed,
+    /// Returned to the desk (operator release or its own CSV reclaim).
+    Released,
 }
 
 /// Two desks swapping stock with each other to move both toward 50/50:

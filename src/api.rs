@@ -74,7 +74,8 @@ struct Meta {
     swap_timeout_blocks: u32,
     pricing: PricingConfig,
     deadline_presets: [u32; 6],
-    /// Tachi key holding desk bonds (custodial escrow).
+    /// Operator key: holds the older VTXO escrow bonds and is the slash key
+    /// in every L1 bond script.
     escrow_pubkey: String,
     /// Fee rate the desks use for their own L1 txs.
     fee_rate_sat_vb: f64,
@@ -114,6 +115,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(get_plan)
         .service(accept_plan)
         .service(post_bond)
+        .service(withdraw_bond)
+        .service(list_bonds)
         .service(events)
         .service(add_webhook)
         .service(quote_advance)
@@ -188,7 +191,8 @@ struct BondBody {
     amount_sats: u64,
 }
 
-/// Desk posts VTXOs to the bond escrow (#6). Operator route.
+/// Desk locks L1 into a bond script: slashable by the operator for
+/// defaults, reclaimable by the desk alone after the CSV delay. Operator route.
 #[post("/v1/lps/{id}/bond")]
 async fn post_bond(
     _admin: Admin,
@@ -196,8 +200,32 @@ async fn post_bond(
     path: web::Path<String>,
     body: web::Json<BondBody>,
 ) -> Result<HttpResponse, Error> {
-    let total = engine.post_bond(&path, body.amount_sats).await?;
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "lp_id": *path, "bond_sats": total })))
+    Ok(HttpResponse::Ok().json(engine.post_bond(&path, body.amount_sats).await?))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct WithdrawBondBody {
+    /// Use the desk's own CSV path instead of the operator's release.
+    #[serde(default)]
+    unilateral: bool,
+}
+
+/// Return a desk's bonds once nothing it owes is in flight. Operator route.
+#[post("/v1/lps/{id}/bond/withdraw")]
+async fn withdraw_bond(
+    _admin: Admin,
+    engine: web::Data<Engine>,
+    path: web::Path<String>,
+    body: Option<web::Json<WithdrawBondBody>>,
+) -> Result<HttpResponse, Error> {
+    let unilateral = body.map(|b| b.unilateral).unwrap_or_default();
+    Ok(HttpResponse::Ok().json(engine.withdraw_bonds(&path, unilateral).await?))
+}
+
+/// Every L1 bond: active, slashed and released, with scripts to audit.
+#[get("/v1/bonds")]
+async fn list_bonds(engine: web::Data<Engine>) -> HttpResponse {
+    HttpResponse::Ok().json(engine.list_bonds().await)
 }
 
 #[derive(serde::Deserialize)]

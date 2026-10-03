@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedMutexGuard, RwLock};
 use uuid::Uuid;
 
+use crate::bond::{BOND_CSV_BLOCKS, BOND_SPEND_VBYTES};
 use crate::advance::{
     ExpectedSpend, MAX_SPEND_FEE_SATS, csv_script, discount_sats, p2wsh, parse_csv_script,
     presign_spend, verify_presigned,
@@ -30,6 +31,7 @@ use crate::model::{
     CreateQuoteRequest, ExitPlan, HtlcLock, LiquidityProvider, LnDirection, LnQuoteRequest,
     LnStatus, LnSwap, ObserveLockRequest, ObserveVtxoRequest, PayInstructions, PriceBreakdown,
     Quote, Rebalance, RebalanceStatus, Side, Swap, SwapStatus, WebhookRequest, fee_sats,
+    Bond, BondStatus,
 };
 use crate::tachi::TachiClient;
 use crate::tachi_tx::{
@@ -95,6 +97,8 @@ const REBALANCE_LOW_PPM: u64 = 300_000;
 /// Most moved in one rebalance, and how often sync tries one.
 const REBALANCE_MAX_SATS: u64 = 1_000_000;
 const REBALANCE_INTERVAL_SECS: i64 = 10 * 60;
+/// Below this, what is left of a slashed bond goes to the fee, not a new bond.
+const BOND_DUST_SATS: u64 = 1_000;
 
 /// Knobs for [`price`]. All values are parts per million.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -169,6 +173,8 @@ struct Inner {
     /// When the desks last tried to rebalance (in memory; a restart may run
     /// one early, which is harmless).
     last_rebalance: Option<chrono::DateTime<Utc>>,
+    /// Desk bonds locked on L1 (`bonds` above is the older VTXO escrow).
+    l1_bonds: Vec<Bond>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -673,6 +679,7 @@ impl Engine {
         inner.ln_swaps = file.ln_swaps.into_iter().map(|l| (l.id, l)).collect();
         inner.webhooks = file.webhooks;
         inner.rebalances = file.rebalances;
+        inner.l1_bonds = file.l1_bonds;
         apply_desk_stats(&mut inner);
         tracing::info!(
             quotes = inner.quotes.len(),
@@ -990,7 +997,11 @@ impl Engine {
                 "volume_in_sats": volume(Side::In),
                 "volume_out_sats": volume(Side::Out),
                 "fees_earned_sats": done.iter().map(|s| s.fee_sats).sum::<u64>(),
-                "defaults_compensated_sats": swaps.iter().filter_map(|s| s.compensation_sats).sum::<u64>(),
+                "defaults_compensated_sats": swaps
+                    .iter()
+                    .filter(|s| s.compensation_vtxo_id.is_some() || s.compensation_txid.is_some())
+                    .filter_map(|s| s.compensation_sats)
+                    .sum::<u64>(),
             },
             "batching": {
                 "outbound_locks": locks.len(),
@@ -1655,6 +1666,7 @@ impl Engine {
             desk_defaulted: false,
             compensation_sats: None,
             compensation_vtxo_id: None,
+            compensation_txid: None,
             l1_lock_value_sats: None,
             claim_confirmed: false,
         };
@@ -2744,15 +2756,14 @@ impl Engine {
         self.get_swap(id).await
     }
 
-    /// Count a default and reserve compensation out of the desk's bond.
+    /// Count a default and work out the compensation the desk's bonds owe.
+    /// The bond itself is only touched when the payout goes out.
     async fn record_default(&self, lp_id: &str, amount_sats: u64) -> u64 {
         let comp = {
             let mut inner = self.inner.write().await;
             inner.reputation.entry(lp_id.to_string()).or_default().1 += 1;
-            let bond = inner.bonds.entry(lp_id.to_string()).or_default();
             let owed = (amount_sats * DEFAULT_PENALTY_PPM / 1_000_000).max(MIN_COMPENSATION_SATS);
-            let comp = owed.min(*bond);
-            *bond -= comp;
+            let comp = owed.min(bonded_sats(&inner, lp_id));
             apply_desk_stats(&mut inner);
             comp
         };
@@ -2767,13 +2778,36 @@ impl Engine {
         apply_desk_stats(&mut inner);
     }
 
-    /// Pay a default's compensation from escrow to the user's Tachi key.
+    /// Pay a default's compensation: out of the desk's L1 bond (operator
+    /// path, rest re-locked) if it has one big enough, else from its older
+    /// VTXO escrow bond.
     async fn pay_compensation(&self, swap: &Swap) -> Result<(), Error> {
         let Some(amount) = swap.compensation_sats else {
             return Ok(());
         };
-        if swap.compensation_vtxo_id.is_some() {
+        if swap.compensation_vtxo_id.is_some() || swap.compensation_txid.is_some() {
             return Ok(());
+        }
+        let fee = self.fee_for(BOND_SPEND_VBYTES);
+        let l1_bond = self
+            .inner
+            .read()
+            .await
+            .l1_bonds
+            .iter()
+            .filter(|b| b.lp_id == swap.lp_id && b.status == BondStatus::Active)
+            .filter(|b| b.value_sats > amount + fee)
+            .max_by_key(|b| b.value_sats)
+            .cloned();
+        if let Some(bond) = l1_bond {
+            return self.slash_l1_bond(swap, &bond, amount, fee).await;
+        }
+        let legacy = self.inner.read().await.bonds.get(&swap.lp_id).copied().unwrap_or(0);
+        if legacy < amount {
+            return Err(Error::Invalid(format!(
+                "desk {}'s bonds cannot cover {amount} sats of compensation",
+                swap.lp_id
+            )));
         }
         let dest = swap
             .user_tachi_address
@@ -2788,33 +2822,240 @@ impl Engine {
                 .await?
                 .output_vtxo_id
         };
-        self.inner.write().await.pending_payouts.remove(&comp_key(swap.id));
+        {
+            let mut inner = self.inner.write().await;
+            inner.pending_payouts.remove(&comp_key(swap.id));
+            if let Some(b) = inner.bonds.get_mut(&swap.lp_id) {
+                *b = b.saturating_sub(amount);
+            }
+            apply_desk_stats(&mut inner);
+        }
         self.update_swap(swap.id, |s| s.compensation_vtxo_id = Some(vtxo_id))
             .await?;
         Ok(())
     }
 
-    /// Desk posts VTXOs to escrow as a bond. Custodial: this server holds the
-    /// escrow key, so a bond protects users only as far as the operator is honest.
-    pub async fn post_bond(&self, lp_id: &str, amount_sats: u64) -> Result<u64, Error> {
-        self.lp_wallet(lp_id)?;
+    /// Operator path: pay the user from the bond, re-lock what is left.
+    async fn slash_l1_bond(&self, swap: &Swap, bond: &Bond, amount: u64, fee: u64) -> Result<(), Error> {
+        let to = self.user_l1_destination(swap)?;
+        let remainder = bond.value_sats - amount - fee;
+        let bond_addr = p2wsh(&redeem_from_hex(&bond.witness_script_hex)?, self.network);
+        let mut outputs = vec![(to, amount)];
+        // Dust is not worth a new bond output; it goes to the fee.
+        if remainder >= BOND_DUST_SATS {
+            outputs.push((bond_addr.clone(), remainder));
+        }
+        let txid = if self.test_mode {
+            format!("sim-slash-{}", swap.id)
+        } else {
+            let hex = crate::bond::spend_as_operator(
+                OutPoint {
+                    txid: parse_txid(&bond.txid)?,
+                    vout: bond.vout,
+                },
+                bond.value_sats,
+                &redeem_from_hex(&bond.witness_script_hex)?,
+                &self.escrow,
+                &outputs,
+            )?;
+            self.broadcast_l1(&hex).await?
+        };
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(b) = inner.l1_bonds.iter_mut().find(|b| b.id == bond.id) {
+                b.status = BondStatus::Slashed;
+                b.spent_txid = Some(txid.clone());
+                b.note = Some(format!("paid {amount} sats to the user of swap {}", swap.id));
+            }
+            if remainder >= BOND_DUST_SATS {
+                inner.l1_bonds.push(Bond {
+                    id: Uuid::now_v7(),
+                    txid: txid.clone(),
+                    vout: 1,
+                    value_sats: remainder,
+                    status: BondStatus::Active,
+                    spent_txid: None,
+                    note: Some(format!("re-locked after slashing bond {}", bond.id)),
+                    created_at: Utc::now(),
+                    ..bond.clone()
+                });
+            }
+            apply_desk_stats(&mut inner);
+        }
+        tracing::warn!(lp = %swap.lp_id, amount, %txid, "bond slashed for a default");
+        self.update_swap(swap.id, |s| s.compensation_txid = Some(txid)).await?;
+        Ok(())
+    }
+
+    /// Where L1 compensation goes: the user's bitcoin address if they gave
+    /// one, else a P2WPKH of their swap key.
+    fn user_l1_destination(&self, swap: &Swap) -> Result<Address, Error> {
+        if let Some(addr) = swap.user_l1_address.as_deref().and_then(|a| {
+            a.parse::<Address<bitcoin::address::NetworkUnchecked>>()
+                .ok()?
+                .require_network(self.network)
+                .ok()
+        }) {
+            return Ok(addr);
+        }
+        let pk = pubkey_from_hex(
+            swap.user_pubkey_hex
+                .as_deref()
+                .ok_or_else(|| Error::Invalid("no user address or key to compensate".into()))?,
+        )?;
+        let compressed = bitcoin::CompressedPublicKey::try_from(pk)
+            .map_err(|e| Error::Bitcoin(e.to_string()))?;
+        Ok(Address::p2wpkh(&compressed, bitcoin::KnownHrp::from(self.network)))
+    }
+
+    fn operator_pubkey(&self) -> PublicKey {
+        PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), &self.escrow))
+    }
+
+    pub async fn list_bonds(&self) -> Vec<Bond> {
+        let mut v = self.inner.read().await.l1_bonds.clone();
+        v.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+        v
+    }
+
+    /// Desk locks `amount_sats` of its own L1 into a bond: slashable by the
+    /// operator for defaults, reclaimable by the desk alone after
+    /// `BOND_CSV_BLOCKS`.
+    pub async fn post_bond(&self, lp_id: &str, amount_sats: u64) -> Result<Bond, Error> {
+        let w = self.lp_wallet(lp_id)?.clone();
         if amount_sats < MIN_SWAP_SATS {
             return Err(Error::AmountTooSmall(MIN_SWAP_SATS));
         }
-        if !self.test_mode {
-            self.send_vtxo_from(lp_id, &self.escrow_pubkey_hex(), amount_sats)
+        let desk_pk = self.lp_pubkey(lp_id)?;
+        let script = crate::bond::bond_script(&self.operator_pubkey(), &desk_pk, BOND_CSV_BLOCKS);
+        let address = p2wsh(&script, self.network);
+        let txid = if self.test_mode {
+            format!("sim-bond-{}", Uuid::now_v7())
+        } else {
+            let (hex, _) = self
+                .sign_l1_payment(lp_id, &[(address.to_string(), amount_sats)])
                 .await?;
-        }
-        let total = {
-            let mut inner = self.inner.write().await;
-            let bond = inner.bonds.entry(lp_id.to_string()).or_default();
-            *bond += amount_sats;
-            let total = *bond;
-            apply_desk_stats(&mut inner);
-            total
+            self.broadcast_l1(&hex).await?
         };
+        let bond = Bond {
+            id: Uuid::now_v7(),
+            lp_id: w.id.clone(),
+            status: BondStatus::Active,
+            address: address.to_string(),
+            witness_script_hex: hex::encode(script.as_bytes()),
+            csv_blocks: BOND_CSV_BLOCKS,
+            txid,
+            vout: 0,
+            value_sats: amount_sats,
+            spent_txid: None,
+            note: None,
+            created_at: Utc::now(),
+        };
+        {
+            let mut inner = self.inner.write().await;
+            inner.l1_bonds.push(bond.clone());
+            apply_desk_stats(&mut inner);
+        }
         self.save_state().await;
-        Ok(total)
+        Ok(bond)
+    }
+
+    /// Return a desk's bonds to it. Refused while it has swaps in flight or
+    /// compensation owed. `unilateral` uses the desk's own CSV path (as if the
+    /// operator had vanished) and needs the bond to have matured.
+    pub async fn withdraw_bonds(&self, lp_id: &str, unilateral: bool) -> Result<serde_json::Value, Error> {
+        let w = self.lp_wallet(lp_id)?.clone();
+        {
+            let inner = self.inner.read().await;
+            let busy = inner.swaps.values().any(|s| {
+                s.lp_id == lp_id
+                    && (matches!(s.status, SwapStatus::Quoted | SwapStatus::LpSettled)
+                        || compensation_owed(s))
+            });
+            if busy {
+                return Err(Error::Invalid(format!(
+                    "desk {lp_id} has swaps in flight or compensation owed; withdraw once they settle"
+                )));
+            }
+        }
+        let active: Vec<Bond> = self
+            .inner
+            .read()
+            .await
+            .l1_bonds
+            .iter()
+            .filter(|b| b.lp_id == lp_id && b.status == BondStatus::Active)
+            .cloned()
+            .collect();
+        let fee = self.fee_for(BOND_SPEND_VBYTES);
+        let mut released = Vec::new();
+        for bond in active {
+            let outpoint = OutPoint {
+                txid: parse_txid(&bond.txid).unwrap_or(bitcoin::Txid::all_zeros()),
+                vout: bond.vout,
+            };
+            let script = redeem_from_hex(&bond.witness_script_hex)?;
+            let txid = if self.test_mode {
+                format!("sim-release-{}", bond.id)
+            } else if unilateral {
+                let confs = self.tachi.tx_confirmations(&bond.txid).await?.unwrap_or(0);
+                if confs < u32::from(bond.csv_blocks) {
+                    return Err(Error::Invalid(format!(
+                        "bond {} matures in {} more blocks",
+                        bond.id,
+                        u32::from(bond.csv_blocks) - confs
+                    )));
+                }
+                let hex = crate::bond::spend_as_desk(
+                    outpoint,
+                    bond.value_sats,
+                    &script,
+                    bond.csv_blocks,
+                    &w.secret,
+                    &w.claim_address,
+                    fee,
+                )?;
+                self.broadcast_l1(&hex).await?
+            } else {
+                let hex = crate::bond::spend_as_operator(
+                    outpoint,
+                    bond.value_sats,
+                    &script,
+                    &self.escrow,
+                    &[(w.claim_address.clone(), bond.value_sats.saturating_sub(fee))],
+                )?;
+                self.broadcast_l1(&hex).await?
+            };
+            let mut inner = self.inner.write().await;
+            if let Some(b) = inner.l1_bonds.iter_mut().find(|b| b.id == bond.id) {
+                b.status = BondStatus::Released;
+                b.spent_txid = Some(txid.clone());
+                b.note = Some(if unilateral {
+                    "reclaimed by the desk on its own after the CSV delay".into()
+                } else {
+                    "released by the operator".into()
+                });
+                released.push(b.clone());
+            }
+        }
+        // The older VTXO escrow bond goes back to the desk's Tachi key.
+        let legacy = self.inner.read().await.bonds.get(lp_id).copied().unwrap_or(0);
+        let mut legacy_tx = None;
+        if legacy > 0 {
+            if !self.test_mode {
+                let dest = hex::encode(xonly_from_secret(&w.secret));
+                legacy_tx = Some(self.send_vtxo_from(ESCROW_ID, &dest, legacy).await?.tendermint_hash);
+            }
+            self.inner.write().await.bonds.insert(lp_id.to_string(), 0);
+        }
+        apply_desk_stats(&mut *self.inner.write().await);
+        self.save_state().await;
+        Ok(serde_json::json!({
+            "lp_id": lp_id,
+            "released": released,
+            "vtxo_escrow_returned_sats": legacy,
+            "vtxo_escrow_tx": legacy_tx,
+        }))
     }
 
     pub async fn mark_lp_default(&self, id: Uuid) -> Result<Swap, Error> {
@@ -4292,17 +4533,36 @@ fn needs_sync(s: &Swap) -> bool {
 
 /// A default was recorded but the bond payout has not landed yet.
 fn compensation_owed(s: &Swap) -> bool {
-    s.desk_defaulted && s.compensation_sats.is_some() && s.compensation_vtxo_id.is_none()
+    s.desk_defaulted
+        && s.compensation_sats.is_some()
+        && s.compensation_vtxo_id.is_none()
+        && s.compensation_txid.is_none()
+}
+
+/// A desk's total bond: active L1 bonds plus any older VTXO escrow bond.
+fn bonded_sats(inner: &Inner, lp_id: &str) -> u64 {
+    let l1: u64 = inner
+        .l1_bonds
+        .iter()
+        .filter(|b| b.lp_id == lp_id && b.status == BondStatus::Active)
+        .map(|b| b.value_sats)
+        .sum();
+    l1 + inner.bonds.get(lp_id).copied().unwrap_or_default()
 }
 
 /// Refresh each desk's bond / fills / defaults / score from the books.
 fn apply_desk_stats(inner: &mut Inner) {
+    let bonded: HashMap<String, u64> = inner
+        .lps
+        .iter()
+        .map(|lp| (lp.id.clone(), bonded_sats(inner, &lp.id)))
+        .collect();
     for lp in inner.lps.iter_mut() {
         let (fills, defaults) = inner.reputation.get(&lp.id).copied().unwrap_or_default();
         lp.fills = fills;
         lp.defaults = defaults;
         lp.score_ppm = (fills + 1) * 1_000_000 / (fills + defaults + 2);
-        lp.bond_sats = inner.bonds.get(&lp.id).copied().unwrap_or_default();
+        lp.bond_sats = bonded.get(&lp.id).copied().unwrap_or_default();
     }
 }
 
@@ -4390,6 +4650,8 @@ struct PersistFile {
     webhooks: Vec<WebhookRequest>,
     #[serde(default)]
     rebalances: Vec<Rebalance>,
+    #[serde(default)]
+    l1_bonds: Vec<Bond>,
 }
 
 impl From<&Inner> for PersistFile {
@@ -4425,6 +4687,7 @@ impl From<&Inner> for PersistFile {
             ln_swaps: inner.ln_swaps.values().cloned().collect(),
             webhooks: inner.webhooks.clone(),
             rebalances: inner.rebalances.clone(),
+            l1_bonds: inner.l1_bonds.clone(),
         }
     }
 }
@@ -5674,7 +5937,9 @@ mod tests {
     #[tokio::test]
     async fn desk_default_pays_from_bond_and_costs_routing() {
         let e = engine();
-        assert_eq!(e.post_bond("lp-alpha", 50_000).await.unwrap(), 50_000);
+        let bond = e.post_bond("lp-alpha", 50_000).await.unwrap();
+        assert_eq!((bond.value_sats, bond.status), (50_000, BondStatus::Active));
+        assert_eq!(bond.csv_blocks, BOND_CSV_BLOCKS);
         let user = generate_keypair();
         // A 10k out routes to alpha (cheapest base fee; its 50k L1 covers it).
         let q = e
@@ -5698,10 +5963,19 @@ mod tests {
         assert!(expired.desk_defaulted);
         let owed = (q.amount_sats * DEFAULT_PENALTY_PPM / 1_000_000).max(MIN_COMPENSATION_SATS);
         assert_eq!(expired.compensation_sats, Some(owed));
+        // Paid on L1 out of the bond, the rest re-locked to the same script.
         assert_eq!(
-            expired.compensation_vtxo_id.as_deref(),
-            Some(format!("sim-comp-{}", swap.id).as_str())
+            expired.compensation_txid.as_deref(),
+            Some(format!("sim-slash-{}", swap.id).as_str())
         );
+        let fee = e.fee_for(BOND_SPEND_VBYTES);
+        let bonds = e.list_bonds().await;
+        assert_eq!(bonds.len(), 2);
+        let relocked = bonds.iter().find(|b| b.status == BondStatus::Active).unwrap();
+        assert_eq!(relocked.value_sats, 50_000 - owed - fee);
+        assert_eq!(relocked.address, bond.address);
+        assert_eq!(relocked.vout, 1);
+        assert!(bonds.iter().any(|b| b.id == bond.id && b.status == BondStatus::Slashed));
 
         let alpha = e
             .inventory()
@@ -5709,7 +5983,7 @@ mod tests {
             .into_iter()
             .find(|lp| lp.id == "lp-alpha")
             .unwrap();
-        assert_eq!(alpha.bond_sats, 50_000 - owed);
+        assert_eq!(alpha.bond_sats, 50_000 - owed - fee);
         assert_eq!((alpha.fills, alpha.defaults), (0, 1));
         assert!(alpha.score_ppm < MIN_ROUTING_SCORE_PPM);
         // With a poor score alpha drops out of routing.
@@ -5726,6 +6000,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next.lp_id, "lp-bravo");
+
+        // Compensation is paid and nothing is in flight: the bond comes back.
+        let out = e.withdraw_bonds("lp-alpha", false).await.unwrap();
+        assert_eq!(out["released"].as_array().unwrap().len(), 1);
+        assert!(e.list_bonds().await.iter().all(|b| b.status != BondStatus::Active));
     }
 
     #[tokio::test]
