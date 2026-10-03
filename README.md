@@ -68,6 +68,7 @@ LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `
 ## API
 
 - `GET /` — UI
+- `GET /v1/stats` — settled volume and fees, swaps by status, batching savings, per-desk track record, average settle time vs a vault exit
 - `POST /v1/rfq` — firm quotes from every desk; body like `/v1/quotes` plus optional `ttl_secs`, `deadline_blocks`
 - `POST /v1/quotes` — best single quote (same body)
 - `GET /v1/price-curve?side=out&amount_sats=…` — fee by deadline per desk (reserves nothing)

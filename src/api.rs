@@ -86,6 +86,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(meta)
         .service(health)
         .service(inventory)
+        .service(stats)
         .service(create_quote)
         .service(rfq)
         .service(price_curve)
@@ -365,6 +366,12 @@ async fn health(engine: web::Data<Engine>) -> HttpResponse {
 #[get("/v1/inventory")]
 async fn inventory(engine: web::Data<Engine>) -> HttpResponse {
     HttpResponse::Ok().json(engine.inventory().await)
+}
+
+/// Volume, fees, batching savings, per-desk track record, time saved.
+#[get("/v1/stats")]
+async fn stats(engine: web::Data<Engine>) -> HttpResponse {
+    HttpResponse::Ok().json(engine.stats().await)
 }
 
 #[post("/v1/quotes")]

@@ -813,6 +813,102 @@ impl Engine {
         apply_desk_stats(&mut inner);
     }
 
+    /// Market numbers for the stats page: volume, fees, batching savings,
+    /// per-desk track record, and time saved against a vault exit.
+    pub async fn stats(&self) -> serde_json::Value {
+        let inner = self.inner.read().await;
+        let swaps: Vec<&Swap> = inner.swaps.values().collect();
+        let done: Vec<&Swap> = swaps
+            .iter()
+            .copied()
+            .filter(|s| s.status == SwapStatus::Claimed)
+            .collect();
+
+        let mut by_status: std::collections::BTreeMap<String, u64> = Default::default();
+        for s in &swaps {
+            let key = serde_json::to_value(s.status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            *by_status.entry(key).or_default() += 1;
+        }
+        let volume = |side: Side| -> u64 {
+            done.iter().filter(|s| s.side == side).map(|s| s.amount_sats).sum()
+        };
+
+        // Batching: outbound locks funded vs funding txs actually used.
+        let locks: Vec<&Swap> = swaps
+            .iter()
+            .copied()
+            .filter(|s| s.side == Side::Out && s.l1_lock_txid.is_some())
+            .collect();
+        let lock_txs: HashSet<&str> = locks.iter().filter_map(|s| s.l1_lock_txid.as_deref()).collect();
+
+        let settle_secs: Vec<i64> = done
+            .iter()
+            .map(|s| (s.updated_at - s.created_at).num_seconds().max(0))
+            .collect();
+        let avg_settle = if settle_secs.is_empty() {
+            None
+        } else {
+            Some(settle_secs.iter().sum::<i64>() / settle_secs.len() as i64)
+        };
+        // A TAURUS exit is VAULT_EXIT_BLOCKS of ~10 minutes each.
+        let vault_exit_secs = i64::from(VAULT_EXIT_BLOCKS) * 600;
+
+        let desks: Vec<serde_json::Value> = inner
+            .lps
+            .iter()
+            .map(|lp| {
+                let mine: Vec<&Swap> = done.iter().copied().filter(|s| s.lp_id == lp.id).collect();
+                serde_json::json!({
+                    "id": lp.id,
+                    "fee_ppm": lp.fee_ppm,
+                    "swaps_settled": mine.len(),
+                    "volume_sats": mine.iter().map(|s| s.amount_sats).sum::<u64>(),
+                    "fees_earned_sats": mine.iter().map(|s| s.fee_sats).sum::<u64>(),
+                    "fills": lp.fills,
+                    "defaults": lp.defaults,
+                    "score_ppm": lp.score_ppm,
+                    "bond_sats": lp.bond_sats,
+                    "routing": routable(lp),
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "swaps": {
+                "total": swaps.len(),
+                "by_status": by_status,
+                "settled": done.len(),
+                "volume_in_sats": volume(Side::In),
+                "volume_out_sats": volume(Side::Out),
+                "fees_earned_sats": done.iter().map(|s| s.fee_sats).sum::<u64>(),
+                "defaults_compensated_sats": swaps.iter().filter_map(|s| s.compensation_sats).sum::<u64>(),
+            },
+            "batching": {
+                "outbound_locks": locks.len(),
+                "funding_txs": lock_txs.len(),
+                "txs_saved": locks.len().saturating_sub(lock_txs.len()),
+            },
+            "time": {
+                "avg_settle_secs": avg_settle,
+                "vault_exit_secs": vault_exit_secs,
+                "vault_exit_blocks": VAULT_EXIT_BLOCKS,
+            },
+            "desks": desks,
+            "advances": {
+                "total": inner.advances.len(),
+                "advanced_sats": inner.advances.values().filter(|a| a.advance_txid.is_some()).map(|a| a.advance_sats).sum::<u64>(),
+                "collected": inner.advances.values().filter(|a| a.status == AdvanceStatus::Collected).count(),
+                "lost": inner.advances.values().filter(|a| a.status == AdvanceStatus::Lost).count(),
+            },
+            "lightning_swaps": inner.ln_swaps.len(),
+            "exit_plans": inner.plans.len(),
+            "fee_rate_sat_vb": self.fee_rate_msat_vb() as f64 / 1_000.0,
+        })
+    }
+
     pub async fn list_swaps(&self) -> Vec<Swap> {
         let mut v: Vec<_> = self.inner.read().await.swaps.values().cloned().collect();
         v.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
@@ -5669,5 +5765,42 @@ mod tests {
         let fee = 100_000 - tx.output[0].value.to_sat();
         assert_eq!(fee, fee_at(MIN_FEE_RATE_MSAT_VB, HTLC_SPEND_VBYTES));
         assert!(tx.input[0].sequence.is_rbf(), "claim must be replaceable");
+    }
+
+    #[tokio::test]
+    async fn stats_sum_settled_volume_fees_and_track_record() {
+        let e = engine();
+        for i in 0..2 {
+            let q = e.create_quote(in_req(100_000, None)).await.unwrap();
+            let s = e.open_swap(q.id).await.unwrap();
+            e.observe_lock(
+                s.id,
+                ObserveLockRequest {
+                    txid: format!("{i:064x}"),
+                    vout: 0,
+                    value_sats: 100_000,
+                },
+            )
+            .await
+            .unwrap();
+            e.claim(s.id).await.unwrap();
+        }
+        // One accepted and left unpaid.
+        let q = e.create_quote(in_req(50_000, None)).await.unwrap();
+        e.open_swap(q.id).await.unwrap();
+
+        let st = e.stats().await;
+        assert_eq!(st["swaps"]["total"], 3);
+        assert_eq!(st["swaps"]["settled"], 2);
+        assert_eq!(st["swaps"]["by_status"]["claimed"], 2);
+        assert_eq!(st["swaps"]["by_status"]["quoted"], 1);
+        assert_eq!(st["swaps"]["volume_in_sats"], 200_000);
+        let fee = fee_sats(100_000, 8_000, MIN_FEE_SATS);
+        assert_eq!(st["swaps"]["fees_earned_sats"], 2 * fee);
+        let alpha = st["desks"].as_array().unwrap().iter().find(|d| d["id"] == "lp-alpha").unwrap();
+        assert_eq!(alpha["fills"], 2);
+        assert_eq!(alpha["swaps_settled"], 2);
+        assert_eq!(st["time"]["vault_exit_blocks"], VAULT_EXIT_BLOCKS);
+        assert!(st["time"]["avg_settle_secs"].as_i64().is_some());
     }
 }

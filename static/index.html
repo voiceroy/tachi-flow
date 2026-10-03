@@ -109,6 +109,10 @@
       <div id="books">loading inventory…</div>
     </section>
     <section>
+      <h2>Desk stats</h2>
+      <div id="stats" class="hint">loading…</div>
+    </section>
+    <section>
       <h2>Get a quote</h2>
       <div class="row">
         <div>
@@ -315,6 +319,28 @@
       </tr>`;
       }).join("");
       $("books").innerHTML = head + body + "</tbody></table>";
+    }
+
+    function duration(secs) {
+      if (secs == null) return "—";
+      if (secs < 120) return secs + " s";
+      if (secs < 7200) return Math.round(secs / 60) + " min";
+      if (secs < 172800) return Math.round(secs / 3600) + " h";
+      return Math.round(secs / 86400) + " days";
+    }
+
+    async function refreshStats() {
+      try {
+        const st = await j("/v1/stats");
+        const sw = st.swaps, b = st.batching, t = st.time;
+        $("stats").innerHTML = `
+          <p><strong>${sw.settled}</strong> swaps settled of ${sw.total} ·
+             volume in ${sats(sw.volume_in_sats)} · out ${sats(sw.volume_out_sats)} ·
+             fees earned ${sats(sw.fees_earned_sats)}</p>
+          <p>Average settle <strong>${duration(t.avg_settle_secs)}</strong> vs a TAURUS exit of ~${duration(t.vault_exit_secs)} (${t.vault_exit_blocks} blocks).</p>
+          <p>Batching: ${b.outbound_locks} outbound locks in ${b.funding_txs} txs (${b.txs_saved} saved) · fee rate ${st.fee_rate_sat_vb} sat/vB</p>
+          <p>Advances: ${st.advances.total} (${st.advances.collected} collected) · Lightning swaps: ${st.lightning_swaps} · split exits: ${st.exit_plans}${sw.defaults_compensated_sats ? " · default compensation paid " + sats(sw.defaults_compensated_sats) : ""}</p>`;
+      } catch { $("stats").textContent = "unavailable"; }
     }
 
     async function refreshSwaps() {
@@ -699,7 +725,8 @@
     refreshBooks();
     refreshSwaps();
     // Swaps arrive live; books and the block height still refresh on a timer.
-    setInterval(() => { refreshBooks(); refreshMeta(); if (!liveUp()) refreshSwaps(); }, 8000);
+    refreshStats();
+    setInterval(() => { refreshBooks(); refreshMeta(); refreshStats(); if (!liveUp()) refreshSwaps(); }, 8000);
   </script>
 </body>
 </html>
