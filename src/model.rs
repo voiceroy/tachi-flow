@@ -94,6 +94,13 @@ pub struct Quote {
     /// Set when this quote is one leg of a split exit plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<Uuid>,
+    /// The quoting desk's Tachi key (x-only hex) and its BIP340 signature over
+    /// the quote's terms (see `quote_commitment`), so a user can prove later
+    /// what the desk promised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk_signature: Option<String>,
 }
 
 /// One amount split across desks: each leg is an ordinary quote, then swap.

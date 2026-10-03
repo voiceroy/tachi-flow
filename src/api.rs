@@ -12,7 +12,7 @@ use crate::error::Error;
 use crate::htlc::{generate_keypair, p2wpkh_address};
 use crate::model::{
     AdvanceAcceptRequest, AdvanceQuoteRequest, CreatePlanRequest, CreateQuoteRequest,
-    CreateSwapRequest, LnQuoteRequest, ObserveLockRequest, ObserveVtxoRequest, Side,
+    CreateSwapRequest, LnQuoteRequest, ObserveLockRequest, ObserveVtxoRequest, Quote, Side,
     WebhookRequest,
 };
 use crate::tachi::Health;
@@ -87,6 +87,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(health)
         .service(inventory)
         .service(stats)
+        .service(verify_quote)
+        .service(dispute)
         .service(create_quote)
         .service(rfq)
         .service(price_curve)
@@ -372,6 +374,18 @@ async fn inventory(engine: web::Data<Engine>) -> HttpResponse {
 #[get("/v1/stats")]
 async fn stats(engine: web::Data<Engine>) -> HttpResponse {
     HttpResponse::Ok().json(engine.stats().await)
+}
+
+/// Is this quote genuinely signed by the desk it names?
+#[post("/v1/quotes/verify")]
+async fn verify_quote(engine: web::Data<Engine>, body: web::Json<Quote>) -> HttpResponse {
+    HttpResponse::Ok().json(engine.verify_quote(&body))
+}
+
+/// Bring a signed quote: did the desk honour it, and did it default?
+#[post("/v1/disputes")]
+async fn dispute(engine: web::Data<Engine>, body: web::Json<Quote>) -> HttpResponse {
+    HttpResponse::Ok().json(engine.dispute(&body).await)
 }
 
 #[post("/v1/quotes")]

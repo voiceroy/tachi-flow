@@ -418,6 +418,7 @@
         <p class="ok">${quote.comparison || ""}</p>
         <p class="hint">${quote.hint || ""}</p>
         <p>Price firm until ${quote.expires_at}${quote.lock_by_height ? " · bitcoin locked by block " + quote.lock_by_height : ""}</p>
+        ${quote.desk_signature ? `<p class="hint">Signed by ${quote.lp_id} (key <code>${quote.desk_pubkey.slice(0, 16)}…</code>). Keep this quote: <code>POST /v1/disputes</code> checks the desk honoured it.</p>` : ""}
         ${payHtml}`;
       document.querySelectorAll("input[name=offer]").forEach(r => {
         r.onchange = () => showQuote(offers[Number(r.dataset.i)]);

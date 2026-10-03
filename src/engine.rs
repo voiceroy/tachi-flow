@@ -223,6 +223,70 @@ impl LpSpend {
     }
 }
 
+/// The terms a desk signs: everything that decides what the user gets and
+/// pays, not presentation text. Serialised as JSON (fixed field order).
+#[derive(Serialize)]
+struct QuoteCommitment<'a> {
+    domain: &'static str,
+    id: Uuid,
+    side: Side,
+    amount_sats: u64,
+    fee_sats: u64,
+    receive_sats: u64,
+    lp_id: &'a str,
+    expires_at: &'a chrono::DateTime<Utc>,
+    pay: &'a PayInstructions,
+    user_pubkey_hex: &'a Option<String>,
+    lock_by_height: Option<u32>,
+}
+
+/// SHA-256 of the quote's committed terms, the message a desk signs.
+pub fn quote_commitment(q: &Quote) -> [u8; 32] {
+    let body = QuoteCommitment {
+        domain: "tachi-flow/quote/v1",
+        id: q.id,
+        side: q.side,
+        amount_sats: q.amount_sats,
+        fee_sats: q.fee_sats,
+        receive_sats: q.receive_sats,
+        lp_id: &q.lp_id,
+        expires_at: &q.expires_at,
+        pay: &q.pay,
+        user_pubkey_hex: &q.user_pubkey_hex,
+        lock_by_height: q.lock_by_height,
+    };
+    let json = serde_json::to_vec(&body).expect("quote commitment serialises");
+    bitcoin::hashes::sha256::Hash::hash(&json).to_byte_array()
+}
+
+fn sign_quote(q: &mut Quote, desk_secret: &SecretKey) {
+    let secp = Secp256k1::new();
+    let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, desk_secret);
+    let msg = bitcoin::secp256k1::Message::from_digest(quote_commitment(q));
+    let sig = secp.sign_schnorr(&msg, &keypair);
+    q.desk_pubkey = Some(hex::encode(keypair.x_only_public_key().0.serialize()));
+    q.desk_signature = Some(hex::encode(sig.as_ref()));
+}
+
+/// Check a quote's BIP340 signature against the key it names. Callers must
+/// still check that the key belongs to the desk in `lp_id`.
+pub fn verify_quote_signature(q: &Quote) -> Result<(), String> {
+    let pk = q.desk_pubkey.as_deref().ok_or("quote is not signed")?;
+    let sig = q.desk_signature.as_deref().ok_or("quote is not signed")?;
+    let pk = hex::decode(pk)
+        .ok()
+        .and_then(|b| bitcoin::secp256k1::XOnlyPublicKey::from_slice(&b).ok())
+        .ok_or("desk_pubkey is not an x-only key")?;
+    let sig = hex::decode(sig)
+        .ok()
+        .and_then(|b| bitcoin::secp256k1::schnorr::Signature::from_slice(&b).ok())
+        .ok_or("desk_signature is not a 64-byte Schnorr signature")?;
+    let msg = bitcoin::secp256k1::Message::from_digest(quote_commitment(q));
+    Secp256k1::verification_only()
+        .verify_schnorr(&sig, &msg, &pk)
+        .map_err(|_| "signature does not match the quote's terms".to_string())
+}
+
 /// Fee for `vbytes` at `msat_vb` milli-sat/vB, rounded up.
 fn fee_at(msat_vb: u64, vbytes: u64) -> u64 {
     (msat_vb * vbytes).div_ceil(1_000)
@@ -915,6 +979,64 @@ impl Engine {
         v
     }
 
+    /// Is this a genuine quote from one of our desks?
+    pub fn verify_quote(&self, q: &Quote) -> serde_json::Value {
+        let signature = verify_quote_signature(q);
+        let desk_key = self
+            .lp_wallet(&q.lp_id)
+            .ok()
+            .map(|w| hex::encode(xonly_from_secret(&w.secret)));
+        let key_matches = desk_key.is_some() && desk_key.as_deref() == q.desk_pubkey.as_deref();
+        serde_json::json!({
+            "valid": signature.is_ok() && key_matches,
+            "signature_ok": signature.is_ok(),
+            "signed_by_desk": key_matches,
+            "desk": q.lp_id,
+            "reason": signature.err().or_else(|| (!key_matches).then(|| format!("key is not desk {}'s", q.lp_id))),
+        })
+    }
+
+    /// A user brings a signed quote: did the desk honour it? Checks the
+    /// signature, then compares the swap opened from it with the signed terms
+    /// and reports any recorded default.
+    pub async fn dispute(&self, q: &Quote) -> serde_json::Value {
+        let mut verdict = self.verify_quote(q);
+        let swap = self
+            .inner
+            .read()
+            .await
+            .swaps
+            .values()
+            .find(|s| s.quote_id == q.id)
+            .cloned();
+        let Some(s) = swap else {
+            verdict["swap"] = serde_json::Value::Null;
+            verdict["finding"] = "no swap was opened from this quote".into();
+            return verdict;
+        };
+        let pay_same = serde_json::to_value(&s.pay).ok() == serde_json::to_value(&q.pay).ok();
+        let honoured = s.amount_sats == q.amount_sats
+            && s.fee_sats == q.fee_sats
+            && s.receive_sats == q.receive_sats
+            && s.lp_id == q.lp_id
+            && pay_same;
+        verdict["swap"] = serde_json::json!({
+            "id": s.id,
+            "status": s.status,
+            "desk_defaulted": s.desk_defaulted,
+            "compensation_sats": s.compensation_sats,
+            "compensation_vtxo_id": s.compensation_vtxo_id,
+        });
+        verdict["terms_honoured"] = honoured.into();
+        verdict["finding"] = match (verdict["valid"].as_bool() == Some(true), honoured, s.desk_defaulted) {
+            (false, _, _) => "the quote is not a valid desk signature; nothing is proven".into(),
+            (true, false, _) => "the swap's terms differ from what the desk signed".into(),
+            (true, true, true) => "terms were honoured but the desk defaulted on settlement".into(),
+            (true, true, false) => "the desk honoured the signed terms".into(),
+        };
+        verdict
+    }
+
     pub async fn get_swap(&self, id: Uuid) -> Result<Swap, Error> {
         self.inner
             .read()
@@ -1335,7 +1457,7 @@ impl Engine {
             terms.timeout_height,
             quote_id,
         )?;
-        let quote = Quote {
+        let mut quote = Quote {
             id: quote_id,
             side: req.side,
             amount_sats: leg.amount_sats,
@@ -1356,7 +1478,10 @@ impl Engine {
             rfq_id: leg.rfq_id,
             lock_by_height: terms.lock_by_height,
             plan_id: leg.plan_id,
+            desk_pubkey: None,
+            desk_signature: None,
         };
+        sign_quote(&mut quote, &self.lp_wallet(lp_id)?.secret);
         debit_lp(
             &mut inner.lps,
             &quote.lp_id,
@@ -5802,5 +5927,47 @@ mod tests {
         assert_eq!(alpha["swaps_settled"], 2);
         assert_eq!(st["time"]["vault_exit_blocks"], VAULT_EXIT_BLOCKS);
         assert!(st["time"]["avg_settle_secs"].as_i64().is_some());
+    }
+
+    #[tokio::test]
+    async fn quotes_are_signed_and_survive_a_json_round_trip() {
+        let e = engine();
+        let q = e.create_quote(in_req(100_000, None)).await.unwrap();
+        // What the user holds is the JSON the API returned.
+        let back: Quote = serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
+        let v = e.verify_quote(&back);
+        assert_eq!(v["valid"], true, "{v}");
+
+        let mut tampered = back.clone();
+        tampered.fee_sats -= 1;
+        let v = e.verify_quote(&tampered);
+        assert_eq!(v["valid"], false);
+        assert_eq!(v["signature_ok"], false);
+
+        // A valid signature from the wrong key does not count as the desk's.
+        let mut forged = back.clone();
+        sign_quote(&mut forged, &generate_keypair().secret);
+        let v = e.verify_quote(&forged);
+        assert_eq!(v["signature_ok"], true);
+        assert_eq!(v["signed_by_desk"], false);
+        assert_eq!(v["valid"], false);
+    }
+
+    #[tokio::test]
+    async fn disputes_compare_the_swap_with_the_signed_terms() {
+        let e = engine();
+        let q = e.create_quote(in_req(100_000, None)).await.unwrap();
+        let none = e.dispute(&q).await;
+        assert!(none["finding"].as_str().unwrap().contains("no swap"));
+
+        let s = e.open_swap(q.id).await.unwrap();
+        let ok = e.dispute(&q).await;
+        assert_eq!(ok["terms_honoured"], true, "{ok}");
+
+        // Had the desk quietly changed the fee, the signed quote proves it.
+        e.inner.write().await.swaps.get_mut(&s.id).unwrap().fee_sats += 500;
+        let bad = e.dispute(&q).await;
+        assert_eq!(bad["terms_honoured"], false);
+        assert!(bad["finding"].as_str().unwrap().contains("differ"));
     }
 }
