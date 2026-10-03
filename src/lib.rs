@@ -10,6 +10,7 @@ pub mod faucet;
 pub mod htlc;
 pub mod lightning;
 pub mod model;
+pub mod store;
 pub mod tachi;
 pub mod tachi_tx;
 pub mod vault;

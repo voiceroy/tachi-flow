@@ -9,5 +9,8 @@ tachi-lp-alpha.secret
 tachi-lp-bravo.secret
 tachi-flow-state.json
 tachi-flow-state.json.tmp
+tachi-flow-state.db
+tachi-flow-state.db-wal
+tachi-flow-state.db-shm
 tachi-flow-admin.token
 tachi-escrow.secret

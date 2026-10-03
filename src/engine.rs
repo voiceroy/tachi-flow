@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +32,7 @@ use crate::model::{
     Quote, Rebalance, RebalanceStatus, Side, Swap, SwapStatus, WebhookRequest, fee_sats,
     Bond, BondStatus,
 };
+use crate::store::Store;
 use crate::tachi::TachiClient;
 use crate::vault::{ExpectedToLocalSpend, ToLocal, parse_to_local, sorted_quorum, vault_id};
 use crate::tachi_tx::{
@@ -429,7 +429,7 @@ pub struct Engine {
     /// Fee rate for the desk's own L1 txs, in milli-sat/vB (refreshed with
     /// the height; never below `MIN_FEE_RATE_MSAT_VB`).
     fee_rate: Arc<AtomicU64>,
-    persist: Option<PathBuf>,
+    persist: Option<Arc<Store>>,
     /// Serialises snapshot + write so an older snapshot never lands last.
     persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// One in-flight operation per swap. Anything that moves money holds it.
@@ -627,28 +627,63 @@ impl Engine {
     /// Load/save quotes, swaps, and HTLC preimages across restarts. A file that
     /// exists but does not parse is an error: starting empty would drop every
     /// preimage the desk needs to claim.
-    pub fn with_persist(mut self, path: impl AsRef<Path>) -> Result<Self, Error> {
-        self.persist = Some(path.as_ref().to_path_buf());
-        self.load_state()?;
+    pub fn with_persist(self, path: impl AsRef<Path>) -> Result<Self, Error> {
+        self.with_persist_migrating(path, None::<&Path>)
+    }
+
+    /// Persist to `path` (SQLite for `.db`/`.sqlite`, else a JSON file). If
+    /// that store is empty and `import_from` (an older JSON state file)
+    /// exists, its state is loaded and written into the new store at once.
+    pub fn with_persist_migrating(
+        mut self,
+        path: impl AsRef<Path>,
+        import_from: Option<impl AsRef<Path>>,
+    ) -> Result<Self, Error> {
+        let store = Store::open(&path)?;
+        let mut doc = self.read_store(&store)?;
+        if doc.is_none()
+            && let Some(old) = import_from
+            && old.as_ref().exists()
+        {
+            let legacy = Store::open(old.as_ref())?;
+            doc = self.read_store(&legacy)?;
+            if let Some(doc) = &doc {
+                store.save(doc)?;
+                tracing::info!(
+                    from = %old.as_ref().display(),
+                    to = %store.path().display(),
+                    "imported state into the new store (the old file is left in place)"
+                );
+            }
+        }
+        if let Some(doc) = doc {
+            self.load_state(doc, store.path())?;
+        }
+        self.persist = Some(Arc::new(store));
         Ok(self)
     }
 
-    fn load_state(&self) -> Result<(), Error> {
-        let Some(path) = &self.persist else {
-            return Ok(());
-        };
-        let raw = match std::fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(Error::Invalid(format!("read {}: {err}", path.display()))),
-        };
+    /// Which store backs this engine (`json`, `sqlite`, or `none`).
+    pub fn storage_kind(&self) -> &'static str {
+        self.persist.as_ref().map_or("none", |s| s.kind())
+    }
+
+    fn read_store(&self, store: &Store) -> Result<Option<serde_json::Value>, Error> {
+        store.load().map_err(|err| {
+            Error::Invalid(format!(
+                "{err}. The state holds HTLC preimages; repair it or move it aside before starting"
+            ))
+        })
+    }
+
+    fn load_state(&self, doc: serde_json::Value, path: &Path) -> Result<(), Error> {
         let corrupt = |why: String| {
             Error::Invalid(format!(
                 "{} is unreadable ({why}). It holds HTLC preimages; repair it or move it aside before starting",
                 path.display()
             ))
         };
-        let file: PersistFile = serde_json::from_str(&raw).map_err(|e| corrupt(e.to_string()))?;
+        let file: PersistFile = serde_json::from_value(doc).map_err(|e| corrupt(e.to_string()))?;
         let preimages = file
             .preimages
             .into_iter()
@@ -703,22 +738,22 @@ impl Engine {
     }
 
     async fn save_state(&self) {
-        let Some(path) = self.persist.clone() else {
+        let Some(store) = self.persist.clone() else {
             return;
         };
         let _writer = self.persist_lock.lock().await;
-        let json = {
+        let doc = {
             let inner = self.inner.read().await;
-            serde_json::to_vec_pretty(&PersistFile::from(&*inner))
+            serde_json::to_value(PersistFile::from(&*inner))
         };
-        let json = match json {
-            Ok(json) => json,
+        let doc = match doc {
+            Ok(doc) => doc,
             Err(err) => {
                 tracing::error!(%err, "persist encode");
                 return;
             }
         };
-        match tokio::task::spawn_blocking(move || write_atomic(&path, &json)).await {
+        match tokio::task::spawn_blocking(move || store.save(&doc)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => tracing::error!(%err, "persist write"),
             Err(err) => tracing::error!(%err, "persist task"),
@@ -1041,6 +1076,7 @@ impl Engine {
                 "moved_sats": inner.rebalances.iter().filter(|r| r.status == RebalanceStatus::Done).map(|r| r.sats).sum::<u64>(),
             },
             "fee_rate_sat_vb": self.fee_rate_msat_vb() as f64 / 1_000.0,
+            "storage": self.storage_kind(),
         })
     }
 
@@ -4628,16 +4664,6 @@ fn tx_inputs(hex_tx: &str) -> Result<Vec<OutPoint>, Error> {
     Ok(tx.input.iter().map(|i| i.previous_output).collect())
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
-}
-
 /// Which swaps the background pass still has work on.
 fn needs_sync(s: &Swap) -> bool {
     match (s.side, s.status) {
@@ -4783,7 +4809,10 @@ fn reserved(inner: &Inner, lp_id: &str) -> (u64, u64) {
 
 #[derive(Serialize, Deserialize)]
 struct PersistFile {
+    // Every field defaults: SQLite stores no rows for an empty collection.
+    #[serde(default)]
     quotes: Vec<Quote>,
+    #[serde(default)]
     swaps: Vec<Swap>,
     #[serde(default)]
     baseline_vtxos: HashMap<Uuid, Vec<String>>,
@@ -5893,6 +5922,48 @@ mod tests {
             .err()
             .expect("corrupt file must not start empty");
         assert!(err.to_string().contains("preimages"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_imports_json_and_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("tachi-flow-test-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json, db) = (dir.join("state.json"), dir.join("state.db"));
+        let tachi = TachiClient::new("http://127.0.0.1:9").expect("client");
+        let fresh = || Engine::from_lp_secret_mode(tachi.clone(), Network::Signet, generate_keypair().secret, true);
+        let user = generate_keypair();
+        let in_quote = |amount_sats| CreateQuoteRequest {
+            side: Side::In,
+            amount_sats,
+            user_tachi_address: Some("tb1ptest".into()),
+            user_l1_address: None,
+            user_refund_pubkey_hex: Some(user.public.to_string()),
+            ttl_secs: None,
+            deadline_blocks: None,
+        };
+
+        // An older JSON-backed desk with one open swap.
+        let old = fresh().with_persist(&json).unwrap();
+        let q = old.create_quote(in_quote(10_000)).await.unwrap();
+        let first = old.open_swap(q.id).await.unwrap();
+
+        // First start on SQLite imports it, then keeps saving there.
+        let e = fresh().with_persist_migrating(&db, Some(&json)).unwrap();
+        assert_eq!(e.storage_kind(), "sqlite");
+        assert!(e.inner.read().await.preimages.contains_key(&first.id));
+        let q = e.create_quote(in_quote(20_000)).await.unwrap();
+        let second = e.open_swap(q.id).await.unwrap();
+        drop(e);
+
+        // The JSON file is untouched; the database has both swaps.
+        let again = fresh().with_persist_migrating(&db, Some(&json)).unwrap();
+        let inner = again.inner.read().await;
+        assert!(inner.swaps.contains_key(&first.id) && inner.swaps.contains_key(&second.id));
+        assert!(inner.preimages.contains_key(&second.id));
+        drop(inner);
+        let from_json = fresh().with_persist(&json).unwrap();
+        assert!(!from_json.inner.read().await.swaps.contains_key(&second.id));
         std::fs::remove_dir_all(&dir).ok();
     }
 

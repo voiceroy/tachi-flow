@@ -25,7 +25,7 @@ Optional outbound: quote **out** (same identity). Accept — the desk funds an H
 
 **Refund / cancel** cancels a swap before any bitcoin is locked. If you already paid an inbound lock and the desk did not settle, the same button refunds it on-chain once the lock's timeout block has passed.
 
-Swaps survive `cargo run` restarts (`tachi-flow-state.json`, gitignored). Empty LP books get a demo VTXO deposit on startup.
+Swaps survive `cargo run` restarts. State lives in SQLite (`tachi-flow-state.db`, gitignored): one row per swap, quote, advance, bond and so on, and each save writes only the rows that changed, in one WAL transaction with full sync. On first start an existing `tachi-flow-state.json` is imported (and left in place). `STATE_PATH=….json` keeps the old single-file JSON store. Empty LP books get a demo VTXO deposit on startup.
 
 ## What the vault can't do
 
@@ -65,6 +65,7 @@ Env:
 | `LND_REST_URL` | unset = Lightning off |
 | `LND_MACAROON_HEX` / `LND_MACAROON_PATH` | required with `LND_REST_URL` |
 | `LND_TLS_CERT_PATH` | LND's self-signed cert, if not publicly trusted |
+| `STATE_PATH` | `tachi-flow-state.db` (SQLite); a `.json` path uses the JSON file store |
 | `VAULT_ADVANCE_UNRECEIPTED` | unset = advance only on vault refunds the watchtower classified `legitimate`; `1` = also without a receipt, at +2% discount |
 
 LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `tachi-lp.secret`). Bond escrow: `tachi-escrow.secret`.
@@ -100,7 +101,7 @@ Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>
 - Desks spend their own unconfirmed change. Outputs a desk's broadcasts pay back to it (change, claims, refunds) are spendable at once, after a mempool check, so back-to-back exits don't wait for a block. Books count confirmed coins not already spent in the mempool, plus that pending change.
 - Desk fees follow bitcoind's `estimatesmartfee` (6-block target, floor 2 sat/vB, shown in `/v1/meta`), sized by each tx's estimated vsize. This covers funding sends, inbound claims and refunds. Claims and funding txs signal RBF. If a desk's inbound claim is still unconfirmed 6 blocks before the HTLC timeout, it is re-signed at double the fee (capped at half the lock) and re-sent, as is a claim the mempool dropped. A user's outbound claim keeps the fixed 500-sat cushion built into the desk's lock; the server cannot re-sign it later because it never keeps the user's key.
 - Holding stock is capped so nobody can freeze the desks for free. Per client (peer IP; the admin token is exempt): at most 6 open quotes or unpaid swaps and 4M sats of stock held, else `429`. A quote for more than a quarter of a desk's free stock stays firm for at most 120 s. An opened swap nobody pays within an hour (and 6 blocks past any deadline) expires and releases its stock.
-- State is written atomically. A corrupt `tachi-flow-state.json` stops startup instead of silently dropping preimages.
+- State is written atomically (one SQLite transaction, or a rename for JSON). A corrupt store stops startup instead of silently dropping preimages.
 
 ## Honest limits
 

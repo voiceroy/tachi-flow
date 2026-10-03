@@ -48,7 +48,10 @@ async fn main() -> std::io::Result<()> {
             ],
         )
         .with_escrow(load_or_create_secret("tachi-escrow.secret", ""))
-        .with_persist("tachi-flow-state.json")
+        .with_persist_migrating(
+            env::var("STATE_PATH").unwrap_or_else(|_| "tachi-flow-state.db".into()),
+            Some("tachi-flow-state.json"),
+        )
         .unwrap_or_else(|err| panic!("{err}"))
     };
     let lightning = tachi_flow::lightning::LightningNode::from_env()
