@@ -91,6 +91,33 @@ impl TachiClient {
         Ok(payload.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// `estimatesmartfee` in sat/vB, `None` when the node has no estimate.
+    pub async fn estimate_fee_rate(&self, target_blocks: u32) -> Result<Option<f64>, Error> {
+        let result = self
+            .bitcoin_rpc("estimatesmartfee", serde_json::json!([target_blocks]))
+            .await?;
+        // BTC per kvB → sat per vB.
+        Ok(result
+            .get("feerate")
+            .and_then(Value::as_f64)
+            .map(|btc_per_kvb| btc_per_kvb * 100_000_000.0 / 1_000.0))
+    }
+
+    /// Confirmations of a tx: `Some(0)` in the mempool, `None` if the node
+    /// does not know it (never sent, or evicted).
+    pub async fn tx_confirmations(&self, txid: &str) -> Result<Option<u32>, Error> {
+        match self
+            .bitcoin_rpc("getrawtransaction", serde_json::json!([txid, true]))
+            .await
+        {
+            Ok(tx) => Ok(Some(
+                tx.get("confirmations").and_then(Value::as_u64).unwrap_or(0) as u32,
+            )),
+            Err(Error::TachiRejected(why)) if why.contains("-5") || why.contains("No such") => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn block_height(&self) -> Result<u32, Error> {
         let info = self
             .bitcoin_rpc("getblockchaininfo", serde_json::json!([]))

@@ -237,6 +237,13 @@ pub struct Swap {
     pub compensation_sats: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compensation_vtxo_id: Option<String>,
+    /// Value of the user's inbound lock, kept so a stuck desk claim can be
+    /// re-signed at a higher fee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_lock_value_sats: Option<u64>,
+    /// The desk's inbound claim has at least one confirmation.
+    #[serde(default)]
+    pub claim_confirmed: bool,
 }
 
 /// A desk buying a maturing timelocked output for bitcoin now (claim advance).

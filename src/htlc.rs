@@ -89,7 +89,18 @@ pub fn random_preimage() -> [u8; 32] {
     sk.secret_bytes()
 }
 
-/// Sign a P2WSH claim (IF branch: preimage + claimer signature).
+/// Rough vsize of an HTLC claim or refund: one P2WSH input with the redeem
+/// script, signature and (for a claim) preimage, and one output.
+pub const HTLC_SPEND_VBYTES: u64 = 150;
+
+/// Rough vsize of a P2WPKH wallet send.
+pub fn p2wpkh_send_vbytes(inputs: usize, outputs: usize) -> u64 {
+    // 11 overhead, 68 per P2WPKH input, 43 per output (P2WSH; P2WPKH is 31).
+    11 + 68 * inputs as u64 + 43 * outputs as u64
+}
+
+/// Sign a P2WSH claim (IF branch: preimage + claimer signature). Signals
+/// RBF so a stuck claim can be fee-bumped before the refund path opens.
 pub fn claim_tx_hex(
     funding: OutPoint,
     value_sats: u64,
@@ -107,7 +118,7 @@ pub fn claim_tx_hex(
         claimer_secret,
         destination,
         LockTime::ZERO,
-        Sequence::MAX,
+        Sequence::ENABLE_RBF_NO_LOCKTIME,
         &[preimage.as_slice(), &[1u8]],
     )
 }
@@ -272,7 +283,7 @@ pub fn p2wpkh_send_many_hex(
             .map(|(op, _)| TxIn {
                 previous_output: *op,
                 script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             })
             .collect(),

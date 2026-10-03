@@ -76,6 +76,8 @@ struct Meta {
     deadline_presets: [u32; 6],
     /// Tachi key holding desk bonds (custodial escrow).
     escrow_pubkey: String,
+    /// Fee rate the desks use for their own L1 txs.
+    fee_rate_sat_vb: f64,
     lightning: bool,
 }
 
@@ -144,6 +146,7 @@ async fn meta(engine: web::Data<Engine>) -> HttpResponse {
         pricing: engine.pricing(),
         deadline_presets: DEADLINE_PRESETS,
         escrow_pubkey: engine.escrow_pubkey_hex(),
+        fee_rate_sat_vb: engine.fee_rate_msat_vb() as f64 / 1_000.0,
         lightning: engine.lightning_enabled(),
     })
 }

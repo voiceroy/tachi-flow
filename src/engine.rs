@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bitcoin::absolute::LockTime;
@@ -20,9 +20,9 @@ use crate::advance::{
 use crate::error::Error;
 use crate::events::{Event, MAX_WEBHOOKS, validate_webhook_url};
 use crate::htlc::{
-    claim_tx_hex, generate_keypair, p2wpkh_address, p2wpkh_send_hex, p2wpkh_send_many_hex,
-    p2wsh_address, parse_txid,
-    payment_hash, pubkey_from_hex, random_preimage, redeem_script, refund_tx_hex, txid_of_hex,
+    HTLC_SPEND_VBYTES, claim_tx_hex, generate_keypair, p2wpkh_address, p2wpkh_send_hex,
+    p2wpkh_send_many_hex, p2wpkh_send_vbytes, p2wsh_address, parse_txid, payment_hash,
+    pubkey_from_hex, random_preimage, redeem_script, refund_tx_hex, txid_of_hex,
 };
 use crate::lightning::{InvoiceState, LightningNode};
 use crate::model::{
@@ -82,6 +82,12 @@ const LARGE_QUOTE_MAX_TTL_SECS: u64 = 120;
 const UNPAID_SWAP_SECS: i64 = 60 * 60;
 /// Deadline swaps are only "unpaid" this many blocks past their deadline.
 const UNPAID_SWAP_BLOCKS: u32 = 6;
+/// Fee-rate floor for the desk's own L1 txs (2 sat/vB).
+const MIN_FEE_RATE_MSAT_VB: u64 = 2_000;
+/// Confirmation target asked of `estimatesmartfee`.
+const FEE_TARGET_BLOCKS: u32 = 6;
+/// Bump a desk claim that is still unconfirmed this close to the timeout.
+const BUMP_BEFORE_TIMEOUT_BLOCKS: u32 = 6;
 
 /// Knobs for [`price`]. All values are parts per million.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -217,6 +223,18 @@ impl LpSpend {
     }
 }
 
+/// Fee for `vbytes` at `msat_vb` milli-sat/vB, rounded up.
+fn fee_at(msat_vb: u64, vbytes: u64) -> u64 {
+    (msat_vb * vbytes).div_ceil(1_000)
+}
+
+/// Fee for the next attempt at a stuck claim: double the last one, but never
+/// more than half of what the claim is worth. `None` once that cap is hit.
+fn bumped_fee(previous_fee: u64, value_sats: u64) -> Option<u64> {
+    let next = previous_fee.saturating_mul(2).min(value_sats / 2);
+    (next > previous_fee).then_some(next)
+}
+
 /// Outputs of `hex_tx` paying `spk`, as (outpoint, value).
 fn outputs_to(hex_tx: &str, spk: &ScriptBuf) -> Vec<(OutPoint, u64)> {
     let Some(tx) = hex::decode(hex_tx)
@@ -293,6 +311,9 @@ pub struct Engine {
     test_mode: bool,
     /// Last Bitcoin height from Tachi; 0 until the first successful fetch.
     height: Arc<AtomicU32>,
+    /// Fee rate for the desk's own L1 txs, in milli-sat/vB (refreshed with
+    /// the height; never below `MIN_FEE_RATE_MSAT_VB`).
+    fee_rate: Arc<AtomicU64>,
     persist: Option<PathBuf>,
     /// Serialises snapshot + write so an older snapshot never lands last.
     persist_lock: Arc<tokio::sync::Mutex<()>>,
@@ -397,6 +418,7 @@ impl Engine {
             wallets,
             test_mode,
             height: Arc::new(AtomicU32::new(if test_mode { SIM_HEIGHT } else { 0 })),
+            fee_rate: Arc::new(AtomicU64::new(MIN_FEE_RATE_MSAT_VB)),
             persist: None,
             persist_lock: Arc::default(),
             swap_locks: Arc::default(),
@@ -628,6 +650,24 @@ impl Engine {
             Ok(h) => self.height.store(h, Ordering::Relaxed),
             Err(err) => tracing::warn!(%err, "block height"),
         }
+        match self.tachi.estimate_fee_rate(FEE_TARGET_BLOCKS).await {
+            Ok(Some(rate)) => {
+                let msat = ((rate * 1_000.0) as u64).max(MIN_FEE_RATE_MSAT_VB);
+                self.fee_rate.store(msat, Ordering::Relaxed);
+            }
+            Ok(None) => {}
+            Err(err) => tracing::debug!(%err, "fee estimate"),
+        }
+    }
+
+    /// Current fee rate, milli-sat/vB.
+    pub fn fee_rate_msat_vb(&self) -> u64 {
+        self.fee_rate.load(Ordering::Relaxed)
+    }
+
+    /// Fee for a tx of `vbytes` at the current rate.
+    fn fee_for(&self, vbytes: u64) -> u64 {
+        fee_at(self.fee_rate_msat_vb(), vbytes)
     }
 
     /// Height used for HTLC timeouts. Never a made-up number on a live chain.
@@ -1347,6 +1387,8 @@ impl Engine {
             desk_defaulted: false,
             compensation_sats: None,
             compensation_vtxo_id: None,
+            l1_lock_value_sats: None,
+            claim_confirmed: false,
         };
 
         if let Some(preimage) = inner.preimages.remove(&quote.id) {
@@ -1920,7 +1962,7 @@ impl Engine {
                 vout: funding.vout,
             },
             funding.value_sats,
-            CLAIM_FEE_SATS,
+            self.fee_for(HTLC_SPEND_VBYTES).min(funding.value_sats / 2),
             &redeem_from_hex(&htlc.redeem_script_hex)?,
             &preimage,
             &w.secret,
@@ -1950,6 +1992,7 @@ impl Engine {
             .update_swap(id, |s| {
                 s.status = SwapStatus::LpSettled;
                 s.l1_lock_txid = Some(funding.txid.clone());
+                s.l1_lock_value_sats = Some(funding.value_sats);
                 s.claim_tx_hex = Some(claim_hex);
                 match payout {
                     Some(p) => {
@@ -2274,6 +2317,74 @@ impl Engine {
         .await
     }
 
+    /// The desk has already paid VTXOs for an inbound lock; if its claim is
+    /// still unconfirmed this close to the timeout, the user could refund the
+    /// lock and keep both. Re-sign the claim at a higher fee (RBF) until it
+    /// confirms, and re-send it if the mempool dropped it.
+    async fn bump_desk_claim(&self, swap: &Swap, height: u32) -> Result<(), Error> {
+        let (Some(hex), Some(value), Some(lock)) = (
+            swap.claim_tx_hex.clone(),
+            swap.l1_lock_value_sats,
+            swap.pay.htlc(),
+        ) else {
+            return Ok(());
+        };
+        let txid = txid_of_hex(&hex)?.to_string();
+        match self.tachi.tx_confirmations(&txid).await? {
+            Some(c) if c > 0 => {
+                self.update_swap(swap.id, |s| s.claim_confirmed = true).await?;
+                return Ok(());
+            }
+            None => {
+                if let Err(err) = self.broadcast_l1(&hex).await {
+                    tracing::warn!(%err, id = %swap.id, "re-send dropped claim");
+                }
+                return Ok(());
+            }
+            Some(_) => {}
+        }
+        if height + BUMP_BEFORE_TIMEOUT_BLOCKS < lock.timeout_height {
+            return Ok(());
+        }
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(
+            &hex::decode(&hex).map_err(|e| Error::Invalid(e.to_string()))?,
+        )
+        .map_err(|e| Error::Bitcoin(e.to_string()))?;
+        let paid_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let Some(fee) = bumped_fee(value.saturating_sub(paid_out), value) else {
+            tracing::warn!(id = %swap.id, "claim fee already at its cap; not bumping");
+            return Ok(());
+        };
+        let preimage = self
+            .inner
+            .read()
+            .await
+            .preimages
+            .get(&swap.id)
+            .copied()
+            .ok_or_else(|| Error::Invalid("missing inbound preimage".into()))?;
+        let w = self.lp_wallet(&swap.lp_id)?;
+        let bumped = claim_tx_hex(
+            tx.input[0].previous_output,
+            value,
+            fee,
+            &redeem_from_hex(&lock.redeem_script_hex)?,
+            &preimage,
+            &w.secret,
+            &w.claim_address,
+        )?;
+        let new_txid = self.broadcast_l1(&bumped).await?;
+        tracing::info!(id = %swap.id, fee, %new_txid, "bumped desk claim");
+        self.update_swap(swap.id, |s| {
+            s.claim_tx_hex = Some(bumped);
+            s.demo_note = Some(format!(
+                "Desk claim was slow to confirm near the timeout; re-sent at {fee} sats fee ({new_txid})."
+            ));
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Desk takes back an outbound lock the user never paid for, after timeout.
     async fn lp_refund_outbound(&self, swap: &Swap, height: u32) -> Result<(), Error> {
         let Some(lock) = swap.pay.htlc() else {
@@ -2293,7 +2404,7 @@ impl Engine {
                 vout: funding.vout,
             },
             funding.value_sats,
-            CLAIM_FEE_SATS,
+            self.fee_for(HTLC_SPEND_VBYTES).min(funding.value_sats / 2),
             &redeem_from_hex(&lock.redeem_script_hex)?,
             LockTime::from_height(lock.timeout_height).map_err(|e| Error::Bitcoin(e.to_string()))?,
             &w.secret,
@@ -2756,6 +2867,9 @@ impl Engine {
             (Side::In, SwapStatus::LpSettled) => {
                 self.claim_inbound_inner(id).await?;
             }
+            (Side::In, SwapStatus::Claimed) => {
+                self.bump_desk_claim(&before, h).await?;
+            }
             (Side::Out, SwapStatus::Quoted) => {
                 if let Err(err) = self.fund_outbound_lock(id).await {
                     tracing::warn!(%id, %err, "outbound lock");
@@ -2897,7 +3011,8 @@ impl Engine {
             .into_iter()
             .map(|u| Ok((OutPoint { txid: parse_txid(&u.txid)?, vout: u.vout }, u.value_sats)))
             .collect::<Result<Vec<_>, Error>>()?;
-        let need = amount_sats + CLAIM_FEE_SATS;
+        // The fee grows with each input picked (outputs + change).
+        let fee_with = |inputs: usize| self.fee_for(p2wpkh_send_vbytes(inputs, outputs.len() + 1));
         let mut picked: Vec<(OutPoint, u64)> = Vec::new();
         let mut total = 0u64;
         for (op, value) in spend.spendable_l1(&confirmed) {
@@ -2914,7 +3029,7 @@ impl Engine {
             }
             picked.push((op, value));
             total += value;
-            if total >= need {
+            if total >= amount_sats + fee_with(picked.len()) {
                 break;
             }
         }
@@ -2922,7 +3037,7 @@ impl Engine {
         let hex = p2wpkh_send_many_hex(
             &picked,
             &outputs,
-            CLAIM_FEE_SATS,
+            fee_with(picked.len()),
             &w.claim_address,
             &w.secret,
             self.network,
@@ -3779,6 +3894,10 @@ fn needs_sync(s: &Swap) -> bool {
             if s.l1_lock_txid.is_some() && s.refund_txid.is_none() =>
         {
             true
+        }
+        // Watch the desk's claim until it confirms, to bump it if it stalls.
+        (Side::In, SwapStatus::Claimed) => {
+            !s.claim_confirmed && s.claim_tx_hex.is_some() && s.l1_lock_value_sats.is_some()
         }
         _ => compensation_owed(s),
     }
@@ -5514,5 +5633,41 @@ mod tests {
         assert_eq!(mine[0].0.vout, 1);
         assert_eq!(mine[0].1, 100_000 - 30_000 - 500);
         assert_eq!(mine[0].0.txid, txid_of_hex(&hex).unwrap());
+    }
+
+    #[test]
+    fn fees_follow_rate_and_size_and_bumps_are_capped() {
+        // 2 sat/vB on a 1-in/2-out send: (11 + 68 + 86) vB.
+        assert_eq!(fee_at(2_000, p2wpkh_send_vbytes(1, 2)), 330);
+        assert_eq!(fee_at(1_500, 3), 5, "rounds up");
+        assert_eq!(bumped_fee(300, 100_000), Some(600));
+        assert_eq!(bumped_fee(40_000, 100_000), Some(50_000), "capped at half");
+        assert_eq!(bumped_fee(50_000, 100_000), None, "nothing left to bump");
+    }
+
+    #[tokio::test]
+    async fn desk_claim_is_sized_by_fee_rate_and_signals_rbf() {
+        let e = engine();
+        let q = e.create_quote(in_req(100_000, None)).await.unwrap();
+        let s = e.open_swap(q.id).await.unwrap();
+        let settled = e
+            .observe_lock(
+                s.id,
+                ObserveLockRequest {
+                    txid: "ab".repeat(32),
+                    vout: 0,
+                    value_sats: 100_000,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled.l1_lock_value_sats, Some(100_000));
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(
+            &hex::decode(settled.claim_tx_hex.unwrap()).unwrap(),
+        )
+        .unwrap();
+        let fee = 100_000 - tx.output[0].value.to_sat();
+        assert_eq!(fee, fee_at(MIN_FEE_RATE_MSAT_VB, HTLC_SPEND_VBYTES));
+        assert!(tx.input[0].sequence.is_rbf(), "claim must be replaceable");
     }
 }
