@@ -29,7 +29,7 @@ use crate::model::{
     Advance, AdvanceAcceptRequest, AdvanceQuoteRequest, AdvanceStatus, CreatePlanRequest,
     CreateQuoteRequest, ExitPlan, HtlcLock, LiquidityProvider, LnDirection, LnQuoteRequest,
     LnStatus, LnSwap, ObserveLockRequest, ObserveVtxoRequest, PayInstructions, PriceBreakdown,
-    Quote, Side, Swap, SwapStatus, WebhookRequest, fee_sats,
+    Quote, Rebalance, RebalanceStatus, Side, Swap, SwapStatus, WebhookRequest, fee_sats,
 };
 use crate::tachi::TachiClient;
 use crate::tachi_tx::{
@@ -88,6 +88,13 @@ const MIN_FEE_RATE_MSAT_VB: u64 = 2_000;
 const FEE_TARGET_BLOCKS: u32 = 6;
 /// Bump a desk claim that is still unconfirmed this close to the timeout.
 const BUMP_BEFORE_TIMEOUT_BLOCKS: u32 = 6;
+/// Desks rebalance when one holds more than this share of its free books in
+/// VTXOs and another less than `REBALANCE_LOW_PPM`.
+const REBALANCE_HIGH_PPM: u64 = 700_000;
+const REBALANCE_LOW_PPM: u64 = 300_000;
+/// Most moved in one rebalance, and how often sync tries one.
+const REBALANCE_MAX_SATS: u64 = 1_000_000;
+const REBALANCE_INTERVAL_SECS: i64 = 10 * 60;
 
 /// Knobs for [`price`]. All values are parts per million.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -158,6 +165,10 @@ struct Inner {
     /// Who asked for each open quote / unpaid swap (by id), for the
     /// per-client caps. Not persisted: holds expire within the hour anyway.
     clients: HashMap<Uuid, String>,
+    rebalances: Vec<Rebalance>,
+    /// When the desks last tried to rebalance (in memory; a restart may run
+    /// one early, which is harmless).
+    last_rebalance: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -285,6 +296,36 @@ pub fn verify_quote_signature(q: &Quote) -> Result<(), String> {
     Secp256k1::verification_only()
         .verify_schnorr(&sig, &msg, &pk)
         .map_err(|_| "signature does not match the quote's terms".to_string())
+}
+
+/// VTXO share of a desk's free books, in ppm (500k when empty).
+fn vtxo_share_ppm(lp: &LiquidityProvider) -> u64 {
+    let total = lp.vtxo_sats + lp.l1_sats;
+    if total == 0 {
+        500_000
+    } else {
+        (u128::from(lp.vtxo_sats) * 1_000_000 / u128::from(total)) as u64
+    }
+}
+
+/// Which two desks should swap stock, and how much: the most VTXO-heavy desk
+/// above `REBALANCE_HIGH_PPM` sends VTXOs to the most L1-heavy desk below
+/// `REBALANCE_LOW_PPM`, which sends the same in L1 back. The amount moves both
+/// toward 50/50 without overshooting either, capped at `REBALANCE_MAX_SATS`.
+fn plan_rebalance(lps: &[LiquidityProvider]) -> Option<(String, String, u64)> {
+    let live: Vec<&LiquidityProvider> = lps.iter().filter(|lp| !lp.defaulted).collect();
+    let heavy = live
+        .iter()
+        .filter(|lp| vtxo_share_ppm(lp) > REBALANCE_HIGH_PPM)
+        .max_by_key(|lp| vtxo_share_ppm(lp))?;
+    let light = live
+        .iter()
+        .filter(|lp| lp.id != heavy.id && vtxo_share_ppm(lp) < REBALANCE_LOW_PPM)
+        .min_by_key(|lp| vtxo_share_ppm(lp))?;
+    let excess_vtxo = heavy.vtxo_sats.saturating_sub((heavy.vtxo_sats + heavy.l1_sats) / 2);
+    let excess_l1 = light.l1_sats.saturating_sub((light.vtxo_sats + light.l1_sats) / 2);
+    let sats = excess_vtxo.min(excess_l1).min(REBALANCE_MAX_SATS);
+    (sats >= MIN_SWAP_SATS).then(|| (heavy.id.clone(), light.id.clone(), sats))
 }
 
 /// Fee for `vbytes` at `msat_vb` milli-sat/vB, rounded up.
@@ -631,6 +672,7 @@ impl Engine {
         inner.pending_advance_txs = file.pending_advance_txs;
         inner.ln_swaps = file.ln_swaps.into_iter().map(|l| (l.id, l)).collect();
         inner.webhooks = file.webhooks;
+        inner.rebalances = file.rebalances;
         apply_desk_stats(&mut inner);
         tracing::info!(
             quotes = inner.quotes.len(),
@@ -969,6 +1011,11 @@ impl Engine {
             },
             "lightning_swaps": inner.ln_swaps.len(),
             "exit_plans": inner.plans.len(),
+            "rebalances": {
+                "done": inner.rebalances.iter().filter(|r| r.status == RebalanceStatus::Done).count(),
+                "pending_l1": inner.rebalances.iter().filter(|r| r.status == RebalanceStatus::PendingL1).count(),
+                "moved_sats": inner.rebalances.iter().filter(|r| r.status == RebalanceStatus::Done).map(|r| r.sats).sum::<u64>(),
+            },
             "fee_rate_sat_vb": self.fee_rate_msat_vb() as f64 / 1_000.0,
         })
     }
@@ -2951,6 +2998,124 @@ impl Engine {
     /// Background pass: settle what was paid, claim what was settled, expire
     /// what is too close to its timeout, and reclaim unpaid outbound locks.
     /// Swaps someone else is working on right now are skipped, not waited on.
+    pub async fn list_rebalances(&self) -> Vec<Rebalance> {
+        let mut v = self.inner.read().await.rebalances.clone();
+        v.sort_by_key(|r| std::cmp::Reverse(r.at));
+        v
+    }
+
+    /// Run one rebalance between desks if their books call for it. The VTXO
+    /// leg goes first; if the L1 leg back then fails, the rebalance stays
+    /// `pending_l1` and sync retries only that leg.
+    pub async fn rebalance(&self) -> Result<Option<Rebalance>, Error> {
+        self.inner.write().await.last_rebalance = Some(Utc::now());
+        if !self.test_mode {
+            self.refresh_live_inventory().await;
+        }
+        let plan = plan_rebalance(&self.inner.read().await.lps);
+        let Some((vtxo_from, l1_from, sats)) = plan else {
+            return Ok(None);
+        };
+        let id = Uuid::now_v7();
+        let vtxo_tx = if self.test_mode {
+            format!("sim-rebalance-vtxo-{id}")
+        } else {
+            let dest = hex::encode(xonly_from_secret(&self.lp_wallet(&l1_from)?.secret));
+            self.send_vtxo_from(&vtxo_from, &dest, sats).await?.tendermint_hash
+        };
+        let rb = Rebalance {
+            id,
+            vtxo_from: vtxo_from.clone(),
+            l1_from: l1_from.clone(),
+            sats,
+            status: RebalanceStatus::PendingL1,
+            vtxo_tx: Some(vtxo_tx),
+            l1_txid: None,
+            note: None,
+            at: Utc::now(),
+        };
+        self.inner.write().await.rebalances.push(rb);
+        self.save_state().await;
+        tracing::info!(%id, %vtxo_from, %l1_from, sats, "rebalance: VTXO leg sent");
+        self.finish_rebalance(id).await.map(Some)
+    }
+
+    /// Send (or retry) the L1 leg of a rebalance.
+    async fn finish_rebalance(&self, id: Uuid) -> Result<Rebalance, Error> {
+        let rb = self
+            .inner
+            .read()
+            .await
+            .rebalances
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+            .ok_or_else(|| Error::Invalid(format!("unknown rebalance {id}")))?;
+        if rb.status != RebalanceStatus::PendingL1 {
+            return Ok(rb);
+        }
+        let leg = if self.test_mode {
+            let mut inner = self.inner.write().await;
+            debit_lp(&mut inner.lps, &rb.vtxo_from, Side::In, rb.sats)?;
+            credit_lp(&mut inner.lps, &rb.l1_from, Side::In, rb.sats);
+            debit_lp(&mut inner.lps, &rb.l1_from, Side::Out, rb.sats)?;
+            credit_lp(&mut inner.lps, &rb.vtxo_from, Side::Out, rb.sats);
+            Ok(format!("sim-rebalance-l1-{id}"))
+        } else {
+            let to = self.lp_wallet(&rb.vtxo_from)?.claim_address.to_string();
+            match self.sign_l1_payment(&rb.l1_from, &[(to, rb.sats)]).await {
+                Ok((hex, _)) => self.broadcast_l1(&hex).await,
+                Err(err) => Err(err),
+            }
+        };
+        let rb = {
+            let mut inner = self.inner.write().await;
+            let r = inner
+                .rebalances
+                .iter_mut()
+                .find(|r| r.id == id)
+                .ok_or_else(|| Error::Invalid(format!("unknown rebalance {id}")))?;
+            match &leg {
+                Ok(txid) => {
+                    r.status = RebalanceStatus::Done;
+                    r.l1_txid = Some(txid.clone());
+                    r.note = None;
+                }
+                Err(err) => r.note = Some(format!("L1 leg not sent yet ({err}); retrying")),
+            }
+            r.clone()
+        };
+        self.save_state().await;
+        leg.map(|_| rb)
+    }
+
+    /// Sync hook: retry owed L1 legs, then rebalance if it has been a while.
+    async fn maybe_rebalance(&self) {
+        let pending: Vec<Uuid> = self
+            .inner
+            .read()
+            .await
+            .rebalances
+            .iter()
+            .filter(|r| r.status == RebalanceStatus::PendingL1)
+            .map(|r| r.id)
+            .collect();
+        for id in pending {
+            if let Err(err) = self.finish_rebalance(id).await {
+                tracing::warn!(%err, %id, "rebalance L1 leg");
+            }
+        }
+        let due = self
+            .inner
+            .read()
+            .await
+            .last_rebalance
+            .is_none_or(|t| Utc::now() - t > Duration::seconds(REBALANCE_INTERVAL_SECS));
+        if due && let Err(err) = self.rebalance().await {
+            tracing::warn!(%err, "rebalance");
+        }
+    }
+
     /// Opened but never paid: after `UNPAID_SWAP_SECS` the swap stops holding
     /// desk stock. An inbound lock nobody funded, or an outbound swap whose
     /// lock is up (and past any deadline) with no VTXOs sent.
@@ -3027,6 +3192,7 @@ impl Engine {
         self.release_unpaid_swaps().await;
         if !self.test_mode {
             self.fund_due_outbound_locks().await;
+            self.maybe_rebalance().await;
         }
         let ids: Vec<Uuid> = self
             .inner
@@ -4222,6 +4388,8 @@ struct PersistFile {
     ln_swaps: Vec<LnSwap>,
     #[serde(default)]
     webhooks: Vec<WebhookRequest>,
+    #[serde(default)]
+    rebalances: Vec<Rebalance>,
 }
 
 impl From<&Inner> for PersistFile {
@@ -4256,6 +4424,7 @@ impl From<&Inner> for PersistFile {
             pending_advance_txs: inner.pending_advance_txs.clone(),
             ln_swaps: inner.ln_swaps.values().cloned().collect(),
             webhooks: inner.webhooks.clone(),
+            rebalances: inner.rebalances.clone(),
         }
     }
 }
@@ -5969,5 +6138,44 @@ mod tests {
         let bad = e.dispute(&q).await;
         assert_eq!(bad["terms_honoured"], false);
         assert!(bad["finding"].as_str().unwrap().contains("differ"));
+    }
+
+    #[test]
+    fn rebalance_pairs_skewed_desks_without_overshooting() {
+        let heavy = lp("a", 100_000, 900_000, 8_000, None, None, "t");
+        let light = lp("b", 800_000, 200_000, 8_000, None, None, "t");
+        // a has 400k VTXO over balance, b has 300k L1 over: move 300k.
+        assert_eq!(
+            plan_rebalance(&[heavy.clone(), light.clone()]),
+            Some(("a".into(), "b".into(), 300_000))
+        );
+        // Balanced books: nothing to do.
+        let even = lp("c", 500_000, 500_000, 8_000, None, None, "t");
+        assert_eq!(plan_rebalance(&[heavy.clone(), even.clone()]), None);
+        // Big imbalances are moved in capped steps.
+        let huge = lp("d", 0, 50_000_000, 8_000, None, None, "t");
+        let deep = lp("e", 50_000_000, 0, 8_000, None, None, "t");
+        assert_eq!(plan_rebalance(&[huge, deep]).unwrap().2, REBALANCE_MAX_SATS);
+        // A banned desk never takes part.
+        let mut banned = light;
+        banned.defaulted = true;
+        assert_eq!(plan_rebalance(&[heavy, banned]), None);
+    }
+
+    #[tokio::test]
+    async fn rebalance_moves_stock_between_desks() {
+        let e = engine();
+        // alpha: 20M VTXO / 50k L1; bravo: 5M VTXO / 20M L1.
+        let rb = e.rebalance().await.unwrap().expect("skewed books rebalance");
+        assert_eq!((rb.vtxo_from.as_str(), rb.l1_from.as_str()), ("lp-alpha", "lp-bravo"));
+        assert_eq!(rb.status, RebalanceStatus::Done);
+        assert_eq!(rb.sats, REBALANCE_MAX_SATS);
+        let books = e.inventory().await;
+        let get = |id: &str| books.iter().find(|l| l.id == id).unwrap().clone();
+        assert_eq!(get("lp-alpha").vtxo_sats, 20_000_000 - REBALANCE_MAX_SATS);
+        assert_eq!(get("lp-alpha").l1_sats, 50_000 + REBALANCE_MAX_SATS);
+        assert_eq!(get("lp-bravo").vtxo_sats, 5_000_000 + REBALANCE_MAX_SATS);
+        assert_eq!(get("lp-bravo").l1_sats, 20_000_000 - REBALANCE_MAX_SATS);
+        assert_eq!(e.stats().await["rebalances"]["moved_sats"], REBALANCE_MAX_SATS);
     }
 }

@@ -253,6 +253,33 @@ pub struct Swap {
     pub claim_confirmed: bool,
 }
 
+/// Two desks swapping stock with each other to move both toward 50/50:
+/// `vtxo_from` sends VTXOs to `l1_from`, which sends the same in L1 back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rebalance {
+    pub id: Uuid,
+    pub vtxo_from: String,
+    pub l1_from: String,
+    pub sats: u64,
+    pub status: RebalanceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vtxo_tx: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_txid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebalanceStatus {
+    /// VTXO leg sent; the L1 leg back is still owed (retried by sync).
+    PendingL1,
+    Done,
+    Failed,
+}
+
 /// A desk buying a maturing timelocked output for bitcoin now (claim advance).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Advance {

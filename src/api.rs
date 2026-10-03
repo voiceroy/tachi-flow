@@ -89,6 +89,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(stats)
         .service(verify_quote)
         .service(dispute)
+        .service(rebalance)
+        .service(list_rebalances)
         .service(create_quote)
         .service(rfq)
         .service(price_curve)
@@ -374,6 +376,23 @@ async fn inventory(engine: web::Data<Engine>) -> HttpResponse {
 #[get("/v1/stats")]
 async fn stats(engine: web::Data<Engine>) -> HttpResponse {
     HttpResponse::Ok().json(engine.stats().await)
+}
+
+/// Rebalance desks now (operator route); sync also does it every 10 min.
+#[post("/v1/rebalance")]
+async fn rebalance(_admin: Admin, engine: web::Data<Engine>) -> Result<HttpResponse, Error> {
+    Ok(match engine.rebalance().await? {
+        Some(rb) => HttpResponse::Ok().json(rb),
+        None => HttpResponse::Ok().json(serde_json::json!({
+            "rebalanced": false,
+            "reason": "no desk pair is skewed enough (one above 70% VTXOs, another below 30%)",
+        })),
+    })
+}
+
+#[get("/v1/rebalances")]
+async fn list_rebalances(engine: web::Data<Engine>) -> HttpResponse {
+    HttpResponse::Ok().json(engine.list_rebalances().await)
 }
 
 /// Is this quote genuinely signed by the desk it names?
