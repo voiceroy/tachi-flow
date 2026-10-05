@@ -1,0 +1,17 @@
+{
+  "name": "tachi-flow-demo",
+  "private": true,
+  "description": "Demo tooling: open + refund a real TAURUS vault on regtest, and record the demo video.",
+  "scripts": {
+    "vault-refund": "node vault-refund.mjs",
+    "record": "node record.cjs",
+    "edit": "node edit.cjs"
+  },
+  "dependencies": {
+    "@bitcoinerlab/secp256k1": "2.0.0",
+    "@tachibtc/taurus-vault-core": "0.3.5",
+    "bitcoinjs-lib": "7.0.2",
+    "ecpair": "3.0.2",
+    "playwright": "1.63.0"
+  }
+}

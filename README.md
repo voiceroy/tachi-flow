@@ -27,6 +27,10 @@ Optional outbound: quote **out** (same identity). Accept — the desk funds an H
 
 Swaps survive `cargo run` restarts. State lives in SQLite (`tachi-flow-state.db`, gitignored): one row per swap, quote, advance, bond and so on, and each save writes only the rows that changed, in one WAL transaction with full sync. On first start an existing `tachi-flow-state.json` is imported (and left in place). `STATE_PATH=….json` keeps the old single-file JSON store. Empty LP books get a demo VTXO deposit on startup.
 
+`demo/` holds the demo tooling (`cd demo && npm install`):
+- `node vault-refund.mjs <user_secret_hex> [csv] [sats]` opens a real TAURUS vault on regtest with Tachi's SDK (`@tachibtc/taurus-vault-core`), refunds it with the validator quorum's co-signature, and prints the `to_local` outpoint and leaf to quote an advance on. Takes two blocks (10 min each on Tachi regtest).
+- `node record.cjs && node edit.cjs` records the walkthrough video against a server on `:8090` with Playwright and cuts the block waits (marked on screen) with ffmpeg.
+
 ## What the vault can't do
 
 A TAURUS vault has one exit: the whole deposit, after a fixed ~1008-block CSV, at no fee. The desks turn that wait into a priced market:

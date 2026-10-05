@@ -12,5 +12,10 @@ tachi-flow-state.json.tmp
 tachi-flow-state.db
 tachi-flow-state.db-wal
 tachi-flow-state.db-shm
+demo/node_modules
+demo/*.webm
+demo/*.mp4
+demo/cuts.json
+tachi-flow-demo.mp4
 tachi-flow-admin.token
 tachi-escrow.secret
