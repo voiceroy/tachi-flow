@@ -7,7 +7,7 @@ Quotes L1 ↔ VTXO swaps so you **skip a TAURUS ~1008-block vault exit**. Two de
 - **In:** you lock bitcoin in an HTLC (~144-block refund) → desk pays VTXOs → desk claims.
 - **Out:** desk locks bitcoin first (you claim with the preimage) → you send VTXOs → you claim the HTLC. Same script, roles reversed. Not “pay VTXOs and hope.”
 
-Open `http://127.0.0.1:8080` for the demo UI.
+Open `http://127.0.0.1:8080` for the demo UI, or the hosted demo at <https://tachi-flow-production.up.railway.app> (Railway: the `Dockerfile` runs the server from a persistent `/data` volume holding the desk keys and SQLite state; it listens on `$PORT`).
 
 ## Demo (inbound, the path judges care about)
 
