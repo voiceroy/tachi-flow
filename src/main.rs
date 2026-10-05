@@ -19,7 +19,12 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let bind = env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    // BIND wins; on a host that assigns PORT (Railway, Fly…) listen on all
+    // interfaces at that port; otherwise local only.
+    let bind = env::var("BIND").unwrap_or_else(|_| match env::var("PORT") {
+        Ok(port) => format!("0.0.0.0:{port}"),
+        Err(_) => "127.0.0.1:8080".into(),
+    });
     let tachi_url =
         env::var("TACHI_BASE_URL").unwrap_or_else(|_| "https://rpc-regtest.tachibtc.com".into());
     let network = match env::var("BITCOIN_NETWORK").as_deref() {

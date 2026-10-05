@@ -1,0 +1,8 @@
+target
+.git
+.scratch
+demo
+*.secret
+*.token
+tachi-flow-state.*
+*.mp4
