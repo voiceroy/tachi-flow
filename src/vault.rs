@@ -172,14 +172,13 @@ fn script_num(ins: &Instruction) -> Option<u32> {
     }
 }
 
-/// Tachi's vault id: SHA256(funding txid as displayed ‖ vout big-endian).
-pub fn vault_id(funding_txid: &str, vout: u32) -> Result<String, Error> {
-    let mut bytes = hex::decode(funding_txid).map_err(|_| Error::Invalid("funding txid".into()))?;
-    if bytes.len() != 32 {
-        return Err(Error::Invalid("funding txid".into()));
-    }
+/// Tachi's vault id: SHA256(funding txid in internal byte order ‖ vout
+/// big-endian). Internal order is the reverse of how explorers display a
+/// txid (and is what `listVaults` reports as `funding_txid`).
+pub fn vault_id(funding_txid: &bitcoin::Txid, vout: u32) -> String {
+    let mut bytes = funding_txid.to_byte_array().to_vec();
     bytes.extend_from_slice(&vout.to_be_bytes());
-    Ok(sha256::Hash::hash(&bytes).to_string())
+    sha256::Hash::hash(&bytes).to_string()
 }
 
 /// What the desk needs from the user's pre-signed `to_local` spend.
@@ -338,8 +337,11 @@ mod tests {
 
     #[test]
     fn vault_id_matches_a_live_vault() {
+        // The live vault's funding tx as bitcoind shows it (listVaults
+        // reports the same txid byte-reversed).
+        let l1_txid = parse_txid("9a8dc45a133ee012ab675ecede6b1144f47565e3f9a14e1f170ac6302e53f1ae").unwrap();
         assert_eq!(
-            vault_id("aef1532e30c60a171f4ea1f9e36575f444116bdece5e67ab12e03e135ac48d9a", 0).unwrap(),
+            vault_id(&l1_txid, 0),
             "e0ca7d690e4f5c7bf54dab2c4edc0077717fe3ea89bb185be13f6c78a1b904ff"
         );
     }

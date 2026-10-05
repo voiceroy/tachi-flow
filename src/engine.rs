@@ -4254,7 +4254,7 @@ impl Engine {
             .first()
             .ok_or_else(|| Error::Invalid("refund tx has no inputs".into()))?
             .previous_output;
-        let vault = vault_id(&funding.txid.to_string(), funding.vout)?;
+        let vault = vault_id(&funding.txid, funding.vout);
         let receipts = match self.tachi.watchtower_receipts(&vault).await {
             Ok(r) => r,
             Err(err) => {
