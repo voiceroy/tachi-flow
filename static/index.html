@@ -602,7 +602,7 @@
     function showAdvance(a) {
       advance = a;
       $("advBox").innerHTML = `<p>Advance <strong>${a.status}</strong> via ${a.lp_id}: you get <strong>${sats(a.advance_sats)}</strong> now for ${sats(a.value_sats)} maturing at block ${a.mature_height} (discount ${sats(a.discount_sats)}).</p>` +
-        (a.kind === "vault_refund" ? `<p>Vault refund of vault <code>${(a.vault_id || "").slice(0, 16)}…</code> · watchtower: <strong>${a.watchtower}</strong></p>` : "") +
+        (a.kind === "vault_refund" ? `<p>Refund of Tachi vault <code>${(a.vault_id || "").slice(0, 16)}…</code> · ${a.quorum_signatures ? `<strong class="ok">co-signed by ${a.quorum_signatures} validators</strong> (verified)` : "<strong>not quorum-attested</strong>"} · watchtower receipt: <strong>${a.watchtower}</strong></p>` : "") +
         (a.advance_txid ? `<p>Paid: ${a.advance_txid}</p>` : "") +
         (a.collect_txid ? `<p>Collected: ${a.collect_txid}</p>` : "") +
         `<p class="hint">${a.note || ""}</p>`;

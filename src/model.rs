@@ -326,6 +326,10 @@ pub struct Advance {
     pub vault_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchtower: Option<String>,
+    /// Validator co-signatures the desk verified on the refund tx (the
+    /// quorum's attestation that it refunds the vault's latest state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quorum_signatures: Option<u8>,
     pub outpoint_txid: String,
     pub outpoint_vout: u32,
     pub value_sats: u64,

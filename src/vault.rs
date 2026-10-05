@@ -172,6 +172,95 @@ fn script_num(ins: &Instruction) -> Option<u32> {
     }
 }
 
+/// The vault funding output's cooperative leaf, which a refund spends:
+/// `<user> CHECKSIGVERIFY <q1> CHECKSIG <q2..> CHECKSIGADD <M> NUMEQUAL`.
+pub fn cooperative_script(tl: &ToLocal) -> ScriptBuf {
+    let mut b = Builder::new()
+        .push_x_only_key(&tl.user)
+        .push_opcode(bitcoin::opcodes::all::OP_CHECKSIGVERIFY);
+    for (i, q) in tl.quorum.iter().enumerate() {
+        b = b
+            .push_x_only_key(q)
+            .push_opcode(if i == 0 { OP_CHECKSIG } else { OP_CHECKSIGADD });
+    }
+    b.push_int(i64::from(tl.threshold))
+        .push_opcode(OP_NUMEQUAL)
+        .into_script()
+}
+
+/// Check that `refund` is a quorum-co-signed cooperative refund of the vault
+/// whose funding output is `funding`: it spends that output through the
+/// cooperative leaf for this user and quorum (committed in the output key),
+/// the user signed, and at least `threshold` validators signed. The quorum
+/// only co-signs a vault's latest state, so this is the quorum's own
+/// attestation that the refund is legitimate. Returns how many signed.
+pub fn verify_quorum_refund(refund: &Transaction, funding: &TxOut, tl: &ToLocal) -> Result<usize, Error> {
+    let bad = |why: &str| Error::Invalid(format!("vault refund: {why}"));
+    let [input] = refund.input.as_slice() else {
+        return Err(bad("a refund spends exactly the vault's funding output"));
+    };
+    let spk = funding.script_pubkey.as_bytes();
+    if !funding.script_pubkey.is_p2tr() {
+        return Err(bad("funding output is not taproot"));
+    }
+    let output_key = XOnlyPublicKey::from_slice(&spk[2..34]).map_err(|_| bad("funding output key"))?;
+    let coop = cooperative_script(tl);
+    let w: Vec<&[u8]> = input.witness.iter().collect();
+    let n = tl.quorum.len();
+    if w.len() != n + 3 {
+        return Err(bad("witness is not a cooperative-leaf spend"));
+    }
+    let (sigs, rest) = w.split_at(n);
+    let [user_sig, script, cb] = rest else {
+        return Err(bad("witness is not a cooperative-leaf spend"));
+    };
+    if *script != coop.as_bytes() {
+        return Err(bad("did not spend the cooperative leaf for this user and quorum"));
+    }
+    let cb = bitcoin::taproot::ControlBlock::decode(cb).map_err(|_| bad("control block"))?;
+    let secp = Secp256k1::verification_only();
+    if !cb.verify_taproot_commitment(&secp, output_key, &coop) {
+        return Err(bad("cooperative leaf is not committed in the funding output"));
+    }
+    let leaf = TapLeafHash::from_script(&coop, LeafVersion::TapScript);
+    let msg = |ty: TapSighashType| -> Result<Message, Error> {
+        let h = SighashCache::new(refund)
+            .taproot_script_spend_signature_hash(0, &Prevouts::All(std::slice::from_ref(funding)), leaf, ty)
+            .map_err(|e| Error::Bitcoin(e.to_string()))?;
+        Ok(Message::from_digest(h.to_byte_array()))
+    };
+    let check = |sig: &[u8], key: &XOnlyPublicKey| -> bool {
+        let (sig, ty) = match sig.len() {
+            64 => (sig, TapSighashType::Default),
+            65 => match TapSighashType::from_consensus_u8(sig[64]) {
+                Ok(ty) => (&sig[..64], ty),
+                Err(_) => return false,
+            },
+            _ => return false,
+        };
+        let Ok(sig) = bitcoin::secp256k1::schnorr::Signature::from_slice(sig) else {
+            return false;
+        };
+        msg(ty).is_ok_and(|m| secp.verify_schnorr(&sig, &m, key).is_ok())
+    };
+    if !check(user_sig, &tl.user) {
+        return Err(bad("user signature does not verify"));
+    }
+    // Script order pops q1's signature first, so the stack holds them reversed.
+    let signed = sigs
+        .iter()
+        .enumerate()
+        .filter(|(i, sig)| !sig.is_empty() && check(sig, &tl.quorum[n - 1 - i]))
+        .count();
+    if signed < usize::from(tl.threshold) {
+        return Err(bad(&format!(
+            "only {signed} validator signatures verify; the quorum needs {}",
+            tl.threshold
+        )));
+    }
+    Ok(signed)
+}
+
 /// Tachi's vault id: SHA256(funding txid in internal byte order ‖ vout
 /// big-endian). Internal order is the reverse of how explorers display a
 /// txid (and is what `listVaults` reports as `funding_txid`).
@@ -333,6 +422,27 @@ mod tests {
         );
         assert_eq!(&hex::encode(tl.control_block())[2..], NUMS_HEX);
         assert_eq!(parse_to_local(&tl.script()), Some(tl));
+    }
+
+    /// A real vault opened on Tachi regtest and refunded with the quorum's
+    /// co-signature (vault fd7f6344…, refund ee87e41e…, 6-block delay).
+    const LIVE_REFUND: &str = "02000000000101ecb64c50db7939c1c4d97c2735b0d00f302bb2d7a3cfe804dbd69531e731b44d0000000000a54918800108e8000000000000225120ce3f77888baa1031c3d2e5c6f5c8428ef1521589a967cbea94e1cc4415c88ee70a407d0e901e9eeeaa9986fd2fdfebfb4f02ecd00e901bbbe4db7eff103493da844b28c44d1963e4c130a8ec4f49c788b5605d9676e5ba44f51b455f63aae752fbf5406d4b3e0800a3f21e8c79f0e3e4bea06c04dd8d42fc050a48c4bed8a7b37b358aabbcfce6b273f56b8cc8c44c7e7f42ec0354335f92025c925c656084c8d4ba0c00409e3baca44430b8ba319abe056670f3cc9dec0876dee0230fd0a8a7016158c1e4f87953dc174acb0fef4ff88c714efb9fc7894ae2963a65ae5dd63e50414c10ca401d1d9a1e06400d4709bf47cc68c0222b548c5bfb7812c1a1dc060312324cf90581b2d114bb3130d535c1a29cb54d55ccb41b5591ea8bdf9915dea654337960e900409df642e4f0f80c99e40eba918d17282f3a5376ea0ea49a321b9d398932bc4880af36e6ea2fbedf1265df7d2110d9799ae5eb4f6267e2d1347201c0a42e30d525405cb816a5e2299dfe9e928c963936ff1774f16a7929cb8ab1c9fbf62d1aab75492ef5b5f7d5bd56066604764eed57c847ee8a5f379340e1a2d1ab766aadc2dc1dfd120120077994dbe3e4681ed61fe8d0608b51afaa281126e2fa6bd3bcf604f95833b243ad20d3a1104032d33236abaccd78ca3f43966c1c321d13320ced60f39c52d1a51c35ac203c8e5ecd2f0974e0ba417e423597ea20eaedb948d2de32f63d23c1c7fe181eb4ba204ab1008db3d6e33adacfcad9158a14b1ff66a7529072b20ab9139b118ef2e276ba2058a7ed060e4dd2ed2e70ffd10d5f9400f6580b16c71618510a844a9b61de770aba207039d9c7dd78422313730f61f5356914200eb09cdfaf400b960cdb4d03862e47ba20ccd51dac229bf173e6f43dfcfb21c7445bad93255afa0cfcaebbcfe287958977ba20e125950f3c8b6fe2ecb2e17036aa0ee2c9b8f9bbe00458fdc5c5a98b15c302ffba559c41c150929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac05f72a9dd3034a60a164a2ca7bd6579401c2124e2e70124a0246737b7df0343799cc77020";
+    const LIVE_FUNDING: &str = "02000000000101fa41853573a7cb168d777195ea29eb22392979d819998ae8a4a2c3378ba3106c0000000000ffffffff0260ea000000000000225120f895b209ce9559e9530dac26f7577513f5931c2caafc68454a43b760d98935012c4c00000000000016001485d2f1aac0362e9fe2e871132ef638ba89ba42ba024830450221008b62d59539a73988e78c84b205f885491edcf21a8934fb633fb80fea23721d2602203092965b8edc6ceceec44df749339abcb9787876653168828b412abf82e7b094012102077994dbe3e4681ed61fe8d0608b51afaa281126e2fa6bd3bcf604f95833b24300000000";
+    const LIVE_TO_LOCAL: &str = "6320d3a1104032d33236abaccd78ca3f43966c1c321d13320ced60f39c52d1a51c35ac203c8e5ecd2f0974e0ba417e423597ea20eaedb948d2de32f63d23c1c7fe181eb4ba204ab1008db3d6e33adacfcad9158a14b1ff66a7529072b20ab9139b118ef2e276ba2058a7ed060e4dd2ed2e70ffd10d5f9400f6580b16c71618510a844a9b61de770aba207039d9c7dd78422313730f61f5356914200eb09cdfaf400b960cdb4d03862e47ba20ccd51dac229bf173e6f43dfcfb21c7445bad93255afa0cfcaebbcfe287958977ba20e125950f3c8b6fe2ecb2e17036aa0ee2c9b8f9bbe00458fdc5c5a98b15c302ffba559c6756b27520077994dbe3e4681ed61fe8d0608b51afaa281126e2fa6bd3bcf604f95833b243ac68";
+
+    #[test]
+    fn live_quorum_refund_verifies_and_tampering_fails() {
+        let tx = |h: &str| -> Transaction { bitcoin::consensus::deserialize(&hex::decode(h).unwrap()).unwrap() };
+        let (refund, funding) = (tx(LIVE_REFUND), tx(LIVE_FUNDING));
+        let tl = parse_to_local(&ScriptBuf::from_bytes(hex::decode(LIVE_TO_LOCAL).unwrap())).unwrap();
+        assert_eq!(tl.quorum, live_quorum());
+        assert_eq!(verify_quorum_refund(&refund, &funding.output[0], &tl).unwrap(), 5);
+        assert_eq!(refund.output[0].script_pubkey, tl.address(Network::Regtest).script_pubkey());
+
+        // Signatures commit to the outputs: redirecting the refund breaks them.
+        let mut stolen = refund.clone();
+        stolen.output[0].script_pubkey = funding.output[1].script_pubkey.clone();
+        assert!(verify_quorum_refund(&stolen, &funding.output[0], &tl).is_err());
     }
 
     #[test]

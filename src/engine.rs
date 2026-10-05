@@ -4006,11 +4006,11 @@ impl Engine {
             return Err(Error::Invalid("witness script does not match the output".into()));
         }
         parse_txid(&req.txid)?;
-        let (vault, watchtower, extra_ppm) = match &template {
-            AdvanceTemplate::Csv { .. } => (None, None, 0),
+        let (vault, watchtower, quorum_signatures, extra_ppm) = match &template {
+            AdvanceTemplate::Csv { .. } => (None, None, None, 0),
             AdvanceTemplate::Vault(tl) => {
-                let (id, watch, ppm) = self.check_vault_refund(tl, &req.txid).await?;
-                (Some(id), Some(watch), ppm)
+                let c = self.check_vault_refund(tl, &req.txid).await?;
+                (Some(c.vault_id), Some(c.watchtower), c.quorum_signatures, c.extra_ppm)
             }
         };
         let tip = self.fresh_height().await?;
@@ -4056,6 +4056,7 @@ impl Engine {
                 kind: template.kind(),
                 vault_id: vault,
                 watchtower,
+                quorum_signatures,
                 outpoint_txid: req.txid.clone(),
                 outpoint_vout: req.vout,
                 value_sats: info.value_sats,
@@ -4231,11 +4232,13 @@ impl Engine {
     }
 
     /// A vault refund is only worth advancing on if it really is Tachi's and
-    /// the watchtower will not sweep it: the quorum must be today's validator
-    /// set (≥ 2/3 threshold), and the watchtower's receipt for the refund
-    /// must say `legitimate`. Returns (vault id, watchtower verdict, extra
-    /// discount ppm).
-    async fn check_vault_refund(&self, tl: &ToLocal, txid: &str) -> Result<(String, String, u64), Error> {
+    /// the quorum will not sweep it. The quorum must be today's validator set
+    /// (≥ 2/3 threshold), any watchtower receipt must say `legitimate`, and
+    /// the refund must be attested: either a registered vault refunded with
+    /// ≥ threshold validator co-signatures (the quorum only co-signs a
+    /// vault's latest state), or a `legitimate` receipt. Otherwise refused,
+    /// unless unreceipted advances are enabled (at an extra discount).
+    async fn check_vault_refund(&self, tl: &ToLocal, txid: &str) -> Result<VaultCheck, Error> {
         let live = sorted_quorum(&self.tachi.quorum_keys().await?);
         if live != tl.quorum {
             return Err(Error::Invalid(
@@ -4245,16 +4248,32 @@ impl Engine {
         if usize::from(tl.threshold) * 3 <= tl.quorum.len() * 2 {
             return Err(Error::Invalid("the refund's quorum threshold is below two thirds".into()));
         }
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(
-            &hex::decode(self.tachi.raw_tx(txid).await?).map_err(|e| Error::Tachi(e.to_string()))?,
-        )
-        .map_err(|e| Error::Bitcoin(e.to_string()))?;
+        let fetch = |id: String| async move {
+            let raw = hex::decode(self.tachi.raw_tx(&id).await?).map_err(|e| Error::Tachi(e.to_string()))?;
+            bitcoin::consensus::deserialize::<bitcoin::Transaction>(&raw).map_err(|e| Error::Bitcoin(e.to_string()))
+        };
+        let tx = fetch(txid.to_string()).await?;
         let funding = tx
             .input
             .first()
             .ok_or_else(|| Error::Invalid("refund tx has no inputs".into()))?
             .previous_output;
         let vault = vault_id(&funding.txid, funding.vout);
+
+        // The quorum's own attestation: a registered vault, refunded through
+        // its cooperative leaf with ≥ threshold validator signatures.
+        let registered = self
+            .tachi
+            .vault_ids(&hex::encode(tl.user.serialize()))
+            .await
+            .is_ok_and(|ids| ids.contains(&vault));
+        let cosigned = match fetch(funding.txid.to_string()).await {
+            Ok(ftx) => match ftx.output.get(funding.vout as usize) {
+                Some(out) => crate::vault::verify_quorum_refund(&tx, out, tl).map_err(|e| e.to_string()),
+                None => Err("funding output missing".into()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
         let receipts = match self.tachi.watchtower_receipts(&vault).await {
             Ok(r) => r,
             Err(err) => {
@@ -4277,15 +4296,27 @@ impl Engine {
                 "Tachi's watchtower classifies this refund as {bad}; the quorum may sweep it"
             )));
         }
-        if !verdicts.is_empty() {
-            return Ok((vault, "legitimate".into(), 0));
+        let watchtower = if verdicts.is_empty() { "none" } else { "legitimate" }.to_string();
+        let signatures = cosigned.as_ref().ok().map(|n| *n as u8);
+        if (registered && signatures.is_some()) || !verdicts.is_empty() {
+            return Ok(VaultCheck { vault_id: vault, watchtower, quorum_signatures: signatures, extra_ppm: 0 });
         }
         if !self.unreceipted_vault_advances {
-            return Err(Error::Invalid(
-                "Tachi's watchtower has no receipt for this refund yet; the desk only advances on refunds it classified legitimate".into(),
-            ));
+            let why = if registered {
+                cosigned.err().unwrap_or_default()
+            } else {
+                "no vault registered on Tachi for this funding output".into()
+            };
+            return Err(Error::Invalid(format!(
+                "not a quorum-attested vault refund ({why}) and no legitimate watchtower receipt"
+            )));
         }
-        Ok((vault, "none".into(), UNRECEIPTED_VAULT_DISCOUNT_PPM))
+        Ok(VaultCheck {
+            vault_id: vault,
+            watchtower,
+            quorum_signatures: None,
+            extra_ppm: UNRECEIPTED_VAULT_DISCOUNT_PPM,
+        })
     }
 
     /// Demo: faucet coins into a CSV-locked output owned by `pubkey_hex` — a
@@ -4870,6 +4901,16 @@ fn compensation_owed(s: &Swap) -> bool {
         && s.compensation_sats.is_some()
         && s.compensation_vtxo_id.is_none()
         && s.compensation_txid.is_none()
+}
+
+/// What the desk established about a vault refund before pricing it.
+struct VaultCheck {
+    vault_id: String,
+    /// Watchtower receipt classification for the refund, or `none`.
+    watchtower: String,
+    /// Validator co-signatures verified on the refund itself.
+    quorum_signatures: Option<u8>,
+    extra_ppm: u64,
 }
 
 /// The maturing outputs a claim advance can buy.

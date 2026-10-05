@@ -371,6 +371,21 @@ impl TachiClient {
         Ok(v.get("receipts").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
+    /// Vault ids registered on Tachi for an x-only user key.
+    pub async fn vault_ids(&self, user_xonly_hex: &str) -> Result<Vec<String>, Error> {
+        let v: Value = self
+            .get_json("/tachi_listVaults", &[("user", user_xonly_hex), ("page_size", "100")])
+            .await?;
+        Ok(v.get("vaults")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.get("vault_id").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Raw hex of a tx the node knows (mempool or chain).
     pub async fn raw_tx(&self, txid: &str) -> Result<String, Error> {
         let hex = self
