@@ -1,6 +1,6 @@
 # tachi-flow
 
-OP_Freedom **bounty #10 — Liquidity Management** PoC against **live Tachi regtest** (`https://rpc-regtest.tachibtc.com`).
+OP_Freedom **bounty #10 — Liquidity Management** PoC against **live Tachi regtest** (`https://rpc-regtest.tachibtc.com`) or **signet** (`https://rpc-signet.tachibtc.com`).
 
 Quotes L1 ↔ VTXO swaps so you **skip a TAURUS ~1008-block vault exit**. Two desks reserve stock.
 
@@ -12,8 +12,11 @@ Open `http://127.0.0.1:8080` for the demo UI, or the hosted demo at <https://tac
 ## Demo (inbound, the path judges care about)
 
 ```bash
-cargo run
+cargo run                      # regtest
+cargo run -- --network signet  # or BITCOIN_NETWORK=signet
 ```
+
+The network picks Tachi's matching RPC and its own state file (`tachi-flow-state-signet.db`), so regtest and signet swaps never mix; desk keys are shared. Every Tachi route the server uses is open on signet without an API key, vault advances included. The faucet path is only verified on regtest; point `TACHI_FAUCET_URL` elsewhere if it won't pay `tb1q…`.
 
 1. Open `http://127.0.0.1:8080`. The page creates a **demo identity** and keeps it in the browser.
 2. Direction: **I have bitcoin, I want Tachi coins**. Amount `20000`. **Get quotes from every desk** → pick a desk → Accept quote.
@@ -62,15 +65,15 @@ Env:
 | Variable | Default |
 |---|---|
 | `BIND` | `127.0.0.1:8080` |
-| `TACHI_BASE_URL` | `https://rpc-regtest.tachibtc.com` |
-| `BITCOIN_NETWORK` | `regtest` |
+| `BITCOIN_NETWORK` | `regtest`; `signet` (or `--network signet`) |
+| `TACHI_BASE_URL` | `https://rpc-regtest.tachibtc.com` / `https://rpc-signet.tachibtc.com` |
 | `TACHI_FAUCET_URL` | `https://faucet.tachibtc.com` |
 | `TEST_MODE` | unset = live Tachi |
 | `ADMIN_TOKEN` | unset = read/create `tachi-flow-admin.token` (0600) |
 | `LND_REST_URL` | unset = Lightning off |
 | `LND_MACAROON_HEX` / `LND_MACAROON_PATH` | required with `LND_REST_URL` |
 | `LND_TLS_CERT_PATH` | LND's self-signed cert, if not publicly trusted |
-| `STATE_PATH` | `tachi-flow-state.db` (SQLite); a `.json` path uses the JSON file store |
+| `STATE_PATH` | `tachi-flow-state.db` (`tachi-flow-state-signet.db` on signet, SQLite); a `.json` path uses the JSON file store |
 | `VAULT_ADVANCE_UNRECEIPTED` | unset = advance only on vault refunds the quorum co-signed (or the watchtower classified `legitimate`); `1` = also on unattested `to_local` outputs, at +2% discount |
 
 LP identities: `tachi-lp-alpha.secret` / `tachi-lp-bravo.secret` (migrates old `tachi-lp.secret`). Bond escrow: `tachi-escrow.secret`.

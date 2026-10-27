@@ -25,13 +25,21 @@ async fn main() -> std::io::Result<()> {
         Ok(port) => format!("0.0.0.0:{port}"),
         Err(_) => "127.0.0.1:8080".into(),
     });
-    let tachi_url =
-        env::var("TACHI_BASE_URL").unwrap_or_else(|_| "https://rpc-regtest.tachibtc.com".into());
-    let network = match env::var("BITCOIN_NETWORK").as_deref() {
-        Ok("signet") => Network::Signet,
-        Ok("bitcoin") | Ok("mainnet") => Network::Bitcoin,
-        _ => Network::Regtest,
+    // `--network signet` wins over BITCOIN_NETWORK; the network picks Tachi's
+    // matching RPC and its own state file, so swaps on two chains never mix.
+    let network_name = network_arg()
+        .or_else(|| env::var("BITCOIN_NETWORK").ok())
+        .unwrap_or_else(|| "regtest".into());
+    let (network, default_tachi, default_state) = match network_name.as_str() {
+        "regtest" => (Network::Regtest, "https://rpc-regtest.tachibtc.com", "tachi-flow-state.db"),
+        "signet" => (Network::Signet, "https://rpc-signet.tachibtc.com", "tachi-flow-state-signet.db"),
+        "bitcoin" | "mainnet" => (Network::Bitcoin, "", "tachi-flow-state-mainnet.db"),
+        other => panic!("unknown network {other:?}: use regtest or signet"),
     };
+    let tachi_url = env::var("TACHI_BASE_URL").unwrap_or_else(|_| {
+        assert!(!default_tachi.is_empty(), "set TACHI_BASE_URL for {network_name}");
+        default_tachi.into()
+    });
 
     let tachi = TachiClient::new(tachi_url).expect("tachi client");
     let test_mode = matches!(
@@ -54,8 +62,9 @@ async fn main() -> std::io::Result<()> {
         )
         .with_escrow(load_or_create_secret("tachi-escrow.secret", ""))
         .with_persist_migrating(
-            env::var("STATE_PATH").unwrap_or_else(|_| "tachi-flow-state.db".into()),
-            Some("tachi-flow-state.json"),
+            env::var("STATE_PATH").unwrap_or_else(|_| default_state.into()),
+            // The legacy JSON store only ever held regtest swaps.
+            (network == Network::Regtest).then_some("tachi-flow-state.json"),
         )
         .unwrap_or_else(|err| panic!("{err}"))
     };
@@ -126,6 +135,20 @@ async fn main() -> std::io::Result<()> {
     .bind(&bind)?
     .run()
     .await
+}
+
+/// `--network <name>` or `--network=<name>` from the command line.
+fn network_arg() -> Option<String> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--network" {
+            return args.next();
+        }
+        if let Some(name) = arg.strip_prefix("--network=") {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 /// `ADMIN_TOKEN` env, else `tachi-flow-admin.token`, else a new random token

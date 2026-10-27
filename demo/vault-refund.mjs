@@ -10,9 +10,11 @@ import { ECPairFactory } from "ecpair";
 import * as bitcoin from "bitcoinjs-lib";
 import * as V from "@tachibtc/taurus-vault-core";
 
-const B = process.env.TACHI_BASE_URL || "https://rpc-regtest.tachibtc.com";
+// BITCOIN_NETWORK=signet targets Tachi signet (tb1… addresses), like the server.
+const signet = process.env.BITCOIN_NETWORK === "signet";
+const B = process.env.TACHI_BASE_URL || `https://rpc-${signet ? "signet" : "regtest"}.tachibtc.com`;
 const FAUCET = process.env.TACHI_FAUCET_URL || "https://faucet.tachibtc.com";
-const net = bitcoin.networks.regtest;
+const net = signet ? bitcoin.networks.testnet : bitcoin.networks.regtest;
 const ECPair = ECPairFactory(ecc);
 const log = (...a) => console.error("[vault]", ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
