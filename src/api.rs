@@ -23,6 +23,14 @@ use crate::tachi_tx::xonly_from_secret;
 #[derive(Clone)]
 pub struct AdminToken(pub String);
 
+/// Networks this server runs, each at `/{name}/v1/…`; `primary` also answers
+/// at `/v1/…`.
+#[derive(Clone, Serialize)]
+pub struct Networks {
+    pub primary: String,
+    pub all: Vec<String>,
+}
+
 /// Extractor that only succeeds with `x-admin-token: <token>` or
 /// `Authorization: Bearer <token>`.
 pub struct Admin;
@@ -81,6 +89,7 @@ struct Meta {
     /// Fee rate the desks use for their own L1 txs.
     fee_rate_sat_vb: f64,
     lightning: bool,
+    networks: Option<Networks>,
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -145,7 +154,7 @@ async fn ui() -> HttpResponse {
 }
 
 #[get("/v1/meta")]
-async fn meta(engine: web::Data<Engine>) -> HttpResponse {
+async fn meta(engine: web::Data<Engine>, req: HttpRequest) -> HttpResponse {
     HttpResponse::Ok().json(Meta {
         service: "tachi-flow",
         bounty: "#10 Liquidity Management",
@@ -161,6 +170,9 @@ async fn meta(engine: web::Data<Engine>) -> HttpResponse {
         escrow_pubkey: engine.escrow_pubkey_hex(),
         fee_rate_sat_vb: engine.fee_rate_msat_vb() as f64 / 1_000.0,
         lightning: engine.lightning_enabled(),
+        networks: req
+            .app_data::<web::Data<Networks>>()
+            .map(|n| n.get_ref().clone()),
     })
 }
 

@@ -12,11 +12,11 @@ Open `http://127.0.0.1:8080` for the demo UI, or the hosted demo at <https://tac
 ## Demo (inbound, the path judges care about)
 
 ```bash
-cargo run                      # regtest
-cargo run -- --network signet  # or BITCOIN_NETWORK=signet
+cargo run                      # regtest + signet, regtest primary
+cargo run -- --network signet  # signet primary (or BITCOIN_NETWORK=signet)
 ```
 
-The network picks Tachi's matching RPC and its own state file (`tachi-flow-state-signet.db`), so regtest and signet swaps never mix; desk keys are shared. Every Tachi route the server uses is open on signet without an API key, vault advances included. The faucet path is only verified on regtest; point `TACHI_FAUCET_URL` elsewhere if it won't pay `tb1q…`.
+One server runs both networks. Each has its own engine, Tachi RPC and state file (`tachi-flow-state.db` / `tachi-flow-state-signet.db`) at `/regtest/v1/…` and `/signet/v1/…`, so swaps never cross chains; desk keys are shared. The primary network also answers at `/v1/…`. The UI has a **regtest / signet** switch (`?net=signet`, remembered per browser, with a separate demo identity per network). `NETWORKS=regtest` runs just one; `TACHI_BASE_URL`, `STATE_PATH` and Lightning apply to the primary only. Every Tachi route the server uses is open on signet without an API key, vault advances included. The faucet path is only verified on regtest; point `TACHI_FAUCET_URL` elsewhere if it won't pay `tb1q…`.
 
 1. Open `http://127.0.0.1:8080`. The page creates a **demo identity** and keeps it in the browser.
 2. Direction: **I have bitcoin, I want Tachi coins**. Amount `20000`. **Get quotes from every desk** → pick a desk → Accept quote.
@@ -65,7 +65,8 @@ Env:
 | Variable | Default |
 |---|---|
 | `BIND` | `127.0.0.1:8080` |
-| `BITCOIN_NETWORK` | `regtest`; `signet` (or `--network signet`) |
+| `BITCOIN_NETWORK` | primary network: `regtest`; `signet` (or `--network signet`) |
+| `NETWORKS` | `regtest,signet` — every network served at `/{name}/v1/…` |
 | `TACHI_BASE_URL` | `https://rpc-regtest.tachibtc.com` / `https://rpc-signet.tachibtc.com` |
 | `TACHI_FAUCET_URL` | `https://faucet.tachibtc.com` |
 | `TEST_MODE` | unset = live Tachi |

@@ -25,29 +25,109 @@ async fn main() -> std::io::Result<()> {
         Ok(port) => format!("0.0.0.0:{port}"),
         Err(_) => "127.0.0.1:8080".into(),
     });
-    // `--network signet` wins over BITCOIN_NETWORK; the network picks Tachi's
-    // matching RPC and its own state file, so swaps on two chains never mix.
-    let network_name = network_arg()
+    // The primary network (`--network signet` wins over BITCOIN_NETWORK) also
+    // answers at `/v1/…`; every network in NETWORKS gets its own engine, state
+    // file and Tachi RPC at `/{network}/v1/…`, so swaps on two chains never mix.
+    let primary = network_arg()
         .or_else(|| env::var("BITCOIN_NETWORK").ok())
         .unwrap_or_else(|| "regtest".into());
-    let (network, default_tachi, default_state) = match network_name.as_str() {
+    let mut names = vec![primary.clone()];
+    for name in env::var("NETWORKS")
+        .unwrap_or_else(|_| "regtest,signet".into())
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+
+    let test_mode = matches!(
+        env::var("TEST_MODE").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+    if test_mode {
+        tracing::warn!("TEST_MODE: simulated lp-alpha / lp-bravo, no live Tachi books");
+    }
+    let unreceipted = matches!(
+        env::var("VAULT_ADVANCE_UNRECEIPTED").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+    if unreceipted {
+        tracing::warn!("advancing on vault refunds without a watchtower receipt (extra discount)");
+    }
+
+    let mut engines = Vec::new();
+    for name in &names {
+        let engine = build_engine(name, name == &primary, test_mode)
+            .with_unreceipted_vault_advances(unreceipted);
+        // HTLC timeouts are absolute heights; never quote before we know the tip.
+        engine.refresh_height().await;
+        if !test_mode && engine.cached_height() == 0 {
+            tracing::warn!(network = %name, "block height unknown; quotes fail until Tachi RPC answers");
+        }
+        spawn_background(engine.clone(), test_mode);
+        engines.push((name.clone(), engine));
+    }
+
+    let admin = AdminToken(load_or_create_admin_token());
+    for (name, engine) in &engines {
+        tracing::info!(
+            %bind,
+            network = %name,
+            primary = name == &primary,
+            tachi = engine.tachi().base_url(),
+            tachi_lp_pubkey = %engine.tachi_lp_pubkey_hex(),
+            height = engine.cached_height(),
+            "tachi-flow listening (operator routes need the admin token)"
+        );
+    }
+    let networks = api::Networks {
+        primary: primary.clone(),
+        all: names,
+    };
+
+    // No CORS layer: the UI is same-origin, and other sites must not be able
+    // to drive this desk from a visitor's browser.
+    HttpServer::new(move || {
+        let mut app = App::new()
+            .wrap(TracingLogger::default())
+            .app_data(web::Data::new(admin.clone()))
+            .app_data(web::Data::new(networks.clone()));
+        for (name, engine) in &engines {
+            app = app.service(
+                web::scope(&format!("/{name}"))
+                    .app_data(web::Data::new(engine.clone()))
+                    .configure(api::configure),
+            );
+        }
+        let primary = &engines[0].1;
+        app.app_data(web::Data::new(primary.clone()))
+            .configure(api::configure)
+    })
+    .bind(&bind)?
+    .run()
+    .await
+}
+
+/// One network's engine: its Tachi RPC, its own state file, the shared desk
+/// keys. Lightning and the TACHI_BASE_URL / STATE_PATH overrides apply to the
+/// primary network only.
+fn build_engine(name: &str, primary: bool, test_mode: bool) -> Engine {
+    let (network, default_tachi, default_state) = match name {
         "regtest" => (Network::Regtest, "https://rpc-regtest.tachibtc.com", "tachi-flow-state.db"),
         "signet" => (Network::Signet, "https://rpc-signet.tachibtc.com", "tachi-flow-state-signet.db"),
         "bitcoin" | "mainnet" => (Network::Bitcoin, "", "tachi-flow-state-mainnet.db"),
         other => panic!("unknown network {other:?}: use regtest or signet"),
     };
-    let tachi_url = env::var("TACHI_BASE_URL").unwrap_or_else(|_| {
-        assert!(!default_tachi.is_empty(), "set TACHI_BASE_URL for {network_name}");
+    let override_var = |var: &str| if primary { env::var(var).ok() } else { None };
+    let tachi_url = override_var("TACHI_BASE_URL").unwrap_or_else(|| {
+        assert!(!default_tachi.is_empty(), "set TACHI_BASE_URL for {name}");
         default_tachi.into()
     });
-
     let tachi = TachiClient::new(tachi_url).expect("tachi client");
-    let test_mode = matches!(
-        env::var("TEST_MODE").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    );
     let engine = if test_mode {
-        tracing::warn!("TEST_MODE: simulated lp-alpha / lp-bravo, no live Tachi books");
         Engine::simulated(tachi, network)
     } else {
         let alpha = load_or_create_secret("tachi-lp-alpha.secret", "tachi-lp.secret");
@@ -62,79 +142,45 @@ async fn main() -> std::io::Result<()> {
         )
         .with_escrow(load_or_create_secret("tachi-escrow.secret", ""))
         .with_persist_migrating(
-            env::var("STATE_PATH").unwrap_or_else(|_| default_state.into()),
+            override_var("STATE_PATH").unwrap_or_else(|| default_state.into()),
             // The legacy JSON store only ever held regtest swaps.
             (network == Network::Regtest).then_some("tachi-flow-state.json"),
         )
         .unwrap_or_else(|err| panic!("{err}"))
     };
+    if !primary {
+        return engine;
+    }
     let lightning = tachi_flow::lightning::LightningNode::from_env()
         .unwrap_or_else(|err| panic!("lightning config: {err}"));
     if lightning.is_some() {
-        tracing::info!("Lightning enabled (LND REST)");
+        tracing::info!(network = %name, "Lightning enabled (LND REST)");
     }
-    let unreceipted = matches!(
-        env::var("VAULT_ADVANCE_UNRECEIPTED").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    );
-    if unreceipted {
-        tracing::warn!("advancing on vault refunds without a watchtower receipt (extra discount)");
-    }
-    let engine = engine
-        .with_lightning(lightning)
-        .with_unreceipted_vault_advances(unreceipted);
+    engine.with_lightning(lightning)
+}
 
-    // HTLC timeouts are absolute heights; never quote before we know the tip.
-    engine.refresh_height().await;
-    if !test_mode && engine.cached_height() == 0 {
-        tracing::warn!("block height unknown; quotes fail until Tachi RPC answers");
-    }
-
-    let admin = AdminToken(load_or_create_admin_token());
-    tracing::info!(
-        %bind,
-        network = %engine.network(),
-        tachi = engine.tachi().base_url(),
-        tachi_lp_pubkey = %engine.tachi_lp_pubkey_hex(),
-        height = engine.cached_height(),
-        "tachi-flow listening (operator routes need the admin token)"
-    );
-
+fn spawn_background(engine: Engine, test_mode: bool) {
     if !test_mode {
         let books = engine.clone();
         tokio::spawn(async move {
             if let Err(err) = books.ensure_demo_liquidity().await {
-                tracing::warn!(%err, "demo liquidity");
+                tracing::warn!(network = %books.network(), %err, "demo liquidity");
             }
         });
         // Push stream: settle the moment Tachi credits a desk, not on the next tick.
         tokio::spawn(tachi_flow::watch::run(engine.clone()));
     }
 
-    let ticker = engine.clone();
     tokio::spawn(async move {
         loop {
-            ticker.refresh_height().await;
-            ticker.refresh_live_inventory().await;
-            if let Err(err) = ticker.sync_all().await {
-                tracing::warn!(%err, "background sync");
+            engine.refresh_height().await;
+            engine.refresh_live_inventory().await;
+            if let Err(err) = engine.sync_all().await {
+                tracing::warn!(network = %engine.network(), %err, "background sync");
             }
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
         }
     });
-
-    // No CORS layer: the UI is same-origin, and other sites must not be able
-    // to drive this desk from a visitor's browser.
-    HttpServer::new(move || {
-        App::new()
-            .wrap(TracingLogger::default())
-            .app_data(web::Data::new(engine.clone()))
-            .app_data(web::Data::new(admin.clone()))
-            .configure(api::configure)
-    })
-    .bind(&bind)?
-    .run()
-    .await
 }
 
 /// `--network <name>` or `--network=<name>` from the command line.
