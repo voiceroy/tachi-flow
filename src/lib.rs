@@ -9,7 +9,6 @@ pub mod events;
 pub mod faucet;
 pub mod hosted;
 pub mod htlc;
-pub mod lightning;
 pub mod model;
 pub mod store;
 pub mod tachi;

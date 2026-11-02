@@ -1,18 +1,17 @@
-//! Live updates: every swap / advance / Lightning-swap change is published on
+//! Live updates: every swap / advance change is published on
 //! a broadcast channel. The UI reads it as server-sent events; registered
 //! webhooks get a POST per event.
 
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::model::{Advance, LnSwap, Swap, WebhookRequest};
+use crate::model::{Advance, Swap, WebhookRequest};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Event {
     Swap(Box<Swap>),
     Advance(Box<Advance>),
-    Ln(Box<LnSwap>),
 }
 
 impl Event {
@@ -20,7 +19,6 @@ impl Event {
         match self {
             Self::Swap(s) => s.id,
             Self::Advance(a) => a.id,
-            Self::Ln(l) => l.id,
         }
     }
 
@@ -29,7 +27,6 @@ impl Event {
         let kind = match self {
             Self::Swap(_) => "swap",
             Self::Advance(_) => "advance",
-            Self::Ln(_) => "ln",
         };
         let json = serde_json::to_string(self).unwrap_or_else(|_| "{}".into());
         format!("event: {kind}\ndata: {json}\n\n")

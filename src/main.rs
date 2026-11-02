@@ -126,8 +126,8 @@ async fn main() -> std::io::Result<()> {
 }
 
 /// One network's engine: its Tachi RPC, its own state file, the shared desk
-/// keys. Lightning and the TACHI_BASE_URL / STATE_PATH overrides apply to the
-/// primary network only.
+/// keys. The TACHI_BASE_URL / STATE_PATH overrides apply to the primary
+/// network only.
 fn build_engine(name: &str, primary: bool, test_mode: bool) -> Engine {
     let (network, default_tachi, default_state) = match name {
         "regtest" => (Network::Regtest, "https://rpc-regtest.tachibtc.com", "tachi-flow-state.db"),
@@ -141,7 +141,7 @@ fn build_engine(name: &str, primary: bool, test_mode: bool) -> Engine {
         default_tachi.into()
     });
     let tachi = TachiClient::new(tachi_url).expect("tachi client");
-    let engine = if test_mode {
+    if test_mode {
         Engine::simulated(tachi, network)
     } else {
         let alpha = load_or_create_secret("tachi-lp-alpha.secret", "tachi-lp.secret");
@@ -161,16 +161,7 @@ fn build_engine(name: &str, primary: bool, test_mode: bool) -> Engine {
             (network == Network::Regtest).then_some("tachi-flow-state.json"),
         )
         .unwrap_or_else(|err| panic!("{err}"))
-    };
-    if !primary {
-        return engine;
     }
-    let lightning = tachi_flow::lightning::LightningNode::from_env()
-        .unwrap_or_else(|err| panic!("lightning config: {err}"));
-    if lightning.is_some() {
-        tracing::info!(network = %name, "Lightning enabled (LND REST)");
-    }
-    engine.with_lightning(lightning)
 }
 
 fn spawn_background(engine: Engine, test_mode: bool) {

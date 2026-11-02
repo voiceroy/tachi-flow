@@ -226,7 +226,7 @@ const W = 1440, H = 900;
       <li>Competing desks · RFQ · split exits · deadlines</li>
       <li>Signed quotes · L1 bonds with a CSV escape · reputation</li>
       <li>Advances on real TAURUS vault refunds</li>
-      <li>Lightning · fee bumping · rebalancing · hosted desks · SQLite</li>
+      <li>Fee bumping · rebalancing · hosted desks · SQLite</li>
     </ul>
     <p style="color:#8b98a8;font-size:18px;margin-top:22px">Proof of concept on Tachi regtest · OP_Freedom bounty #10</p>`, 6000);
 
