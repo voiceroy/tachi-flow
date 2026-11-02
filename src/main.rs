@@ -71,6 +71,17 @@ async fn main() -> std::io::Result<()> {
         engines.push((name.clone(), engine));
     }
 
+    // Behind a reverse proxy the peer address is the proxy's; count the caps
+    // against the IP it forwards instead. Only set this where a proxy that
+    // appends to X-Forwarded-For fronts every request.
+    let trust_proxy = matches!(
+        env::var("TRUST_PROXY").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+    if trust_proxy {
+        tracing::info!("TRUST_PROXY: per-client caps use the last X-Forwarded-For entry");
+    }
+
     let admin = AdminToken(load_or_create_admin_token());
     for (name, engine) in &engines {
         tracing::info!(
@@ -95,6 +106,9 @@ async fn main() -> std::io::Result<()> {
             .wrap(TracingLogger::default())
             .app_data(web::Data::new(admin.clone()))
             .app_data(web::Data::new(networks.clone()));
+        if trust_proxy {
+            app = app.app_data(web::Data::new(api::TrustProxy));
+        }
         for (name, engine) in &engines {
             app = app.service(
                 web::scope(&format!("/{name}"))
