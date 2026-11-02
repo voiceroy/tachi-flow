@@ -90,7 +90,8 @@ const LARGE_QUOTE_SHARE_PPM: u64 = 250_000;
 const LARGE_QUOTE_MAX_TTL_SECS: u64 = 120;
 /// An opened swap nobody pays releases its stock after this long.
 const UNPAID_SWAP_SECS: i64 = 60 * 60;
-/// Deadline swaps are only "unpaid" this many blocks past their deadline.
+/// Deadline swaps are only "unpaid" this many blocks past their deadline, and
+/// outbound swaps only once the desk's lock has this many confirmations.
 const UNPAID_SWAP_BLOCKS: u32 = 6;
 /// Fee-rate floor for the desk's own L1 txs (2 sat/vB).
 const MIN_FEE_RATE_MSAT_VB: u64 = 2_000;
@@ -3613,6 +3614,16 @@ impl Engine {
                     _ => continue,
                 }
             }
+            // The user can only pay once the desk's lock has confirmed, so
+            // their hour starts there, not when the swap was opened: a desk
+            // that locked late (seen live on signet) left them no time at all.
+            if swap.side == Side::Out
+                && !self.test_mode
+                && let Some(lock) = swap.l1_lock_txid.as_deref()
+                && !matches!(self.lock_confirmations(lock).await, Ok(c) if c >= UNPAID_SWAP_BLOCKS)
+            {
+                continue;
+            }
             let Ok(current) = self.get_swap(swap.id).await else {
                 continue;
             };
@@ -3631,7 +3642,7 @@ impl Engine {
                     "Nobody paid the lock within an hour, so the desk released the stock. If you pay it anyway, refund it after block {timeout}."
                 ),
                 Side::Out => format!(
-                    "No Tachi coins arrived within an hour, so the swap expired. Do not send them now; the desk takes its lock back after block {timeout}."
+                    "No Tachi coins arrived within {UNPAID_SWAP_BLOCKS} blocks of the desk's lock confirming, so the swap expired. Do not send them now; the desk takes its lock back after block {timeout}."
                 ),
             };
             if let Err(err) = self
