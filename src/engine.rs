@@ -3434,6 +3434,9 @@ impl Engine {
     /// leg goes first; if the L1 leg back then fails, the rebalance stays
     /// `pending_l1` and sync retries only that leg.
     pub async fn rebalance(&self) -> Result<Option<Rebalance>, Error> {
+        // One plan at a time: a forced rebalance and the periodic one must not
+        // both read the same books and each move stock.
+        let _one = self.lock_swap(Uuid::nil()).await;
         self.inner.write().await.last_rebalance = Some(Utc::now());
         if !self.test_mode {
             self.refresh_live_inventory().await;
@@ -3457,6 +3460,7 @@ impl Engine {
             status: RebalanceStatus::PendingL1,
             vtxo_tx: Some(vtxo_tx),
             l1_txid: None,
+            l1_tx_hex: None,
             note: None,
             at: Utc::now(),
         };
@@ -3466,8 +3470,11 @@ impl Engine {
         self.finish_rebalance(id).await.map(Some)
     }
 
-    /// Send (or retry) the L1 leg of a rebalance.
+    /// Send (or retry) the L1 leg of a rebalance. One caller at a time (a
+    /// forced rebalance and the sync retry raced and both paid), and the
+    /// signed tx is saved first, so a retry re-sends it rather than paying twice.
     async fn finish_rebalance(&self, id: Uuid) -> Result<Rebalance, Error> {
+        let _guard = self.lock_swap(id).await;
         let rb = self
             .inner
             .read()
@@ -3488,9 +3495,24 @@ impl Engine {
             credit_lp(&mut inner.lps, &rb.vtxo_from, Side::Out, rb.sats);
             Ok(format!("sim-rebalance-l1-{id}"))
         } else {
-            let to = self.lp_wallet(&rb.vtxo_from)?.claim_address.to_string();
-            match self.sign_l1_payment(&rb.l1_from, &[(to, rb.sats)]).await {
-                Ok((hex, _)) => self.broadcast_l1(&hex).await,
+            let hex = match rb.l1_tx_hex.clone() {
+                Some(hex) => Ok(hex),
+                None => {
+                    let to = self.lp_wallet(&rb.vtxo_from)?.claim_address.to_string();
+                    match self.sign_l1_payment(&rb.l1_from, &[(to, rb.sats)]).await {
+                        Ok((hex, _)) => {
+                            if let Some(r) = self.inner.write().await.rebalances.iter_mut().find(|r| r.id == id) {
+                                r.l1_tx_hex = Some(hex.clone());
+                            }
+                            self.save_state().await;
+                            Ok(hex)
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+            };
+            match hex {
+                Ok(hex) => self.broadcast_l1(&hex).await,
                 Err(err) => Err(err),
             }
         };

@@ -298,6 +298,10 @@ pub struct Rebalance {
     pub vtxo_tx: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub l1_txid: Option<String>,
+    /// The signed L1 leg, saved before broadcast so a retry re-sends this
+    /// tx instead of signing (and paying) a second one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_tx_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     pub at: DateTime<Utc>,
