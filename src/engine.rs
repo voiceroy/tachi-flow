@@ -2135,6 +2135,8 @@ impl Engine {
             }
             // Paid already: retry the claim only.
             SwapStatus::LpSettled => {}
+            // Done: a repeat click shows the swap rather than an error.
+            SwapStatus::Claimed => return Ok(swap),
             from => {
                 return Err(Error::BadTransition {
                     from,
