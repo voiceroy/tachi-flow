@@ -59,23 +59,33 @@ async function voutPaying(txid, address) {
 // 1. The vault: user key + today's 7 validators, 5-of-7, short exit for the demo.
 const vals = await (await fetch(`${B}/tachi_validators`)).json();
 const nodePubkeys = vals.validators.map((v) => v.pub_key_hex);
-const vault = await V.createVault({ network: "regtest", userPubkey: pub33, nodePubkeys, csvBlocks });
+const vaultNet = signet ? "signet" : "regtest";
+const vault = await V.createVault({ network: vaultNet, userPubkey: pub33, nodePubkeys, csvBlocks });
 log("vault address", vault.p2tr.address, "csv", vault.p2tr.exitLeaf.csvBlocks);
 
 // 2. Fund it: faucet -> the user's P2WPKH -> the vault (SegWit funding).
 // FUND_TXID resumes from a vault funding that already confirmed (vout 0).
+// COIN_TXID uses a coin already paid to the user's P2WPKH (the faucet now
+// answers only a browser), instead of asking the faucet.
 let fundTxid = process.env.FUND_TXID;
 if (!fundTxid) {
   const wpkh = bitcoin.payments.p2wpkh({ pubkey: pub33, network: net });
-  const drip = await (await fetch(`${FAUCET}/api/faucet`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ address: wpkh.address, amountBtc: Number(amount + 20000n) / 1e8, proof: null }),
-  })).json();
-  if (!drip.ok) throw new Error("faucet: " + JSON.stringify(drip));
-  const coin = await voutPaying(drip.txid, wpkh.address);
+  let coinTxid = process.env.COIN_TXID;
+  if (!coinTxid) {
+    const drip = await (await fetch(`${FAUCET}/api/faucet`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ address: wpkh.address, amountBtc: Number(amount + 20000n) / 1e8, proof: null }),
+    })).json().catch(() => ({ ok: false, error: "the faucet needs a browser" }));
+    if (!drip.ok) {
+      throw new Error(`faucet: ${JSON.stringify(drip)}. Pay ${wpkh.address} at least ${amount + 1000n} sats by hand and rerun with COIN_TXID=<txid>`);
+    }
+    coinTxid = drip.txid;
+  }
+  const coin = await voutPaying(coinTxid, wpkh.address);
+  if (coin.sats < amount + 1000n) throw new Error(`coin pays ${coin.sats} sats; need at least ${amount + 1000n}`);
   const fundPsbt = new bitcoin.Psbt({ network: net });
-  fundPsbt.addInput({ hash: drip.txid, index: coin.vout, witnessUtxo: { script: wpkh.output, value: coin.sats } });
+  fundPsbt.addInput({ hash: coinTxid, index: coin.vout, witnessUtxo: { script: wpkh.output, value: coin.sats } });
   fundPsbt.addOutput({ address: vault.p2tr.address, value: amount });
   fundPsbt.addOutput({ address: wpkh.address, value: coin.sats - amount - 500n });
   fundPsbt.signInput(0, kp);
@@ -114,7 +124,7 @@ log("vault opened", reg.vaultIdHex);
 
 // 5. Refund at state 0: user signs, the quorum co-signs, then broadcast.
 const toLocal = V.buildToLocalP2trOutput({
-  network: "regtest",
+  network: vaultNet,
   nodePubkeys,
   userDelayedPubkey: vault.p2tr.cooperativeLeaf.userKey,
   toSelfDelay: vault.p2tr.exitLeaf.csvBlocks,
