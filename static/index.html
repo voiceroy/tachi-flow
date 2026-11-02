@@ -264,6 +264,8 @@
 
     function human(s) {
       if (!s) return "";
+      if (s.status === "quoted" && s.side === "in" && s.l1_lock_txid)
+        return "Your lock is broadcast. The desk pays your Tachi coins once it has 1 confirmation (the next block, ~10 min), so a replaced lock can't take them.";
       if (s.status === "quoted" && s.side === "in" && !s.faucet_txid && s.fund_address)
         return "The faucet only answers your browser. Open faucet.tachibtc.com, send the amount below to the fund address (not the lock), paste the txid in the box and click Fund with faucet again.";
       if (s.status === "quoted" && s.side === "in" && !s.faucet_txid)

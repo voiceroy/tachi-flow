@@ -59,6 +59,9 @@ pub const HTLC_TIMEOUT_BLOCKS: u32 = 144;
 /// Stop settling this many blocks before an HTLC times out, so a claim has
 /// time to confirm before the other side can take the refund path.
 const SAFETY_MARGIN_BLOCKS: u32 = 12;
+/// Confirmations an inbound lock needs before the desk pays VTXOs. A lock
+/// still in the mempool can be replaced (RBF) after the user has the VTXOs.
+const INBOUND_LOCK_CONFIRMATIONS: u32 = 1;
 /// TAURUS unilateral-exit leaf (CSV). The swap exists so users skip this wait.
 pub const VAULT_EXIT_BLOCKS: u32 = 1008;
 const CLAIM_FEE_SATS: u64 = 500;
@@ -2324,6 +2327,15 @@ impl Engine {
         if funding.value_sats < swap.amount_sats {
             return Err(Error::Invalid("underpaid HTLC".into()));
         }
+        if !self.test_mode {
+            let conf = self.lock_confirmations(&funding.txid).await?;
+            if conf < INBOUND_LOCK_CONFIRMATIONS {
+                return Err(Error::Invalid(format!(
+                    "lock {} has {conf} confirmations; the desk pays at {INBOUND_LOCK_CONFIRMATIONS}",
+                    funding.txid
+                )));
+            }
+        }
 
         let h = if self.test_mode {
             self.cached_height()
@@ -3595,7 +3607,9 @@ impl Engine {
             (Side::In, SwapStatus::Quoted) => {
                 if near_timeout {
                     self.expire(id).await?;
-                } else if self.scan_htlc(&before).await?.is_some() {
+                } else if let Some(lock) = self.scan_htlc(&before).await?
+                    && self.lock_confirmations(&lock.txid).await? >= INBOUND_LOCK_CONFIRMATIONS
+                {
                     self.observe_lock_inner(id, ObserveLockRequest::default())
                         .await?;
                 }
@@ -3631,6 +3645,11 @@ impl Engine {
         }
         let after = self.get_swap(id).await?;
         Ok((after.updated_at != before.updated_at).then_some(after))
+    }
+
+    /// Confirmations of a lock tx; 0 while it is only in the mempool.
+    async fn lock_confirmations(&self, txid: &str) -> Result<u32, Error> {
+        Ok(self.tachi.tx_confirmations(txid).await?.unwrap_or(0))
     }
 
     async fn scan_htlc(&self, swap: &Swap) -> Result<Option<ObserveLockRequest>, Error> {
