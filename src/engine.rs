@@ -2893,16 +2893,9 @@ impl Engine {
             ),
         };
         let compensation = if desk_failed {
-            let comp = self.record_default(&swap.lp_id, swap.amount_sats).await;
-            note.push_str(&format!(
-                " The desk defaulted on this swap{}.",
-                if comp > 0 {
-                    format!("; {comp} sats from its bond are on their way to your Tachi key")
-                } else {
-                    " (it had no bond to pay you from)".to_string()
-                }
-            ));
-            Some(comp).filter(|c| *c > 0)
+            let (comp, why) = self.charge_default(&swap).await;
+            note.push_str(&why);
+            comp
         } else {
             None
         };
@@ -2921,6 +2914,18 @@ impl Engine {
             }
         }
         self.get_swap(id).await
+    }
+
+    /// Record a default on `swap` and say what the user is owed: the
+    /// compensation (if the desk is bonded) and a note for the swap.
+    async fn charge_default(&self, swap: &Swap) -> (Option<u64>, String) {
+        let comp = self.record_default(&swap.lp_id, swap.amount_sats).await;
+        let note = if comp > 0 {
+            format!(" The desk defaulted on this swap; {comp} sats from its bond are being paid to you.")
+        } else {
+            " The desk defaulted on this swap (it had no bond to pay you from).".to_string()
+        };
+        (Some(comp).filter(|c| *c > 0), note)
     }
 
     /// Count a default and work out the compensation the desk's bonds owe.
@@ -3234,21 +3239,34 @@ impl Engine {
                 to: SwapStatus::Failed,
             });
         }
-        {
+        if swap.status == SwapStatus::Quoted {
             let mut inner = self.inner.write().await;
-            if swap.status == SwapStatus::Quoted {
-                credit_lp(
-                    &mut inner.lps,
-                    &swap.lp_id,
-                    swap.side,
-                    reserve_sats(swap.side, swap.receive_sats),
-                );
-            }
-            if let Some(lp) = inner.lps.iter_mut().find(|lp| lp.id == swap.lp_id) {
-                lp.defaulted = true;
+            credit_lp(
+                &mut inner.lps,
+                &swap.lp_id,
+                swap.side,
+                reserve_sats(swap.side, swap.receive_sats),
+            );
+        }
+        // The same default as one found at expiry: it counts against the
+        // desk's score (which stops routing below the floor) and pays the
+        // user from its bond. It does not ban the desk outright.
+        let (compensation, why) = self.charge_default(&swap).await;
+        let swap = self
+            .update_swap(id, |s| {
+                s.status = SwapStatus::Failed;
+                s.desk_defaulted = true;
+                s.compensation_sats = compensation;
+                s.demo_note = Some(format!("The operator marked this swap as a desk default.{why}"));
+            })
+            .await?;
+        if compensation.is_some() {
+            // Failure is retried by sync (`compensation_owed`).
+            if let Err(err) = self.pay_compensation(&swap).await {
+                tracing::warn!(%err, %id, "bond compensation");
             }
         }
-        self.update_swap(id, |s| s.status = SwapStatus::Failed).await
+        self.get_swap(id).await
     }
 
     /// Spend LP VTXOs on Tachi to `dest` (P2TR address or x-only pubkey hex).
