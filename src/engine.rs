@@ -94,6 +94,12 @@ const UNPAID_SWAP_SECS: i64 = 60 * 60;
 const UNPAID_SWAP_BLOCKS: u32 = 6;
 /// Fee-rate floor for the desk's own L1 txs (2 sat/vB).
 const MIN_FEE_RATE_MSAT_VB: u64 = 2_000;
+/// Fee-rate ceiling on test networks (25 sat/vB). Signet's estimatesmartfee
+/// answered 3,902 sat/vB for every target while its mempool took 0.1 sat/vB,
+/// which priced a 10k-sat lock at 650k sats of fee.
+const MAX_TEST_FEE_RATE_MSAT_VB: u64 = 25_000;
+/// Sanity ceiling on mainnet (1,000 sat/vB): follows real spikes, not nonsense.
+const MAX_FEE_RATE_MSAT_VB: u64 = 1_000_000;
 /// Confirmation target asked of `estimatesmartfee`.
 const FEE_TARGET_BLOCKS: u32 = 6;
 /// Bump a desk claim that is still unconfirmed this close to the timeout.
@@ -815,7 +821,12 @@ impl Engine {
         }
         match self.tachi.estimate_fee_rate(FEE_TARGET_BLOCKS).await {
             Ok(Some(rate)) => {
-                let msat = ((rate * 1_000.0) as u64).max(MIN_FEE_RATE_MSAT_VB);
+                let cap = if self.network == Network::Bitcoin {
+                    MAX_FEE_RATE_MSAT_VB
+                } else {
+                    MAX_TEST_FEE_RATE_MSAT_VB
+                };
+                let msat = ((rate * 1_000.0) as u64).clamp(MIN_FEE_RATE_MSAT_VB, cap);
                 self.fee_rate.store(msat, Ordering::Relaxed);
             }
             Ok(None) => {}
