@@ -2059,12 +2059,15 @@ impl Engine {
             txid: parse_txid(&u.txid)?,
             vout: u.vout,
         };
+        // Change goes to the user, not back to the demo wallet: its key is
+        // dropped below, and a hand payment can be far more than the lock.
+        let change = self.user_l1_destination(&swap)?;
         let hex = p2wpkh_send_hex(
             &[(op, u.value_sats)],
             &dest,
             swap.amount_sats,
             fee,
-            &from,
+            &change,
             &sk,
             self.network,
         )?;
@@ -4395,6 +4398,11 @@ impl Engine {
         let drip = (amount_sats + 20_000) as f64 / 100_000_000.0;
         let faucet_txid = crate::faucet::drip(&from.to_string(), drip).await?;
         let u = self.wait_for_coin_to(&faucet_txid, &from).await?;
+        // Change to the owner: `sk` is never stored.
+        let change = Address::p2wpkh(
+            &bitcoin::CompressedPublicKey::try_from(owner).map_err(|e| Error::Bitcoin(e.to_string()))?,
+            bitcoin::KnownHrp::from(self.network),
+        );
         let hex = p2wpkh_send_hex(
             &[(
                 OutPoint {
@@ -4406,7 +4414,7 @@ impl Engine {
             &lock,
             amount_sats,
             300,
-            &from,
+            &change,
             &sk,
             self.network,
         )?;
