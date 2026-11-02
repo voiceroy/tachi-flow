@@ -212,6 +212,9 @@ struct LpSpend {
     /// once per process: `l1` is lost on restart, and only this desk can
     /// spend its coins, so after one check `l1` tracks every later spend.
     checked: HashSet<OutPoint>,
+    /// Confirmed coins from the last scan of the claim address, and the
+    /// height it was taken at.
+    scanned: Option<(u32, Vec<(OutPoint, u64)>)>,
 }
 
 impl LpSpend {
@@ -943,21 +946,35 @@ impl Engine {
     /// What the desk can spend on L1 right now: confirmed coins it has not
     /// already spent in the mempool, plus its own unconfirmed change.
     async fn live_l1_sats_for(&self, lp_id: &str, addr: &Address) -> u64 {
-        let confirmed: Vec<(OutPoint, u64)> = self
+        let Ok(mut spend) = self.lp_spend(lp_id).await else {
+            return 0;
+        };
+        let confirmed = self.confirmed_l1(&mut spend, addr).await.unwrap_or_default();
+        let confirmed = self.drop_mempool_spent(&mut spend, confirmed).await;
+        spend.spendable_l1(&confirmed).iter().map(|(_, v)| v).sum()
+    }
+
+    /// The desk's confirmed coins at `addr`, scanned once per block. They only
+    /// change when a block lands (its own spends and change in between are in
+    /// `spend.l1` / `spend.pending`), and on signet the node's one scan slot
+    /// is so busy that a scan per sync made each books refresh take a minute.
+    async fn confirmed_l1(&self, spend: &mut LpSpend, addr: &Address) -> Result<Vec<(OutPoint, u64)>, Error> {
+        let h = self.cached_height();
+        if let Some((at, coins)) = &spend.scanned
+            && *at == h
+            && h != 0
+        {
+            return Ok(coins.clone());
+        }
+        let coins = self
             .tachi
             .scan_address(&addr.to_string())
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
-            .filter_map(|u| Some((OutPoint { txid: parse_txid(&u.txid).ok()?, vout: u.vout }, u.value_sats)))
-            .collect();
-        match self.lp_spend(lp_id).await {
-            Ok(mut spend) => {
-                let confirmed = self.drop_mempool_spent(&mut spend, confirmed).await;
-                spend.spendable_l1(&confirmed).iter().map(|(_, v)| v).sum()
-            }
-            Err(_) => confirmed.iter().map(|(_, v)| v).sum(),
-        }
+            .map(|u| Ok((OutPoint { txid: parse_txid(&u.txid)?, vout: u.vout }, u.value_sats)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        spend.scanned = Some((h, coins.clone()));
+        Ok(coins)
     }
 
     /// Drop confirmed coins an unconfirmed tx already spends. After a restart
@@ -3863,13 +3880,7 @@ impl Engine {
         let amount_sats: u64 = outputs.iter().map(|(_, v)| *v).sum();
         let mut spend = self.lp_spend(lp_id).await?;
         let w = self.lp_wallet(lp_id)?;
-        let confirmed = self
-            .tachi
-            .scan_address(&w.claim_address.to_string())
-            .await?
-            .into_iter()
-            .map(|u| Ok((OutPoint { txid: parse_txid(&u.txid)?, vout: u.vout }, u.value_sats)))
-            .collect::<Result<Vec<_>, Error>>()?;
+        let confirmed = self.confirmed_l1(&mut spend, &w.claim_address).await?;
         let confirmed = self.drop_mempool_spent(&mut spend, confirmed).await;
         // The fee grows with each input picked (outputs + change).
         let fee_with = |inputs: usize| self.fee_for(p2wpkh_send_vbytes(inputs, outputs.len() + 1));
