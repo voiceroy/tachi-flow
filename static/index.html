@@ -277,7 +277,7 @@
       if (s.status === "quoted" && s.side === "out" && !s.l1_lock_txid)
         return "Accept done. Desk is locking bitcoin first (same HTLC as inbound, roles reversed). Wait, then send Tachi coins.";
       if (s.status === "quoted" && s.side === "out" && s.l1_lock_txid)
-        return "Desk lock is up. Send my Tachi coins — then you claim the bitcoin. If you never send, they refund after the timeout (not a 1008-block vault wait).";
+        return "Desk lock is up. Once it has 1 confirmation (the next block, ~10 min), Send my Tachi coins — then you claim the bitcoin. If you never send, they refund after the timeout (not a 1008-block vault wait).";
       if (s.status === "lp_settled" && s.side === "in")
         return "Desk paid your Tachi coins. Claiming the bitcoin lock…";
       if (s.status === "lp_settled" && s.side === "out")

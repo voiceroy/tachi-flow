@@ -59,9 +59,10 @@ pub const HTLC_TIMEOUT_BLOCKS: u32 = 144;
 /// Stop settling this many blocks before an HTLC times out, so a claim has
 /// time to confirm before the other side can take the refund path.
 const SAFETY_MARGIN_BLOCKS: u32 = 12;
-/// Confirmations an inbound lock needs before the desk pays VTXOs. A lock
-/// still in the mempool can be replaced (RBF) after the user has the VTXOs.
-const INBOUND_LOCK_CONFIRMATIONS: u32 = 1;
+/// Confirmations a lock needs before the other side pays VTXOs: the desk for
+/// an inbound lock, the user (through Send) for the desk's outbound lock. A
+/// lock still in the mempool can be replaced (RBF) after the VTXOs are gone.
+const LOCK_CONFIRMATIONS: u32 = 1;
 /// TAURUS unilateral-exit leaf (CSV). The swap exists so users skip this wait.
 pub const VAULT_EXIT_BLOCKS: u32 = 1008;
 const CLAIM_FEE_SATS: u64 = 500;
@@ -2206,11 +2207,20 @@ impl Engine {
             let lock = lock
                 .as_ref()
                 .ok_or_else(|| Error::Invalid("swap has no desk lock".into()))?;
-            if self.scan_htlc(swap).await?.is_none() {
+            let Some(found) = self.scan_htlc(swap).await? else {
                 return Err(Error::Invalid(
                     "desk has not locked bitcoin yet — wait for the HTLC, then send Tachi coins"
                         .into(),
                 ));
+            };
+            // The mirror of the inbound rule: a desk lock still in the
+            // mempool could be replaced after the user's coins are gone.
+            let conf = self.lock_confirmations(&found.txid).await?;
+            if conf < LOCK_CONFIRMATIONS {
+                return Err(Error::Invalid(format!(
+                    "the desk's lock {} has {conf} confirmations; send once it has {LOCK_CONFIRMATIONS} (the next block)",
+                    found.txid
+                )));
             }
             let h = self.fresh_height().await?;
             if h + SAFETY_MARGIN_BLOCKS >= lock.timeout_height {
@@ -2366,9 +2376,9 @@ impl Engine {
         }
         if !self.test_mode {
             let conf = self.lock_confirmations(&funding.txid).await?;
-            if conf < INBOUND_LOCK_CONFIRMATIONS {
+            if conf < LOCK_CONFIRMATIONS {
                 return Err(Error::Invalid(format!(
-                    "lock {} has {conf} confirmations; the desk pays at {INBOUND_LOCK_CONFIRMATIONS}",
+                    "lock {} has {conf} confirmations; the desk pays at {LOCK_CONFIRMATIONS}",
                     funding.txid
                 )));
             }
@@ -3645,7 +3655,7 @@ impl Engine {
                 if near_timeout {
                     self.expire(id).await?;
                 } else if let Some(lock) = self.scan_htlc(&before).await?
-                    && self.lock_confirmations(&lock.txid).await? >= INBOUND_LOCK_CONFIRMATIONS
+                    && self.lock_confirmations(&lock.txid).await? >= LOCK_CONFIRMATIONS
                 {
                     self.observe_lock_inner(id, ObserveLockRequest::default())
                         .await?;

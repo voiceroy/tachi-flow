@@ -106,7 +106,7 @@ Operator routes need `x-admin-token: <token>` (or `Authorization: Bearer <token>
 `quoted` → `lp_settled` → `claimed`, or `expired` / `refunded` / `failed`.
 
 - Timeouts are absolute block heights. The server fetches the tip before serving and refuses to quote while it is unknown.
-- The desk pays VTXOs for an inbound lock only once it has 1 confirmation. A lock still in the mempool could be replaced (RBF) after the user had the VTXOs.
+- The desk pays VTXOs for an inbound lock only once it has 1 confirmation, and **Send** (`pay-vtxo`) waits for 1 confirmation of the desk's outbound lock. A lock still in the mempool could be replaced (RBF) after the other side had paid VTXOs. A user paying outbound from their own wallet should wait for that confirmation too.
 - The desk stops settling 12 blocks before a lock's timeout. Such swaps become `expired`; the user refunds an inbound lock after the timeout, and the desk takes back an unpaid outbound lock.
 - Desk payouts (VTXOs and L1 locks) are signed and saved before broadcast. Retries re-send the same tx or confirm it landed, so a lost reply cannot pay twice.
 - Open quotes and unsettled swaps hold desk inventory; live books are chain balance minus those holds.
