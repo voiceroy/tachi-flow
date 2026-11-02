@@ -73,13 +73,13 @@ async fn main() -> std::io::Result<()> {
 
     // Behind a reverse proxy the peer address is the proxy's; count the caps
     // against the IP it forwards instead. Only set this where a proxy that
-    // appends to X-Forwarded-For fronts every request.
+    // overwrites X-Real-IP (Railway) fronts every request.
     let trust_proxy = matches!(
         env::var("TRUST_PROXY").ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
     );
     if trust_proxy {
-        tracing::info!("TRUST_PROXY: per-client caps use the last X-Forwarded-For entry");
+        tracing::info!("TRUST_PROXY: per-client caps use X-Real-IP");
     }
 
     let admin = AdminToken(load_or_create_admin_token());

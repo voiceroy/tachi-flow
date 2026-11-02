@@ -71,7 +71,7 @@ Env:
 | `TACHI_FAUCET_URL` | `https://faucet.tachibtc.com` |
 | `TEST_MODE` | unset = live Tachi |
 | `ADMIN_TOKEN` | unset = read/create `tachi-flow-admin.token` (0600) |
-| `TRUST_PROXY` | unset = per-client caps use the peer IP; `1` = the last `X-Forwarded-For` entry (set behind Railway's proxy, never when clients connect directly) |
+| `TRUST_PROXY` | unset = per-client caps use the peer IP; `1` = the `X-Real-IP` Railway's proxy sets (never when clients connect directly) |
 | `LND_REST_URL` | unset = Lightning off |
 | `LND_MACAROON_HEX` / `LND_MACAROON_PATH` | required with `LND_REST_URL` |
 | `LND_TLS_CERT_PATH` | LND's self-signed cert, if not publicly trusted |

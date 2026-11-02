@@ -53,25 +53,27 @@ fn is_admin(req: &HttpRequest) -> bool {
         .is_some_and(|(want, got)| constant_time_eq(want.0.as_bytes(), got.trim().as_bytes()))
 }
 
-/// Present when the server sits behind a reverse proxy (Railway, Fly…) that
-/// appends the visitor's IP to `X-Forwarded-For`. Without it the peer
-/// address is the proxy, which changes per connection, so the caps never fill.
+/// Present when the server sits behind a reverse proxy (Railway) that sets
+/// `X-Real-IP` to the visitor's IP, overwriting any the client sent. Without
+/// it the peer address is the proxy, which changes per connection, so the
+/// caps never fill. `X-Forwarded-For` is not used: Railway passes the
+/// client's own value through.
 #[derive(Clone)]
 pub struct TrustProxy;
 
 /// Who a quote request counts against for the anti-griefing caps: the peer
-/// IP, or behind a trusted proxy the last `X-Forwarded-For` entry (the one the
-/// proxy added; earlier entries are whatever the client sent). Operator
-/// requests (admin token) are not capped.
+/// IP, or behind a trusted proxy its `X-Real-IP`. Operator requests (admin
+/// token) are not capped.
 fn quote_client(req: &HttpRequest) -> Option<String> {
     if is_admin(req) {
         return None;
     }
     let forwarded = req
         .app_data::<web::Data<TrustProxy>>()
-        .and_then(|_| req.headers().get("x-forwarded-for"))
+        .and_then(|_| req.headers().get("x-real-ip"))
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').map(str::trim).find(|ip| !ip.is_empty()))
+        .map(str::trim)
+        .filter(|ip| !ip.is_empty())
         .map(str::to_string);
     Some(forwarded.unwrap_or_else(|| {
         req.peer_addr()
@@ -890,11 +892,12 @@ mod tests {
         )
         .await;
         let user = generate_keypair();
-        let ask = |port: u16, xff: &str| {
+        let ask = |port: u16, ip: &str| {
             test::TestRequest::post()
                 .uri("/v1/rfq")
                 .peer_addr(format!("10.0.0.1:{port}").parse().unwrap())
-                .insert_header(("x-forwarded-for", xff.to_string()))
+                .insert_header(("x-real-ip", ip.to_string()))
+                .insert_header(("x-forwarded-for", format!("198.51.100.{port}")))
                 .set_json(serde_json::json!({
                     "side": "in",
                     "amount_sats": 10_000,
@@ -905,12 +908,12 @@ mod tests {
                 .to_request()
         };
         // Three RFQs (two desks each) over new proxy connections fill the cap;
-        // a forged leading entry does not make the visitor someone else.
+        // a changing client-sent X-Forwarded-For does not make the visitor
+        // someone else.
         for port in 1..=3 {
             assert_eq!(test::call_service(&app, ask(port, "203.0.113.7")).await.status(), 201);
         }
-        let forged = ask(4, "198.51.100.1, 203.0.113.7");
-        assert_eq!(test::call_service(&app, forged).await.status(), 429);
+        assert_eq!(test::call_service(&app, ask(4, "203.0.113.7")).await.status(), 429);
         assert_eq!(test::call_service(&app, ask(5, "203.0.113.8")).await.status(), 201);
     }
 
