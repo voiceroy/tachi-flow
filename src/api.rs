@@ -653,13 +653,14 @@ async fn sync_swap(
     engine: web::Data<Engine>,
     path: web::Path<Uuid>,
 ) -> Result<HttpResponse, Error> {
-    match engine.sync_swap(path.into_inner()).await? {
-        Some(swap) => Ok(HttpResponse::Ok().json(swap)),
-        None => Ok(HttpResponse::Ok().json(serde_json::json!({
-            "status": "waiting",
-            "hint": "pay the quote address, then sync again"
-        }))),
-    }
+    // Nothing changed on this call (still unpaid, or the background sync got
+    // there first): answer with the swap as it stands, not "waiting".
+    let id = path.into_inner();
+    let swap = match engine.sync_swap(id).await? {
+        Some(swap) => swap,
+        None => engine.get_swap(id).await?,
+    };
+    Ok(HttpResponse::Ok().json(swap))
 }
 
 #[derive(serde::Deserialize)]
