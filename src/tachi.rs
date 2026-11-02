@@ -7,7 +7,16 @@ use crate::error::Error;
 pub struct TachiClient {
     http: reqwest::Client,
     base_url: String,
+    /// bitcoind runs one `scantxoutset` at a time. Without this our own
+    /// syncs and request handlers collide with each other.
+    scan: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
+
+/// A full UTXO-set scan on signet outlasts the 3 s default; giving up early
+/// leaves the node scanning and every later scan fails. Tachi's SDK uses 30 s.
+const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Retries while someone else's scan holds the node's single scan slot.
+const SCAN_RETRIES: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vtxo {
@@ -40,6 +49,7 @@ impl TachiClient {
         Ok(Self {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            scan: Default::default(),
         })
     }
 
@@ -71,16 +81,26 @@ impl TachiClient {
 
     /// Bitcoin Core JSON-RPC 1.0 proxy as documented at POST `/`.
     pub async fn bitcoin_rpc(&self, method: &str, params: Value) -> Result<Value, Error> {
+        self.bitcoin_rpc_within(method, params, None).await
+    }
+
+    async fn bitcoin_rpc_within(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Value, Error> {
         let body = serde_json::json!({
             "id": "tachi-flow",
             "jsonrpc": "1.0",
             "method": method,
             "params": params,
         });
-        let resp = self
-            .http
-            .post(format!("{}/", self.base_url))
-            .json(&body)
+        let mut req = self.http.post(format!("{}/", self.base_url)).json(&body);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| Error::Tachi(e.to_string()))?;
@@ -268,12 +288,23 @@ impl TachiClient {
     }
 
     pub async fn scan_address(&self, address: &str) -> Result<Vec<ChainUtxo>, Error> {
-        let result = self
-            .bitcoin_rpc(
-                "scantxoutset",
-                serde_json::json!(["start", [format!("addr({address})")]]),
-            )
-            .await?;
+        let _one_at_a_time = self.scan.lock().await;
+        let params = serde_json::json!(["start", [format!("addr({address})")]]);
+        let mut attempt = 0;
+        let result = loop {
+            match self
+                .bitcoin_rpc_within("scantxoutset", params.clone(), Some(SCAN_TIMEOUT))
+                .await
+            {
+                Err(Error::TachiRejected(why))
+                    if why.contains("Scan already in progress") && attempt < SCAN_RETRIES =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(500 << attempt)).await;
+                }
+                other => break other?,
+            }
+        };
         let mut out = Vec::new();
         if let Some(unspents) = result.get("unspents").and_then(Value::as_array) {
             for u in unspents {
