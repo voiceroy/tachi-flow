@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -10,6 +11,9 @@ pub struct TachiClient {
     /// bitcoind runs one `scantxoutset` at a time. Without this our own
     /// syncs and request handlers collide with each other.
     scan: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Outputs (vout, address, sats) of mempool txs already read, so a
+    /// mempool search only fetches txs it has not seen.
+    mempool: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<(u32, String, u64)>>>>,
 }
 
 /// A full UTXO-set scan on signet outlasts the 3 s default; giving up early
@@ -50,6 +54,7 @@ impl TachiClient {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             scan: Default::default(),
+            mempool: Default::default(),
         })
     }
 
@@ -327,6 +332,60 @@ impl TachiClient {
             }
         }
         Ok(out)
+    }
+
+    /// Unconfirmed outputs paying `address`, found by reading the mempool
+    /// (`scantxoutset` sees only confirmed coins and the node has no address
+    /// index). Each tx is fetched once; txs that leave the mempool are dropped.
+    pub async fn mempool_outputs_to(&self, address: &str) -> Result<Vec<ChainUtxo>, Error> {
+        let txids: Vec<String> = serde_json::from_value(self.bitcoin_rpc("getrawmempool", serde_json::json!([])).await?)
+            .map_err(|e| Error::Tachi(format!("getrawmempool: {e}")))?;
+        let mut cache = self.mempool.lock().await;
+        let live: std::collections::HashSet<&String> = txids.iter().collect();
+        cache.retain(|txid, _| live.contains(txid));
+        let unseen: Vec<String> = txids.iter().filter(|t| !cache.contains_key(*t)).cloned().collect();
+        // A busy signet mempool is ~100 txs: fetch them a few at a time.
+        let fetched: Vec<(String, Option<Value>)> = futures_util::stream::iter(unseen)
+            .map(|txid| {
+                let client = self.clone();
+                async move {
+                    let tx = client.bitcoin_rpc("getrawtransaction", serde_json::json!([txid, true])).await;
+                    (txid, tx.ok())
+                }
+            })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+        for (txid, tx) in fetched {
+            // Gone between the listing and now (mined or evicted): skip it.
+            let Some(tx) = tx else { continue };
+            let outs = tx
+                .get("vout")
+                .and_then(Value::as_array)
+                .map(|vout| {
+                    vout.iter()
+                        .filter_map(|o| {
+                            let n = o.get("n")?.as_u64()? as u32;
+                            let addr = o.pointer("/scriptPubKey/address")?.as_str()?.to_string();
+                            let sats = (o.get("value")?.as_f64()? * 100_000_000.0).round() as u64;
+                            Some((n, addr, sats))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            cache.insert(txid, outs);
+        }
+        Ok(cache
+            .iter()
+            .flat_map(|(txid, outs)| {
+                outs.iter().filter(|(_, a, _)| a == address).map(|(vout, _, sats)| ChainUtxo {
+                    txid: txid.clone(),
+                    vout: *vout,
+                    value_sats: *sats,
+                    script_pubkey_hex: String::new(),
+                })
+            })
+            .collect())
     }
 
     /// Mempool-aware `gettxout`. Used so a just-broadcast faucet/lock tx is visible

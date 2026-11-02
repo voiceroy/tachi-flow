@@ -3697,11 +3697,16 @@ impl Engine {
             (Side::In, SwapStatus::Quoted) => {
                 if near_timeout {
                     self.expire(id).await?;
-                } else if let Some(lock) = self.scan_htlc(&before).await?
-                    && self.lock_confirmations(&lock.txid).await? >= LOCK_CONFIRMATIONS
-                {
-                    self.observe_lock_inner(id, ObserveLockRequest::default())
-                        .await?;
+                } else if let Some(lock) = self.scan_htlc(&before).await? {
+                    if self.lock_confirmations(&lock.txid).await? >= LOCK_CONFIRMATIONS {
+                        self.observe_lock_inner(id, ObserveLockRequest::default())
+                            .await?;
+                    } else if before.l1_lock_txid.is_none() {
+                        // Seen in the mempool: record it (the UI says it is
+                        // broadcast; later checks go straight to it), settle
+                        // once it confirms.
+                        self.update_swap(id, |s| s.l1_lock_txid = Some(lock.txid)).await?;
+                    }
                 }
             }
             (Side::In, SwapStatus::LpSettled) => {
@@ -3770,14 +3775,23 @@ impl Engine {
             }
         }
         let utxos = self.tachi.scan_address(&lock.address).await?;
-        Ok(utxos
-            .into_iter()
-            .find(|u| u.value_sats >= need)
-            .map(|u| ObserveLockRequest {
-                txid: u.txid,
-                vout: u.vout,
-                value_sats: u.value_sats,
-            }))
+        let found = match utxos.into_iter().find(|u| u.value_sats >= need) {
+            Some(u) => Some(u),
+            // A lock paid from the user's own wallet and not mined yet: only
+            // the mempool knows it. Missing it let a cancel go through on a
+            // paid lock, stranding the coins until the timeout.
+            None => self
+                .tachi
+                .mempool_outputs_to(&lock.address)
+                .await?
+                .into_iter()
+                .find(|u| u.value_sats >= need),
+        };
+        Ok(found.map(|u| ObserveLockRequest {
+            txid: u.txid,
+            vout: u.vout,
+            value_sats: u.value_sats,
+        }))
     }
 
     /// Find the user's payment for an outbound swap without being told its id.
