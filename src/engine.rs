@@ -207,6 +207,10 @@ struct LpSpend {
     /// refunds) that are not confirmed yet. Spendable right away, so the
     /// desk need not wait a block between exits.
     pending: HashMap<OutPoint, u64>,
+    /// Confirmed coins the node said were not spent in its mempool. Checked
+    /// once per process: `l1` is lost on restart, and only this desk can
+    /// spend its coins, so after one check `l1` tracks every later spend.
+    checked: HashSet<OutPoint>,
 }
 
 impl LpSpend {
@@ -231,6 +235,7 @@ impl LpSpend {
     /// and spent markers for coins that are gone are forgotten.
     fn spendable_l1(&mut self, confirmed: &[(OutPoint, u64)]) -> Vec<(OutPoint, u64)> {
         let seen: HashSet<OutPoint> = confirmed.iter().map(|(op, _)| *op).collect();
+        self.checked.retain(|op| seen.contains(op));
         self.pending.retain(|op, _| !seen.contains(op));
         let pending = &self.pending;
         self.l1.retain(|op| seen.contains(op) || pending.contains_key(op));
@@ -946,9 +951,39 @@ impl Engine {
             .filter_map(|u| Some((OutPoint { txid: parse_txid(&u.txid).ok()?, vout: u.vout }, u.value_sats)))
             .collect();
         match self.lp_spend(lp_id).await {
-            Ok(mut spend) => spend.spendable_l1(&confirmed).iter().map(|(_, v)| v).sum(),
+            Ok(mut spend) => {
+                let confirmed = self.drop_mempool_spent(&mut spend, confirmed).await;
+                spend.spendable_l1(&confirmed).iter().map(|(_, v)| v).sum()
+            }
             Err(_) => confirmed.iter().map(|(_, v)| v).sum(),
         }
+    }
+
+    /// Drop confirmed coins an unconfirmed tx already spends. After a restart
+    /// `spend.l1` no longer knows our own in-flight spends, so each coin is
+    /// asked about once (mempool-aware `gettxout`); a coin the node can't
+    /// answer for is left out this round rather than risk spending it twice.
+    async fn drop_mempool_spent(
+        &self,
+        spend: &mut LpSpend,
+        confirmed: Vec<(OutPoint, u64)>,
+    ) -> Vec<(OutPoint, u64)> {
+        let mut keep = Vec::with_capacity(confirmed.len());
+        for (op, value) in confirmed {
+            if !spend.checked.contains(&op) && !spend.l1.contains(&op) {
+                match self.tachi.get_tx_out(&op.txid.to_string(), op.vout).await {
+                    Ok(Some(_)) => {
+                        spend.checked.insert(op);
+                    }
+                    Ok(None) => {
+                        spend.l1.insert(op);
+                    }
+                    Err(_) => continue,
+                }
+            }
+            keep.push((op, value));
+        }
+        keep
     }
 
     /// Books = what the desk holds on chain minus what open quotes and swaps
@@ -3768,6 +3803,7 @@ impl Engine {
             .into_iter()
             .map(|u| Ok((OutPoint { txid: parse_txid(&u.txid)?, vout: u.vout }, u.value_sats)))
             .collect::<Result<Vec<_>, Error>>()?;
+        let confirmed = self.drop_mempool_spent(&mut spend, confirmed).await;
         // The fee grows with each input picked (outputs + change).
         let fee_with = |inputs: usize| self.fee_for(p2wpkh_send_vbytes(inputs, outputs.len() + 1));
         let mut picked: Vec<(OutPoint, u64)> = Vec::new();
@@ -5059,10 +5095,13 @@ fn reserved(inner: &Inner, lp_id: &str) -> (u64, u64) {
         .quotes
         .values()
         .map(|q| (&q.lp_id, q.side, q.receive_sats));
+    // An outbound swap whose lock is funded already left the desk's balance;
+    // holding it too would count those coins twice until the user pays.
     let swaps = inner
         .swaps
         .values()
         .filter(|s| s.status == SwapStatus::Quoted)
+        .filter(|s| !(s.side == Side::Out && s.l1_lock_txid.is_some()))
         .map(|s| (&s.lp_id, s.side, s.receive_sats));
     let (mut vtxo, mut l1) = (0u64, 0u64);
     for (id, side, receive) in quotes.chain(swaps) {
