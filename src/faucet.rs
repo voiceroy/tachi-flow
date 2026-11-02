@@ -25,6 +25,15 @@ pub async fn drip(address: &str, amount_btc: f64) -> Result<String, Error> {
         .send()
         .await
         .map_err(|e| Error::Tachi(format!("faucet: {e}")))?;
+    // The faucet sits behind a Cloudflare browser check: a 403 HTML page
+    // with `cf-mitigated: challenge` instead of JSON.
+    if resp.headers().contains_key("cf-mitigated") || resp.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err(Error::Tachi(format!(
+            "the faucet at {} only answers a browser that passes its bot check (HTTP {})",
+            faucet_url(),
+            resp.status().as_u16()
+        )));
+    }
     let payload: Value = resp
         .json()
         .await

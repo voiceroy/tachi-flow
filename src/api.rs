@@ -13,7 +13,7 @@ use crate::hosted::RegisterDeskRequest;
 use crate::htlc::{generate_keypair, p2wpkh_address};
 use crate::model::{
     AdvanceAcceptRequest, AdvanceQuoteRequest, CreatePlanRequest, CreateQuoteRequest,
-    CreateSwapRequest, LnQuoteRequest, ObserveLockRequest, ObserveVtxoRequest, Quote, Side,
+    CreateSwapRequest, FundRequest, LnQuoteRequest, ObserveLockRequest, ObserveVtxoRequest, Quote, Side,
     WebhookRequest,
 };
 use crate::tachi::Health;
@@ -717,13 +717,16 @@ async fn demo_keys(engine: web::Data<Engine>) -> HttpResponse {
     })
 }
 
-/// Faucet a P2WPKH and forward into the inbound lock (hosted faucet refuses P2WSH).
+/// Fund a P2WPKH (faucet, or by hand: body `{"txid": …}`) and forward into
+/// the inbound lock (the hosted faucet refuses P2WSH).
 #[post("/v1/swaps/{id}/fund")]
 async fn fund_inbound(
     engine: web::Data<Engine>,
     path: web::Path<Uuid>,
+    body: Option<web::Json<FundRequest>>,
 ) -> Result<HttpResponse, Error> {
-    Ok(HttpResponse::Ok().json(engine.fund_inbound(path.into_inner()).await?))
+    let txid = body.and_then(|b| b.into_inner().txid).filter(|t| !t.trim().is_empty());
+    Ok(HttpResponse::Ok().json(engine.fund_inbound(path.into_inner(), txid).await?))
 }
 
 /// Sign a VTXO payment from the user's demo secret to the outbound desk key,

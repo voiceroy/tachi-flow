@@ -321,6 +321,7 @@ impl TachiClient {
                         txid,
                         vout,
                         value_sats,
+                        script_pubkey_hex: String::new(),
                     });
                 }
             }
@@ -350,6 +351,11 @@ impl TachiClient {
             txid: txid.to_string(),
             vout,
             value_sats,
+            script_pubkey_hex: result
+                .pointer("/scriptPubKey/hex")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         }))
     }
 
@@ -442,6 +448,9 @@ pub struct ChainUtxo {
     pub txid: String,
     pub vout: u32,
     pub value_sats: u64,
+    /// Set by `get_tx_out`; a scan already matched the address.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub script_pubkey_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

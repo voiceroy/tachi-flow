@@ -505,6 +505,14 @@ pub struct ObserveVtxoRequest {
     pub vtxo_id: String,
 }
 
+/// Optional body of `/fund`: the tx that paid the swap's `fund_address`
+/// when the user funded it by hand.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FundRequest {
+    #[serde(default)]
+    pub txid: Option<String>,
+}
+
 pub fn fee_sats(amount: u64, fee_ppm: u64, min_fee: u64) -> u64 {
     let proportional = amount.saturating_mul(fee_ppm) / 1_000_000;
     proportional.max(min_fee)

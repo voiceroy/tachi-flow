@@ -21,7 +21,7 @@ One server runs both networks. Each has its own engine, Tachi RPC and state file
 1. Open `http://127.0.0.1:8080`. The page creates a **demo identity** and keeps it in the browser.
 2. Direction: **I have bitcoin, I want Tachi coins**. Amount `20000`. **Get quotes from every desk** → pick a desk → Accept quote.
 3. Click **Fund with faucet**.  
-   Do **not** paste the lock address into https://faucet.tachibtc.com — that faucet rejects P2WSH lock addresses (`unknown output kind: p2wsh`). The desk faucets a normal wallet and forwards coins into the lock.
+   Do **not** paste the lock address into https://faucet.tachibtc.com — that faucet rejects P2WSH lock addresses (`unknown output kind: p2wsh`). The desk funds a normal wallet and forwards coins into the lock. The faucet now sits behind a Cloudflare browser check the server cannot pass, so the swap then shows a **fund address**: send it the amount shown from the faucet in your browser (or any signet faucet), paste that txid and click **Fund with faucet** again (`POST /v1/swaps/{id}/fund {"txid": …}`).
 4. Status moves to **claimed**. VTXOs sit on the Tachi key shown at the top.
 
 Optional outbound: quote **out** (same identity). Accept — the desk funds an HTLC to you. Then **Send my Tachi coins**. You claim the lock. If the desk never locks, you never send VTXOs. Clicking **Send** again after paying never pays twice; it only retries the claim.

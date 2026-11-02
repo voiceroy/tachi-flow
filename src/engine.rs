@@ -1965,9 +1965,12 @@ impl Engine {
         .await
     }
 
-    /// Faucet a normal P2WPKH, then send into the inbound HTLC. The hosted faucet
-    /// refuses P2WSH lock addresses (`unknown output kind: p2wsh`).
-    pub async fn fund_inbound(&self, id: Uuid) -> Result<Swap, Error> {
+    /// Fund a normal P2WPKH demo wallet, then send into the inbound HTLC. The
+    /// hosted faucet refuses P2WSH lock addresses (`unknown output kind:
+    /// p2wsh`) and now sits behind a browser check, so when the server cannot
+    /// drip, the user pays the swap's `fund_address` by hand and calls again
+    /// with that tx's id.
+    pub async fn fund_inbound(&self, id: Uuid, txid: Option<String>) -> Result<Swap, Error> {
         if self.test_mode {
             return Err(Error::Invalid(
                 "faucet helper is for live Tachi regtest, not TEST_MODE".into(),
@@ -2003,33 +2006,53 @@ impl Engine {
             .require_network(self.network)
             .map_err(|e| Error::Bitcoin(e.to_string()))?;
 
-        // Reuse the drip from an earlier attempt instead of asking twice.
+        if let Some(t) = &txid {
+            parse_txid(t)?;
+        }
+
+        // One demo wallet per swap, kept across attempts (and restarts) so a
+        // drip or a hand payment to it is never stranded.
         let existing = self.inner.read().await.fund_keys.get(&id).copied();
-        let (sk, faucet_txid) = match (existing, swap.faucet_txid.clone()) {
-            (Some(sk), Some(txid)) => (sk, txid),
-            _ => {
+        let sk = match existing {
+            Some(sk) => sk,
+            None => {
                 let sk = generate_keypair().secret;
-                let from = p2wpkh_address(&sk, self.network);
-                let drip_sats = swap.amount_sats.saturating_add(20_000).max(40_000);
-                let amount_btc = drip_sats as f64 / 100_000_000.0;
-                let txid = crate::faucet::drip(&from.to_string(), amount_btc).await?;
                 self.inner.write().await.fund_keys.insert(id, sk);
-                let t = txid.clone();
-                self.update_swap(id, |s| {
-                    s.faucet_txid = Some(t);
-                    s.fund_address = Some(from.to_string());
-                })
-                .await?;
-                (sk, txid)
+                sk
             }
         };
         let from = p2wpkh_address(&sk, self.network);
-        let u = self.wait_for_faucet_coin(&faucet_txid).await?;
+        if swap.fund_address.is_none() {
+            let a = from.to_string();
+            self.update_swap(id, |s| s.fund_address = Some(a)).await?;
+        }
+
+        // A txid from the user wins; then an earlier drip; else ask the faucet.
+        let need_sats = swap.amount_sats.saturating_add(20_000).max(40_000);
+        let funding_txid = match txid.or(swap.faucet_txid.clone()) {
+            Some(t) => t,
+            None => match crate::faucet::drip(&from.to_string(), need_sats as f64 / 100_000_000.0).await {
+                Ok(t) => t,
+                Err(err) => {
+                    let note = format!(
+                        "{err}. Send at least {need_sats} sats to {from} (for example from {} in your browser), then fund again with that transaction's id.",
+                        crate::faucet::faucet_url()
+                    );
+                    return self.update_swap(id, |s| s.demo_note = Some(note)).await;
+                }
+            },
+        };
+        if swap.faucet_txid.as_deref() != Some(funding_txid.as_str()) {
+            let t = funding_txid.clone();
+            self.update_swap(id, |s| s.faucet_txid = Some(t)).await?;
+        }
+        let u = self.wait_for_coin_to(&funding_txid, &from).await?;
         let fee = 300u64;
         if u.value_sats <= swap.amount_sats + fee {
             return Err(Error::Invalid(format!(
-                "faucet sent {} sats, need {} for the lock plus fee",
-                u.value_sats, swap.amount_sats
+                "{from} got {} sats, need more than {} for the lock plus fee",
+                u.value_sats,
+                swap.amount_sats + fee
             )));
         }
         let op = OutPoint {
@@ -2050,7 +2073,7 @@ impl Engine {
         self.update_swap(id, |s| {
             s.l1_lock_txid = Some(lock_txid);
             s.demo_note = Some(
-                "The Tachi faucet cannot pay a lock address, so we fauceted a normal wallet and forwarded coins into the lock.".into(),
+                "The Tachi faucet cannot pay a lock address, so a normal wallet was funded and its coins forwarded into the lock.".into(),
             );
         })
         .await
@@ -3783,18 +3806,30 @@ impl Engine {
     }
 
     /// The hosted faucet's payout, once bitcoind shows it (mempool-aware).
-    async fn wait_for_faucet_coin(&self, faucet_txid: &str) -> Result<crate::tachi::ChainUtxo, Error> {
-        for _ in 0..25 {
-            for vout in 0..4u32 {
-                if let Ok(Some(u)) = self.tachi.get_tx_out(faucet_txid, vout).await {
-                    return Ok(u);
+    /// The unspent output of `txid` that pays `to` (not the payer's change,
+    /// which can sit at any index), waiting briefly for the tx to reach the
+    /// node. A tx the node knows (mempool included) that pays `to` nothing
+    /// unspent fails at once rather than after the wait.
+    async fn wait_for_coin_to(&self, txid: &str, to: &Address) -> Result<crate::tachi::ChainUtxo, Error> {
+        let want = hex::encode(to.script_pubkey().as_bytes());
+        for _ in 0..10 {
+            if let Ok(Some(_)) = self.tachi.tx_confirmations(txid).await {
+                for vout in 0..8u32 {
+                    if let Ok(Some(u)) = self.tachi.get_tx_out(txid, vout).await
+                        && u.script_pubkey_hex.eq_ignore_ascii_case(&want)
+                    {
+                        return Ok(u);
+                    }
                 }
+                return Err(Error::Invalid(format!(
+                    "{txid} has no unspent output paying {to}"
+                )));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        Err(Error::Tachi(
-            "faucet paid but the coin is not visible on RPC yet — try again".into(),
-        ))
+        Err(Error::Invalid(format!(
+            "the node does not know {txid} yet; check the txid, or try again in a moment"
+        )))
     }
 }
 
@@ -4359,7 +4394,7 @@ impl Engine {
         let from = p2wpkh_address(&sk, self.network);
         let drip = (amount_sats + 20_000) as f64 / 100_000_000.0;
         let faucet_txid = crate::faucet::drip(&from.to_string(), drip).await?;
-        let u = self.wait_for_faucet_coin(&faucet_txid).await?;
+        let u = self.wait_for_coin_to(&faucet_txid, &from).await?;
         let hex = p2wpkh_send_hex(
             &[(
                 OutPoint {

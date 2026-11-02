@@ -163,6 +163,7 @@
       <button id="btnPayOut">Send my Tachi coins</button>
       <button id="btnSync" class="ghost">Check if paid</button>
       <button id="btnRefund" class="ghost">Refund / cancel</button>
+      <input id="fundTxid" placeholder="txid that paid the fund address (only if the faucet needs your browser)" />
       <p class="hint" id="swapHint"></p>
       <div id="status"></div>
     </section>
@@ -263,6 +264,8 @@
 
     function human(s) {
       if (!s) return "";
+      if (s.status === "quoted" && s.side === "in" && !s.faucet_txid && s.fund_address)
+        return "The faucet only answers your browser. Open faucet.tachibtc.com, send the amount below to the fund address (not the lock), paste the txid in the box and click Fund with faucet again.";
       if (s.status === "quoted" && s.side === "in" && !s.faucet_txid)
         return "Accepted. Click Fund with faucet (the public faucet cannot pay the lock address).";
       if (s.status === "quoted" && s.side === "in" && s.faucet_txid)
@@ -296,6 +299,8 @@
       let extra = "";
       if (pay.method === "l1_htlc") extra += "Lock: " + pay.address + "\n";
       if (pay.pay_to) extra += "Pay Tachi to: " + pay.pay_to + "\n";
+      if (s.fund_address && !s.l1_lock_txid)
+        extra += "Fund address: " + s.fund_address + " (at least " + sats(Math.max(s.amount_sats + 20000, 40000)) + ")\n";
       if (s.faucet_txid) extra += "Faucet tx: " + s.faucet_txid + "\n";
       if (s.l1_lock_txid) extra += "Bitcoin tx: " + s.l1_lock_txid + "\n";
       if (s.vtxo_payment_id) extra += "VTXO: " + s.vtxo_payment_id + "\n";
@@ -484,9 +489,14 @@
 
     $("btnFund").onclick = async () => {
       if (!swap) return;
-      $("swapHint").textContent = "Asking the faucet, then paying the lock…";
+      const txid = $("fundTxid").value.trim();
+      $("swapHint").textContent = txid ? "Forwarding your coins into the lock…" : "Asking the faucet, then paying the lock…";
       try {
-        showSwap(await j("/v1/swaps/" + swap.id + "/fund", { method: "POST" }));
+        showSwap(await j("/v1/swaps/" + swap.id + "/fund", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ txid: txid || null }),
+        }));
         startPoll();
         refreshSwaps();
       } catch (e) {
