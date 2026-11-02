@@ -2675,9 +2675,12 @@ impl Engine {
             None => {}
         }
         match (swap.side, swap.status) {
-            (Side::In, SwapStatus::Quoted | SwapStatus::Expired | SwapStatus::Refunded) => {
-                self.refund_inbound(swap, secret).await
-            }
+            // Failed covers a desk default flagged by the operator: the user's
+            // lock may be funded and is theirs to take back after the timeout.
+            (
+                Side::In,
+                SwapStatus::Quoted | SwapStatus::Expired | SwapStatus::Refunded | SwapStatus::Failed,
+            ) => self.refund_inbound(swap, secret).await,
             (Side::Out, SwapStatus::Quoted) if swap.vtxo_payment_id.is_none() => {
                 self.cancel(&swap).await
             }
