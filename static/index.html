@@ -489,7 +489,15 @@
     };
 
     $("btnPayOut").onclick = async () => {
-      if (!swap || !keys) return;
+      // Say why instead of ignoring the click: it is the button people try first.
+      const why = !keys ? "Your demo identity is still loading; try again in a moment."
+        : !swap ? "Open an outbound swap first: direction \"I have Tachi coins, I want bitcoin\", get quotes, then Accept quote."
+        : swap.side !== "out" ? "This is an inbound swap (bitcoin in). Send my Tachi coins is for outbound swaps."
+        : null;
+      if (why) {
+        $("swapHint").innerHTML = "<span class='warn'>" + why + "</span>";
+        return;
+      }
       $("swapHint").textContent = "Sending Tachi coins to the desk…";
       try {
         showSwap(await j("/v1/swaps/" + swap.id + "/pay-vtxo", {
