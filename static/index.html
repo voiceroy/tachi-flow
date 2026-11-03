@@ -282,6 +282,9 @@
 
     function showSwap(s) {
       swap = s;
+      // Kept per network like the identity, so a reload reopens this swap
+      // instead of leaving Send with nothing to act on.
+      try { localStorage.setItem(KEYS + ":swap", s.id); } catch {}
       const pay = s.pay || {};
       let extra = "";
       if (pay.method === "l1_htlc") extra += "Lock: " + pay.address + "\n";
@@ -720,8 +723,16 @@
       sw.hidden = false;
     }
 
+    async function restoreSwap() {
+      let id = null;
+      try { id = localStorage.getItem(KEYS + ":swap"); } catch {}
+      if (!id) return;
+      try { showSwap(await j("/v1/swaps/" + id)); } catch {}
+    }
+
     initNet().then(() => {
       ensureKeys();
+      restoreSwap();
       connectLive();
       refreshMeta();
       refreshBooks();
