@@ -78,6 +78,11 @@
     .net { display: inline-flex; gap: .5rem; margin-top: .8rem; }
     .net button { padding: .35rem .9rem; font-size: .85rem; background: transparent; color: var(--muted); border: 1px solid var(--line); }
     .net button.on { background: var(--accent); color: #111; border-color: var(--accent); }
+    a { color: var(--accent); }
+    #toasts { position: fixed; right: 1rem; bottom: 1rem; display: flex; flex-direction: column; gap: .5rem; z-index: 10; max-width: 24rem; }
+    .toast { background: var(--panel); border: 1px solid var(--accent); border-radius: 8px; padding: .7rem .9rem; font-size: .9rem; box-shadow: 0 4px 16px #0008; }
+    .toast strong { display: block; margin-bottom: .2rem; }
+    .toast button { float: right; margin: 0 0 0 .5rem; padding: 0 .4rem; background: transparent; color: var(--muted); }
   </style>
 </head>
 <body>
@@ -202,6 +207,7 @@
       </div>
     </section>
   </main>
+  <div id="toasts"></div>
   <script>
     const $ = (id) => document.getElementById(id);
     const NET_KEY = "tachi-flow-net";
@@ -212,6 +218,73 @@
 
     function sats(n) { return Number(n).toLocaleString() + " sats"; }
     function feePct(ppm) { return (ppm / 10000).toFixed(2) + "%"; }
+    function esc(s) { return String(s).replace(/[&<>"']/g, c => "&#" + c.charCodeAt(0) + ";"); }
+
+    // Tachi transfers and VTXOs open on the Tachi Explorer. It has no page for
+    // plain bitcoin txs, so those open on a bitcoin explorer for the same chain
+    // (Tachi signet is the public signet).
+    const EXPLORERS = {
+      signet: { tachi: "https://signet.tachibtcscan.com", btc: "https://mempool.space/signet" },
+      regtest: { tachi: "https://regtest.tachibtcscan.com", btc: "https://explorer-regtest.tachibtc.com" },
+    };
+    let metaNet = "";
+    function txUrl(kind, id) {
+      if (!/^[0-9a-f]{64}$/i.test(id || "")) return null;
+      const e = EXPLORERS[net || metaNet] || EXPLORERS.signet;
+      return kind === "btc" ? e.btc + "/tx/" + id : e.tachi + (kind === "vtxo" ? "/vtxo/" : "/tx/") + id;
+    }
+    function txLink(kind, id) {
+      const u = txUrl(kind, id);
+      return u ? `<a href="${u}" target="_blank" rel="noopener">${esc(id)}</a>` : esc(id || "");
+    }
+
+    // [field, explorer kind, label] for every transaction a swap or advance records.
+    const SWAP_TXS = [
+      ["faucet_txid", "btc", "Faucet paid the fund address"],
+      ["l1_lock_txid", "btc", "Bitcoin lock broadcast"],
+      ["tachi_tx_hash", "tachi", "Tachi coins sent"],
+      ["vtxo_payment_id", "vtxo", "Tachi coins (VTXO) paid"],
+      ["claim_txid", "btc", "Bitcoin lock claimed"],
+      ["refund_txid", "btc", "Lock refunded"],
+      ["compensation_vtxo_id", "vtxo", "Bond compensation paid"],
+      ["compensation_txid", "btc", "Bond compensation paid"],
+    ];
+    const ADVANCE_TXS = [
+      ["advance_txid", "btc", "Advance paid"],
+      ["collect_txid", "btc", "Advance collected"],
+    ];
+
+    // Ids already announced, kept per network so a reload doesn't repeat them.
+    function seenTxs() {
+      try { return new Set(JSON.parse(localStorage.getItem(KEYS + ":seen-txs") || "[]")); } catch { return new Set(); }
+    }
+    function notifyTx(kind, id, label) {
+      const url = txUrl(kind, id);
+      if (!url) return;
+      const seen = seenTxs();
+      if (seen.has(id)) return;
+      seen.add(id);
+      try { localStorage.setItem(KEYS + ":seen-txs", JSON.stringify([...seen].slice(-200))); } catch {}
+      const t = document.createElement("div");
+      t.className = "toast";
+      const where = kind === "btc" ? "bitcoin explorer" : "Tachi Explorer";
+      t.innerHTML = `<button title="Dismiss">×</button><strong>${esc(label)}</strong>` +
+        `<a href="${url}" target="_blank" rel="noopener">View ${id.slice(0, 10)}… on the ${where}</a>`;
+      t.querySelector("button").onclick = () => t.remove();
+      $("toasts").appendChild(t);
+      setTimeout(() => t.remove(), 30000);
+    }
+    function notifyAll(obj, fields) {
+      for (const [f, kind, label] of fields) {
+        // The Tachi tx hash covers the VTXO it created; announce one, not both.
+        if (f === "vtxo_payment_id" && obj.tachi_tx_hash) continue;
+        if (obj[f]) notifyTx(kind, obj[f], label);
+      }
+    }
+    function mine(s) {
+      return keys && (s.user_tachi_address === keys.tachi_xonly_hex || s.user_pubkey_hex === keys.pubkey_hex ||
+        (keys.l1_address && s.user_l1_address === keys.l1_address));
+    }
 
     function api(url) { return net && url.startsWith("/v1/") ? "/" + net + url : url; }
 
@@ -287,24 +360,30 @@
       try { localStorage.setItem(KEYS + ":swap", s.id); } catch {}
       const pay = s.pay || {};
       let extra = "";
-      if (pay.method === "l1_htlc") extra += "Lock: " + pay.address + "\n";
-      if (pay.pay_to) extra += "Pay Tachi to: " + pay.pay_to + "\n";
+      if (pay.method === "l1_htlc") extra += "Lock: " + esc(pay.address) + "\n";
+      if (pay.pay_to) extra += "Pay Tachi to: " + esc(pay.pay_to) + "\n";
       if (s.fund_address && !s.l1_lock_txid)
-        extra += "Fund address: " + s.fund_address + " (at least " + sats(Math.max(s.amount_sats + 20000, 40000)) + ")\n";
-      if (s.faucet_txid) extra += "Faucet tx: " + s.faucet_txid + "\n";
-      if (s.l1_lock_txid) extra += "Bitcoin tx: " + s.l1_lock_txid + "\n";
-      if (s.vtxo_payment_id) extra += "VTXO: " + s.vtxo_payment_id + "\n";
+        extra += "Fund address: " + esc(s.fund_address) + " (at least " + sats(Math.max(s.amount_sats + 20000, 40000)) + ")\n";
+      if (s.faucet_txid) extra += "Faucet tx: " + txLink("btc", s.faucet_txid) + "\n";
+      if (s.l1_lock_txid) extra += "Bitcoin tx: " + txLink("btc", s.l1_lock_txid) + "\n";
+      if (s.tachi_tx_hash) extra += "Tachi tx: " + txLink("tachi", s.tachi_tx_hash) + "\n";
+      if (s.vtxo_payment_id) extra += "VTXO: " + txLink("vtxo", s.vtxo_payment_id) + "\n";
+      if (s.claim_txid) extra += "Claim tx: " + txLink("btc", s.claim_txid) + "\n";
       const lock = pay.method === "l1_htlc" ? pay : pay.lock;
       if (lock && lock.timeout_height) extra += "Lock timeout: block " + lock.timeout_height + "\n";
-      if (s.preimage_hex) extra += "Preimage: " + s.preimage_hex + "\n";
-      if (s.refund_txid) extra += "Refund tx: " + s.refund_txid + "\n";
-      if (s.demo_note) extra += s.demo_note + "\n";
+      if (s.preimage_hex) extra += "Preimage: " + esc(s.preimage_hex) + "\n";
+      if (s.refund_txid) extra += "Refund tx: " + txLink("btc", s.refund_txid) + "\n";
+      if (s.compensation_vtxo_id) extra += "Compensation VTXO: " + txLink("vtxo", s.compensation_vtxo_id) + "\n";
+      if (s.compensation_txid) extra += "Compensation tx: " + txLink("btc", s.compensation_txid) + "\n";
+      if (s.demo_note) extra += esc(s.demo_note) + "\n";
       $("swapHint").innerHTML = "<span class='" + (s.status === "claimed" || s.status === "lp_settled" ? "ok" : "") + "'>" + human(s) + "</span>";
-      $("status").textContent = "Swap " + s.id + " · " + s.side + " · " + sats(s.amount_sats) + " via " + s.lp_id + "\n" + extra;
+      $("status").innerHTML = "Swap " + esc(s.id) + " · " + esc(s.side) + " · " + sats(s.amount_sats) + " via " + esc(s.lp_id) + "\n" + extra;
+      notifyAll(s, SWAP_TXS);
     }
 
     async function refreshMeta() {
       const m = await j("/v1/meta");
+      metaNet = m.network;
       $("meta").textContent = m.bounty + " · " + m.network + " · " + m.tachi + " · block " + m.height +
         (liveUp() ? " · live" : "");
     }
@@ -560,6 +639,9 @@
       live.addEventListener("swap", (m) => {
         const s = JSON.parse(m.data).data;
         if (swap && s.id === swap.id) showSwap(s);
+        // Swaps of an exit plan (and any other swap of this identity) announce
+        // their transactions too, not only the one on screen.
+        else if (mine(s)) notifyAll(s, SWAP_TXS);
         refreshListsSoon();
       });
       live.addEventListener("advance", (m) => {
@@ -613,9 +695,10 @@
       advance = a;
       $("advBox").innerHTML = `<p>Advance <strong>${a.status}</strong> via ${a.lp_id}: you get <strong>${sats(a.advance_sats)}</strong> now for ${sats(a.value_sats)} maturing at block ${a.mature_height} (discount ${sats(a.discount_sats)}).</p>` +
         (a.kind === "vault_refund" ? `<p>Refund of Tachi vault <code>${(a.vault_id || "").slice(0, 16)}…</code> · ${a.quorum_signatures ? `<strong class="ok">co-signed by ${a.quorum_signatures} validators</strong> (verified)` : "<strong>not quorum-attested</strong>"} · watchtower receipt: <strong>${a.watchtower}</strong></p>` : "") +
-        (a.advance_txid ? `<p>Paid: ${a.advance_txid}</p>` : "") +
-        (a.collect_txid ? `<p>Collected: ${a.collect_txid}</p>` : "") +
+        (a.advance_txid ? `<p>Paid: ${txLink("btc", a.advance_txid)}</p>` : "") +
+        (a.collect_txid ? `<p>Collected: ${txLink("btc", a.collect_txid)}</p>` : "") +
         `<p class="hint">${a.note || ""}</p>`;
+      notifyAll(a, ADVANCE_TXS);
     }
 
     $("btnCsvLock").onclick = async () => {
@@ -632,7 +715,8 @@
             vault: $("csvKind").value === "vault",
           }),
         });
-        $("advBox").innerHTML = `<p>Locked ${sats(csvLock.value_sats)} at ${csvLock.address} (${csvLock.txid}:0) behind ${csvLock.csv_blocks} blocks.</p><p class="hint">${csvLock.note}</p>`;
+        $("advBox").innerHTML = `<p>Locked ${sats(csvLock.value_sats)} at ${csvLock.address} (${txLink("btc", csvLock.txid)}:${csvLock.vout}) behind ${csvLock.csv_blocks} blocks.</p><p class="hint">${csvLock.note}</p>`;
+        notifyTx("btc", csvLock.txid, "Coins locked behind the delay");
       } catch (e) {
         $("advBox").innerHTML = `<p class="warn">${e.message}</p>`;
       }

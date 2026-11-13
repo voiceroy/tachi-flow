@@ -34,6 +34,14 @@ Swaps survive `cargo run` restarts. State lives in SQLite (`tachi-flow-state.db`
 - `node vault-refund.mjs <user_secret_hex> [csv] [sats]` opens a real TAURUS vault on regtest with Tachi's SDK (`@tachibtc/taurus-vault-core`), refunds it with the validator quorum's co-signature, and prints the `to_local` outpoint and leaf to quote an advance on. Takes two blocks (10 min each on Tachi regtest).
 - `node record.cjs && node edit.cjs` records the walkthrough video against a server on `:8090` with Playwright and cuts the block waits (marked on screen) with ffmpeg.
 
+## Tachi integration and verifying on signet
+
+Every transaction runs on **Bitcoin Signet** through Tachi's signet node (`https://rpc-signet.tachibtc.com`). Tachi signet is the public signet (block 1 is `00000086d6b2…`).
+
+- **Tachi RPC.** `src/tachi.rs` calls Tachi's routes directly: `/tachi_addressVtxos`, `/tachi_vtxo`, `/tachi_nonce`, `/tachi_feeEstimate`, `/tachi_txBroadcastSync` (VTXO transfers), `/tachi_validators`, `/tachi_listVaults`, `/tachi_watchtower/receipts`, the `/tachi_ws` push stream, and Bitcoin Core calls through Tachi's JSON-RPC proxy (`scantxoutset`, `gettxout`, `getrawtransaction`, `sendrawtransaction`, `estimatesmartfee`, …).
+- **Tachi SDK.** The server is Rust, so it signs VTXO transfers itself. `src/tachi_tx.rs` is a port of the SDK's `encodeTachiTx` wire format and sighash from `@tachibtc/taurus-vault-core`. `demo/vault-refund.mjs` uses that SDK as-is to open a real TAURUS vault and refund it with the validator quorum's co-signature. The desks then accept the refund output for an advance.
+- **Every transaction is announced in the app.** When a swap or advance gains a transaction, the UI shows a notification with a link to the transaction on an explorer, and the ids in the status box become links too. Tachi transfers (`tachi_tx_hash`) open on the **Tachi Explorer** at `signet.tachibtcscan.com/tx/…`, and VTXOs (`vtxo_payment_id`, `compensation_vtxo_id`) at `/vtxo/…`. The Tachi Explorer has no page for plain bitcoin transactions, so the faucet payment, HTLC lock, claim, refund, bond compensation and advance transactions open on `mempool.space/signet/tx/…`. On regtest the links go to `regtest.tachibtcscan.com` and `explorer-regtest.tachibtc.com`.
+
 ## What the vault can't do
 
 A TAURUS vault has one exit: the whole deposit, after a fixed ~1008-block CSV, at no fee. The desks turn that wait into a priced market:

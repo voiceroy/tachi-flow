@@ -1784,6 +1784,7 @@ impl Engine {
             vtxo_payment_id: None,
             tachi_tx_hash: None,
             claim_tx_hex: None,
+            claim_txid: None,
             created_at: now,
             updated_at: now,
             faucet_txid: None,
@@ -2327,6 +2328,7 @@ impl Engine {
         self.record_fill(&swap.lp_id).await;
         self.update_swap(id, |s| {
             s.claim_tx_hex = Some(hex);
+            s.claim_txid = Some(sent.clone());
             s.status = SwapStatus::Claimed;
             s.demo_note = Some(format!(
                 "You claimed the desk lock ({sent}). Same HTLC pattern as inbound, roles reversed."
@@ -2452,6 +2454,7 @@ impl Engine {
                 s.status = SwapStatus::LpSettled;
                 s.l1_lock_txid = Some(funding.txid.clone());
                 s.l1_lock_value_sats = Some(funding.value_sats);
+                s.claim_txid = txid_of_hex(&claim_hex).ok().map(|t| t.to_string());
                 s.claim_tx_hex = Some(claim_hex);
                 match payout {
                     Some(p) => {
@@ -2839,6 +2842,7 @@ impl Engine {
         tracing::info!(id = %swap.id, fee, %new_txid, "bumped desk claim");
         self.update_swap(swap.id, |s| {
             s.claim_tx_hex = Some(bumped);
+            s.claim_txid = Some(new_txid.clone());
             s.demo_note = Some(format!(
                 "Desk claim was slow to confirm near the timeout; re-sent at {fee} sats fee ({new_txid})."
             ));

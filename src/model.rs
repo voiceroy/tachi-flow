@@ -207,6 +207,9 @@ pub struct Swap {
     pub vtxo_payment_id: Option<String>,
     pub tachi_tx_hash: Option<String>,
     pub claim_tx_hex: Option<String>,
+    /// Txid of `claim_tx_hex`, so the UI can link the claim on an explorer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_txid: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Faucet drip that funded the ephemeral P2WPKH (demo helper).
