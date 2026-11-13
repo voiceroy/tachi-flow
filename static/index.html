@@ -110,6 +110,7 @@
       <p class="hint">Same keys after refresh. Tachi coins from inbound swaps land on this Tachi key.</p>
       <p>Tachi key: <span class="mono" id="showTachi">—</span></p>
       <p>Bitcoin address: <span class="mono" id="showL1">—</span></p>
+      <p>Tachi balance: <span id="showBal">—</span> <span class="hint">(read from Tachi with Tachi’s SDK)</span></p>
       <button id="btnKeys">New keys</button>
     </section>
     <section>
@@ -208,6 +209,8 @@
     </section>
   </main>
   <div id="toasts"></div>
+  <!-- Tachi's SDK (@tachibtc/tachi-sdk-ts), bundled by web/: window.TachiSDK. -->
+  <script src="/tachi-sdk.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
     const NET_KEY = "tachi-flow-net";
@@ -224,10 +227,44 @@
     // plain bitcoin txs, so those open on a bitcoin explorer for the same chain
     // (Tachi signet is the public signet).
     const EXPLORERS = {
-      signet: { tachi: "https://signet.tachibtcscan.com", btc: "https://mempool.space/signet" },
+      signet: { tachi: "https://signet.tachibtcscan.com", btc: "https://mempool.space/signet", btcApi: "https://mempool.space/signet/api" },
       regtest: { tachi: "https://regtest.tachibtcscan.com", btc: "https://explorer-regtest.tachibtc.com" },
     };
     let metaNet = "";
+    // Tachi's SDK client for this network's node (from /v1/meta), so the page
+    // reads balances, checks transactions and sends payments on Tachi itself
+    // rather than taking this server's word for it.
+    let tachi = null, tachiSend = null, tachiUrl = "";
+
+    async function refreshBalance() {
+      if (!tachi || !keys) return;
+      try {
+        const b = await tachi.getBalance(keys.tachi_xonly_hex);
+        $("showBal").textContent = sats(b.balance_sat);
+      } catch (e) {
+        $("showBal").textContent = "unavailable (" + e.message.slice(0, 60) + ")";
+      }
+    }
+
+    // What Tachi's node says about a transaction right now, via the SDK.
+    async function checkOnTachi(kind, id) {
+      if (kind === "tachi") {
+        const t = await tachi.getTransaction(id);
+        return "Tachi: " + (t.state || "found");
+      }
+      if (kind === "vtxo") {
+        const v = await tachi.getVtxo(id);
+        return "Tachi: VTXO " + (v.spent ? "exists (since spent)" : "exists");
+      }
+      // Tachi's bitcoind proxy refuses browser (CORS) requests, so bitcoin txs
+      // are checked on the explorer the link opens.
+      const e = EXPLORERS[net || metaNet];
+      if (!e || !e.btcApi) throw new Error("no explorer API");
+      const r = await fetch(e.btcApi + "/tx/" + id + "/status");
+      if (!r.ok) throw new Error(r.statusText);
+      const st = await r.json();
+      return "Signet: " + (st.confirmed ? "confirmed in block " + st.block_height : "in the mempool");
+    }
     function txUrl(kind, id) {
       if (!/^[0-9a-f]{64}$/i.test(id || "")) return null;
       const e = EXPLORERS[net || metaNet] || EXPLORERS.signet;
@@ -269,10 +306,19 @@
       t.className = "toast";
       const where = kind === "btc" ? "bitcoin explorer" : "Tachi Explorer";
       t.innerHTML = `<button title="Dismiss">×</button><strong>${esc(label)}</strong>` +
-        `<a href="${url}" target="_blank" rel="noopener">View ${id.slice(0, 10)}… on the ${where}</a>`;
+        `<a href="${url}" target="_blank" rel="noopener">View ${id.slice(0, 10)}… on the ${where}</a>` +
+        `<div class="hint" style="margin-top:.3rem"></div>`;
       t.querySelector("button").onclick = () => t.remove();
       $("toasts").appendChild(t);
       setTimeout(() => t.remove(), 30000);
+      if (tachi) {
+        const out = t.querySelector(".hint");
+        out.textContent = kind === "btc" ? "Checking signet…" : "Checking with Tachi’s SDK…";
+        checkOnTachi(kind, id)
+          .then(s => { out.textContent = s; })
+          .catch(() => { out.textContent = "Not visible yet; it can take a block."; });
+      }
+      refreshBalance();
     }
     function notifyAll(obj, fields) {
       for (const [f, kind, label] of fields) {
@@ -303,6 +349,7 @@
       $("l1Dest").value = k.l1_address || "";
       $("showTachi").textContent = k.tachi_xonly_hex;
       $("showL1").textContent = k.l1_address || "(click New keys)";
+      refreshBalance();
     }
 
     async function ensureKeys() {
@@ -384,6 +431,21 @@
     async function refreshMeta() {
       const m = await j("/v1/meta");
       metaNet = m.network;
+      if (window.TachiSDK && (!tachi || tachiUrl !== m.tachi)) {
+        tachiUrl = m.tachi;
+        tachi = new TachiSDK.TachiClient({ baseUrl: m.tachi, timeoutMs: 20000 });
+        // Tachi only accepts browser broadcasts from its own explorer, so the
+        // SDK's broadcast goes through this server's one-route relay. The SDK
+        // resolves paths from the root of baseUrl, so the relay prefix is
+        // added in its fetch hook.
+        const relay = location.origin + (net ? "/" + net : "") + "/tachi-rpc";
+        tachiSend = new TachiSDK.TachiClient({
+          baseUrl: location.origin,
+          fetch: (url, init) => fetch(String(url).replace(location.origin, relay), init),
+          timeoutMs: 20000,
+        });
+      }
+      refreshBalance();
       $("meta").textContent = m.bounty + " · " + m.network + " · " + m.tachi + " · block " + m.height +
         (liveUp() ? " · live" : "");
     }
@@ -581,12 +643,33 @@
         return;
       }
       $("swapHint").textContent = "Sending Tachi coins to the desk…";
+      const post = (path, body) => j("/v1/swaps/" + swap.id + path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ secret_hex: keys.secret_hex, ...body }),
+      });
       try {
-        showSwap(await j("/v1/swaps/" + swap.id + "/pay-vtxo", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ secret_hex: keys.secret_hex }),
-        }));
+        // The server signs; the page broadcasts to Tachi with Tachi's SDK. A
+        // retry gets the same tx back while it can still land, so it never
+        // pays twice. Without the SDK, pay-vtxo signs and sends on its own.
+        let hash = null, refused = "";
+        if (tachiSend && swap.status === "quoted") {
+          const signed = await post("/pay-vtxo/sign", {});
+          if (signed.tx_hex) {
+            $("swapHint").textContent = "Broadcasting your payment to Tachi with Tachi’s SDK…";
+            try {
+              const r = await tachiSend.broadcastTxSync(signed.tx_hex);
+              if (r.result && r.result.code === 0) hash = r.result.hash;
+              else refused = (r.result && r.result.log) || "refused";
+            } catch (e) {
+              refused = e.message;
+            }
+          }
+        }
+        const s = await post("/pay-vtxo", { tachi_tx_hash: hash });
+        showSwap(s);
+        if (refused && s.status === "quoted")
+          $("swapHint").innerHTML += "<br><span class='warn'>Tachi did not accept the broadcast: " + esc(refused) + ". Click Send again to retry the same payment.</span>";
         refreshBooks();
         refreshSwaps();
       } catch (e) {

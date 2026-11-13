@@ -199,6 +199,14 @@ struct PendingPayout {
     nonce: u64,
 }
 
+/// The user's outbound payment, signed for the page to broadcast with Tachi's
+/// SDK. `tx_hex` is `None` when this server already sent it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignedPayment {
+    pub vtxo_id: String,
+    pub tx_hex: Option<String>,
+}
+
 /// Coins and nonce a desk has committed to in-flight txs that Tachi or
 /// bitcoind may not show yet. Lives behind the desk's spend mutex.
 #[derive(Default)]
@@ -2158,7 +2166,14 @@ impl Engine {
     /// Demo helper: spend the user's VTXOs to the outbound `pay_to` using their
     /// secret, then claim the desk's lock. Calling it again after a payment
     /// never pays twice; it only retries confirmation and the claim.
-    pub async fn user_pay_outbound(&self, id: Uuid, secret_hex: &str) -> Result<Swap, Error> {
+    /// `tachi_tx_hash` is the hash Tachi returned when the page broadcast the
+    /// payment from `user_sign_outbound` itself.
+    pub async fn user_pay_outbound(
+        &self,
+        id: Uuid,
+        secret_hex: &str,
+        tachi_tx_hash: Option<&str>,
+    ) -> Result<Swap, Error> {
         let secret = parse_secret(secret_hex)?;
         let _guard = self.lock_swap(id).await;
         let swap = self.get_swap(id).await?;
@@ -2172,7 +2187,15 @@ impl Engine {
                     Some(paid) => paid,
                     None => self.send_outbound_payment(&swap, &secret).await?,
                 };
-                if !self.await_and_observe(id, &paid).await? {
+                if let Some(hash) = tachi_tx_hash.filter(|h| looks_like_vtxo_id(h)) {
+                    let hash = hash.to_lowercase();
+                    self.update_swap(id, |s| s.tachi_tx_hash = Some(hash)).await?;
+                }
+                let seen = self.await_and_observe(id, &paid).await?;
+                if seen && self.inner.write().await.pending_payouts.remove(&id).is_some() {
+                    self.save_state().await;
+                }
+                if !seen {
                     return self
                         .update_swap(id, |s| {
                             s.demo_note = Some(
@@ -2213,6 +2236,93 @@ impl Engine {
     /// Pay the desk from the user's key. The payment id is stored before the tx
     /// leaves, so a lost reply cannot lead to a second payment.
     async fn send_outbound_payment(&self, swap: &Swap, secret: &SecretKey) -> Result<String, Error> {
+        let pay_to = self.outbound_pay_to(swap).await?;
+        let mut spend = LpSpend::default();
+        let built = self
+            .build_transfer(secret, &spend, &pay_to, swap.amount_sats)
+            .await?;
+        let paid = built.signed.output_vtxo_id.clone();
+        let p = paid.clone();
+        self.update_swap(swap.id, |s| s.vtxo_payment_id = Some(p))
+            .await?;
+        match self.broadcast_transfer(&mut spend, &built).await {
+            Ok(hash) => {
+                self.update_swap(swap.id, |s| s.tachi_tx_hash = Some(hash))
+                    .await?;
+                Ok(paid)
+            }
+            Err(Error::TachiRejected(why)) => {
+                self.update_swap(swap.id, |s| s.vtxo_payment_id = None)
+                    .await?;
+                Err(Error::TachiRejected(why))
+            }
+            // May have landed; the stored id lets a retry check instead of pay.
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Sign the user's VTXO payment without sending it, so the page can
+    /// broadcast it with Tachi's SDK. Same rule as a desk payout: while the
+    /// signed tx's nonce is unused it is handed out again unchanged, and it is
+    /// only re-signed once that nonce is spent and its output never appeared,
+    /// so at most one payment can land.
+    pub async fn user_sign_outbound(&self, id: Uuid, secret_hex: &str) -> Result<SignedPayment, Error> {
+        let secret = parse_secret(secret_hex)?;
+        let _guard = self.lock_swap(id).await;
+        let swap = self.get_swap(id).await?;
+        if swap.side != Side::Out {
+            return Err(Error::WrongSide(swap.side));
+        }
+        self.check_owner(&swap, &secret)?;
+        if swap.status != SwapStatus::Quoted {
+            return Err(Error::BadTransition {
+                from: swap.status,
+                to: SwapStatus::LpSettled,
+            });
+        }
+        let pending = self.inner.read().await.pending_payouts.get(&id).cloned();
+        if let Some(p) = pending {
+            let pk_hex = hex::encode(xonly_from_secret(&secret));
+            if self.tachi.find_vtxo(&p.signed.output_vtxo_id).await?.is_some()
+                || self.tachi.next_nonce(&pk_hex).await? <= p.nonce
+            {
+                return Ok(SignedPayment {
+                    vtxo_id: p.signed.output_vtxo_id,
+                    tx_hex: Some(p.signed.hex),
+                });
+            }
+            self.inner.write().await.pending_payouts.remove(&id);
+        } else if let Some(paid) = swap.vtxo_payment_id.clone() {
+            // Already sent by this server (pay-vtxo alone): nothing to broadcast.
+            return Ok(SignedPayment { vtxo_id: paid, tx_hex: None });
+        }
+        let pay_to = self.outbound_pay_to(&swap).await?;
+        let built = self
+            .build_transfer(&secret, &LpSpend::default(), &pay_to, swap.amount_sats)
+            .await?;
+        self.inner.write().await.pending_payouts.insert(
+            id,
+            PendingPayout {
+                signed: built.signed.clone(),
+                nonce: built.nonce,
+            },
+        );
+        let paid = built.signed.output_vtxo_id.clone();
+        // Stored before the page sends it, so pay-vtxo only ever waits for it.
+        self.update_swap(id, |s| {
+            s.vtxo_payment_id = Some(paid);
+            s.tachi_tx_hash = None;
+        })
+        .await?;
+        Ok(SignedPayment {
+            vtxo_id: built.signed.output_vtxo_id,
+            tx_hex: Some(built.signed.hex),
+        })
+    }
+
+    /// The desk key to pay, once it is safe to pay it: the desk's lock is up
+    /// with a confirmation and not near its timeout.
+    async fn outbound_pay_to(&self, swap: &Swap) -> Result<String, Error> {
         let PayInstructions::TachiVtxo { pay_to, lock, .. } = &swap.pay else {
             return Err(Error::Invalid("swap is not waiting on a VTXO payment".into()));
         };
@@ -2243,28 +2353,7 @@ impl Engine {
                 )));
             }
         }
-        let mut spend = LpSpend::default();
-        let built = self
-            .build_transfer(secret, &spend, pay_to, swap.amount_sats)
-            .await?;
-        let paid = built.signed.output_vtxo_id.clone();
-        let p = paid.clone();
-        self.update_swap(swap.id, |s| s.vtxo_payment_id = Some(p))
-            .await?;
-        match self.broadcast_transfer(&mut spend, &built).await {
-            Ok(hash) => {
-                self.update_swap(swap.id, |s| s.tachi_tx_hash = Some(hash))
-                    .await?;
-                Ok(paid)
-            }
-            Err(Error::TachiRejected(why)) => {
-                self.update_swap(swap.id, |s| s.vtxo_payment_id = None)
-                    .await?;
-                Err(Error::TachiRejected(why))
-            }
-            // May have landed; the stored id lets a retry check instead of pay.
-            Err(err) => Err(err),
-        }
+        Ok(pay_to.clone())
     }
 
     /// Tachi commits a block after CheckTx; give it a few seconds. Returns

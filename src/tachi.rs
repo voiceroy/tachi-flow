@@ -292,6 +292,13 @@ impl TachiClient {
             .ok_or_else(|| Error::Tachi("broadcast missing hash".into()))
     }
 
+    /// Forward a broadcast as-is and return Tachi's reply untouched, for the
+    /// page's SDK client: Tachi only lets its own explorer broadcast from a
+    /// browser (CORS).
+    pub async fn relay_broadcast_sync(&self, body: &Value) -> Result<Value, Error> {
+        self.post_json("/tachi_txBroadcastSync", body).await
+    }
+
     pub async fn scan_address(&self, address: &str) -> Result<Vec<ChainUtxo>, Error> {
         let _one_at_a_time = self.scan.lock().await;
         let params = serde_json::json!(["start", [format!("addr({address})")]]);

@@ -15,6 +15,7 @@ tachi-flow-state.db-shm
 tachi-flow-state-*.db*
 .scratch
 demo/node_modules
+web/node_modules
 demo/*.webm
 demo/*.mp4
 demo/cuts.json

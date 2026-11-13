@@ -1,0 +1,14 @@
+{
+  "name": "tachi-flow-web",
+  "private": true,
+  "description": "Bundles Tachi's SDK (@tachibtc/tachi-sdk-ts) for the demo page: npm run build writes ../static/tachi-sdk.js.",
+  "scripts": {
+    "build": "esbuild entry.js --bundle --format=iife --global-name=TachiSDK --target=es2020 --minify --outfile=../static/tachi-sdk.js"
+  },
+  "dependencies": {
+    "@tachibtc/tachi-sdk-ts": "0.3.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.0"
+  }
+}
