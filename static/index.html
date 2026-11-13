@@ -870,11 +870,13 @@
       try { showSwap(await j("/v1/swaps/" + id)); } catch {}
     }
 
-    initNet().then(() => {
+    initNet().then(async () => {
       ensureKeys();
+      // Meta first: it creates the Tachi SDK client that the restored swap's
+      // notifications check with.
+      await refreshMeta().catch(() => {});
       restoreSwap();
       connectLive();
-      refreshMeta();
       refreshBooks();
       refreshSwaps();
       // Swaps arrive live; books and the block height still refresh on a timer.
