@@ -18,22 +18,48 @@
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font: 16px/1.45 "Iowan Old Style", Palatino, "Palatino Linotype", serif;
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       background: var(--bg);
       color: var(--text);
     }
-    header { padding: 2rem 1.5rem 1rem; max-width: 960px; margin: 0 auto; }
-    header h1 { font-size: 1.8rem; margin: 0 0 .4rem; font-weight: 600; }
-    header p { margin: 0; color: var(--muted); max-width: 42rem; }
-    main { max-width: 960px; margin: 0 auto; padding: 0 1.5rem 4rem; }
+    header { padding: 2rem 1.5rem 1rem; max-width: 1180px; margin: 0 auto; }
+    header h1 { font-size: 1.8rem; margin: 0 0 .4rem; font-weight: 700; letter-spacing: -.01em; }
+    header h1 span { color: var(--accent); }
+    header p { margin: 0; color: var(--muted); max-width: 46rem; }
+    main { max-width: 1180px; margin: 0 auto; padding: 0 1.5rem 4rem; }
     section {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 10px;
       padding: 1.25rem 1.4rem;
       margin: 1rem 0;
+      min-width: 0;
     }
-    h2 { font-size: 1.05rem; margin: 0 0 .8rem; letter-spacing: .02em; }
+    h2 { font-size: 1rem; margin: 0 0 .8rem; letter-spacing: .02em; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+    .grid2 > section { margin: 0; }
+    @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+    .pill { display: inline-block; padding: .05rem .55rem; border-radius: 999px; font-size: .8rem; font-weight: 600; background: #2a3340; color: var(--text); }
+    .pill.claimed, .pill.lp_settled { background: #3dba8426; color: var(--ok); }
+    .pill.quoted, .pill.waiting { background: #f4c14e26; color: var(--accent); }
+    .pill.expired, .pill.refunded { background: #8b98a826; color: var(--muted); }
+    .pill.defaulted { background: #e08a3c26; color: var(--warn); }
+    dl.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .35rem 1rem; margin: .8rem 0 0; }
+    dl.kv dd .hint { font: .85rem system-ui, sans-serif; }
+    dl.kv dt { color: var(--muted); font-size: .88rem; }
+    dl.kv dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .75rem; margin-bottom: .8rem; }
+    .tile { background: #10151c; border: 1px solid var(--line); border-radius: 8px; padding: .7rem .9rem; }
+    .tile b { display: block; font-size: 1.35rem; color: var(--text); font-variant-numeric: tabular-nums; }
+    .tile span { font-size: .8rem; color: var(--muted); }
+    #stats p { margin: .25rem 0; }
+    .btns { display: flex; flex-wrap: wrap; gap: .5rem; }
+    .btns button { margin: 0; }
+    .swapcard { margin-top: 1rem; padding: 1rem; background: #10151c; border: 1px solid var(--line); border-radius: 8px; }
+    .swapcard .head { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+    .swapcard .hint { overflow-wrap: anywhere; }
+    #swaps, #books { overflow-x: auto; }
+    #swaps td { white-space: nowrap; }
     ol.steps { margin: .4rem 0 0; padding-left: 1.2rem; color: var(--muted); }
     ol.steps li { margin: .25rem 0; }
     table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
@@ -73,7 +99,6 @@
     .ok { color: var(--ok); }
     .warn { color: var(--warn); }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; word-break: break-all; }
-    #status { white-space: pre-wrap; }
     .idcard p { margin: .3rem 0; }
     .net { display: inline-flex; gap: .5rem; margin-top: .8rem; }
     .net button { padding: .35rem .9rem; font-size: .85rem; background: transparent; color: var(--muted); border: 1px solid var(--line); }
@@ -87,7 +112,7 @@
 </head>
 <body>
   <header>
-    <h1>tachi-flow</h1>
+    <h1>tachi<span>-</span>flow</h1>
     <p>
       Swap on-chain bitcoin for Tachi VTXOs (and back) without a week-long vault exit.
       This page is a live demo on Tachi’s test chain.
@@ -96,10 +121,11 @@
     <p class="hint" id="meta">loading…</p>
   </header>
   <main>
+    <div class="grid2">
     <section>
       <h2>How to demo</h2>
       <ol class="steps">
-        <li>Keep the identity below (saved in this browser).</li>
+        <li>Keep your demo identity (saved in this browser).</li>
         <li>Quote inbound, accept, <strong>Fund with faucet</strong> (do not paste the lock into the faucet site).</li>
         <li>Wait until <em>claimed</em>. That skipped a ~1008-block TAURUS vault exit.</li>
         <li>Optional reverse: quote outbound. The desk locks bitcoin first; then <strong>Send my Tachi coins</strong> and you claim the lock.</li>
@@ -108,11 +134,18 @@
     <section class="idcard">
       <h2>Your demo identity</h2>
       <p class="hint">Same keys after refresh. Tachi coins from inbound swaps land on this Tachi key.</p>
-      <p>Tachi key: <span class="mono" id="showTachi">—</span></p>
-      <p>Bitcoin address: <span class="mono" id="showL1">—</span></p>
-      <p>Tachi balance: <span id="showBal">—</span> <span class="hint">(read from Tachi with Tachi’s SDK)</span></p>
-      <button id="btnKeys">New keys</button>
+      <dl class="kv">
+        <dt>Tachi key</dt><dd><span id="showTachi">—</span></dd>
+        <dt>Bitcoin address</dt><dd><span id="showL1">—</span></dd>
+        <dt>Tachi balance</dt><dd><strong id="showBal">—</strong> <span class="hint">via Tachi’s SDK</span></dd>
+      </dl>
+      <div class="btns" style="margin-top:.9rem">
+        <button class="ghost" data-copy="showTachi">Copy Tachi key</button>
+        <button class="ghost" data-copy="showL1">Copy address</button>
+        <button id="btnKeys" class="ghost">New keys</button>
+      </div>
     </section>
+    </div>
     <section>
       <h2>Marketplace</h2>
       <p class="hint">Desk float vs a TAURUS vault: vault unilateral exit is ~1008 blocks (~a week). This desk swaps so you don’t sit that wait.</p>
@@ -164,12 +197,15 @@
     </section>
     <section>
       <h2>Swap</h2>
-      <button id="btnOpen">Accept quote</button>
-      <button id="btnFund">Fund with faucet</button>
-      <button id="btnPayOut">Send my Tachi coins</button>
-      <button id="btnSync" class="ghost">Check if paid</button>
-      <button id="btnRefund" class="ghost">Refund / cancel</button>
-      <input id="fundTxid" placeholder="txid that paid the fund address (only if the faucet needs your browser)" />
+      <div class="btns">
+        <button id="btnOpen">Accept quote</button>
+        <button id="btnFund">Fund with faucet</button>
+        <button id="btnPayOut">Send my Tachi coins</button>
+        <button id="btnSync" class="ghost">Check if paid</button>
+        <button id="btnRefund" class="ghost">Refund / cancel</button>
+      </div>
+      <label>Faucet txid (only if the faucet needs your browser)</label>
+      <input id="fundTxid" placeholder="txid that paid the fund address" />
       <p class="hint" id="swapHint"></p>
       <div id="status"></div>
     </section>
@@ -177,6 +213,7 @@
       <h2>Recent swaps</h2>
       <div id="swaps">—</div>
     </section>
+    <div class="grid2">
     <section>
       <h2>Split a big exit across desks</h2>
       <p class="hint">A vault exit takes the whole deposit. Here any amount is split into legs, cheapest desk first, each its own swap. Uses the direction, amount and deadline above.</p>
@@ -207,6 +244,7 @@
         <div><div id="advBox" class="hint"></div></div>
       </div>
     </section>
+    </div>
   </main>
   <div id="toasts"></div>
   <!-- Tachi's SDK (@tachibtc/tachi-sdk-ts), bundled by web/: window.TachiSDK. -->
@@ -222,6 +260,7 @@
     function sats(n) { return Number(n).toLocaleString() + " sats"; }
     function feePct(ppm) { return (ppm / 10000).toFixed(2) + "%"; }
     function esc(s) { return String(s).replace(/[&<>"']/g, c => "&#" + c.charCodeAt(0) + ";"); }
+    function pill(status) { return `<span class="pill ${esc(status)}">${esc(String(status).replace("_", " "))}</span>`; }
 
     // Tachi transfers and VTXOs open on the Tachi Explorer. It has no page for
     // plain bitcoin txs, so those open on a bitcoin explorer for the same chain
@@ -408,25 +447,29 @@
       // instead of leaving Send with nothing to act on.
       try { localStorage.setItem(KEYS + ":swap", s.id); } catch {}
       const pay = s.pay || {};
-      let extra = "";
-      if (pay.method === "l1_htlc") extra += "Lock: " + esc(pay.address) + "\n";
-      if (pay.pay_to) extra += "Pay Tachi to: " + esc(pay.pay_to) + "\n";
+      const rows = [];
+      if (pay.method === "l1_htlc") rows.push(["Lock address", esc(pay.address)]);
+      if (pay.pay_to) rows.push(["Pay Tachi to", esc(pay.pay_to)]);
       if (s.fund_address && !s.l1_lock_txid)
-        extra += "Fund address: " + esc(s.fund_address) + " (at least " + sats(Math.max(s.amount_sats + 20000, 40000)) + ")\n";
-      if (s.faucet_txid) extra += "Faucet tx: " + txLink("btc", s.faucet_txid) + "\n";
-      if (s.l1_lock_txid) extra += "Bitcoin tx: " + txLink("btc", s.l1_lock_txid) + "\n";
-      if (s.tachi_tx_hash) extra += "Tachi tx: " + txLink("tachi", s.tachi_tx_hash) + "\n";
-      if (s.vtxo_payment_id) extra += "VTXO: " + txLink("vtxo", s.vtxo_payment_id) + "\n";
-      if (s.claim_txid) extra += "Claim tx: " + txLink("btc", s.claim_txid) + "\n";
+        rows.push(["Fund address", esc(s.fund_address) + " (at least " + sats(Math.max(s.amount_sats + 20000, 40000)) + ")"]);
+      if (s.faucet_txid) rows.push(["Faucet tx", txLink("btc", s.faucet_txid)]);
+      if (s.l1_lock_txid) rows.push(["Bitcoin lock", txLink("btc", s.l1_lock_txid)]);
+      if (s.tachi_tx_hash) rows.push(["Tachi tx", txLink("tachi", s.tachi_tx_hash)]);
+      if (s.vtxo_payment_id) rows.push(["VTXO", txLink("vtxo", s.vtxo_payment_id)]);
+      if (s.claim_txid) rows.push(["Claim tx", txLink("btc", s.claim_txid)]);
       const lock = pay.method === "l1_htlc" ? pay : pay.lock;
-      if (lock && lock.timeout_height) extra += "Lock timeout: block " + lock.timeout_height + "\n";
-      if (s.preimage_hex) extra += "Preimage: " + esc(s.preimage_hex) + "\n";
-      if (s.refund_txid) extra += "Refund tx: " + txLink("btc", s.refund_txid) + "\n";
-      if (s.compensation_vtxo_id) extra += "Compensation VTXO: " + txLink("vtxo", s.compensation_vtxo_id) + "\n";
-      if (s.compensation_txid) extra += "Compensation tx: " + txLink("btc", s.compensation_txid) + "\n";
-      if (s.demo_note) extra += esc(s.demo_note) + "\n";
+      if (lock && lock.timeout_height) rows.push(["Lock timeout", "block " + lock.timeout_height]);
+      if (s.preimage_hex) rows.push(["Preimage", esc(s.preimage_hex)]);
+      if (s.refund_txid) rows.push(["Refund tx", txLink("btc", s.refund_txid)]);
+      if (s.compensation_vtxo_id) rows.push(["Compensation VTXO", txLink("vtxo", s.compensation_vtxo_id)]);
+      if (s.compensation_txid) rows.push(["Compensation tx", txLink("btc", s.compensation_txid)]);
       $("swapHint").innerHTML = "<span class='" + (s.status === "claimed" || s.status === "lp_settled" ? "ok" : "") + "'>" + human(s) + "</span>";
-      $("status").innerHTML = "Swap " + esc(s.id) + " · " + esc(s.side) + " · " + sats(s.amount_sats) + " via " + esc(s.lp_id) + "\n" + extra;
+      $("status").innerHTML = `<div class="swapcard">
+        <div class="head">${pill(s.status)} <strong>${s.side === "in" ? "Bitcoin → Tachi" : "Tachi → Bitcoin"}</strong>
+          · ${sats(s.amount_sats)} via ${esc(s.lp_id)} <span class="hint" style="margin:0" title="${esc(s.id)}">swap ${esc(s.id.slice(-8))}</span></div>
+        <dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
+        ${s.demo_note ? `<p class="hint">${esc(s.demo_note)}</p>` : ""}
+      </div>`;
       notifyAll(s, SWAP_TXS);
     }
 
@@ -475,10 +518,12 @@
         const st = await j("/v1/stats");
         const sw = st.swaps, b = st.batching, t = st.time;
         $("stats").innerHTML = `
-          <p><strong>${sw.settled}</strong> swaps settled of ${sw.total} ·
-             volume in ${sats(sw.volume_in_sats)} · out ${sats(sw.volume_out_sats)} ·
-             fees earned ${sats(sw.fees_earned_sats)}</p>
-          <p>Average settle <strong>${duration(t.avg_settle_secs)}</strong> vs a TAURUS exit of ~${duration(t.vault_exit_secs)} (${t.vault_exit_blocks} blocks).</p>
+          <div class="tiles">
+            <div class="tile"><b>${sw.settled} / ${sw.total}</b><span>swaps settled</span></div>
+            <div class="tile"><b>${duration(t.avg_settle_secs)}</b><span>average settle vs ~${duration(t.vault_exit_secs)} for a TAURUS exit (${t.vault_exit_blocks} blocks)</span></div>
+            <div class="tile"><b>${sats(sw.volume_in_sats)}</b><span>volume in · ${sats(sw.volume_out_sats)} out</span></div>
+            <div class="tile"><b>${sats(sw.fees_earned_sats)}</b><span>fees earned</span></div>
+          </div>
           <p>Batching: ${b.outbound_locks} outbound locks in ${b.funding_txs} txs (${b.txs_saved} saved) · fee rate ${st.fee_rate_sat_vb} sat/vB</p>
           <p>Rebalances between desks: ${st.rebalances.done} (${sats(st.rebalances.moved_sats)} moved)${st.rebalances.pending_l1 ? ", " + st.rebalances.pending_l1 + " waiting on their L1 leg" : ""}</p>
           <p>Advances: ${st.advances.total} (${st.advances.collected} collected) · split exits: ${st.exit_plans}${sw.defaults_compensated_sats ? " · default compensation paid " + sats(sw.defaults_compensated_sats) : ""}</p>
@@ -504,7 +549,7 @@
           <td><a href="#" data-swap="${esc(s.id)}" title="Open ${esc(s.id)} in the Swap panel">${esc(s.id.slice(-8))}</a></td>
           <td>${esc(when(s.updated_at))}</td>
           <td>${esc(s.side)}</td>
-          <td>${esc(s.status)}</td>
+          <td>${pill(s.status)}</td>
           <td>${sats(s.amount_sats)}</td>
           <td>${esc(s.lp_id)}</td>
           <td>${txs(s)}</td>
@@ -515,6 +560,13 @@
         $("status").scrollIntoView({ behavior: "smooth", block: "center" });
       });
     }
+
+    document.querySelectorAll("button[data-copy]").forEach(b => b.onclick = async () => {
+      const label = b.textContent;
+      try { await navigator.clipboard.writeText($(b.dataset.copy).textContent); b.textContent = "Copied"; }
+      catch { b.textContent = "Copy failed"; }
+      setTimeout(() => { b.textContent = label; }, 1200);
+    });
 
     $("btnKeys").onclick = async () => {
       if (!confirm("Replace the saved demo identity? Existing VTXOs stay on the old key.")) return;
