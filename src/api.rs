@@ -140,8 +140,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(sync_all)
         .service(sync_swap)
         .service(fund_inbound)
-        .service(sign_outbound)
-        .service(relay_broadcast)
         .service(pay_outbound)
         .service(plan_exit)
         .service(get_plan)
@@ -691,65 +689,17 @@ async fn fund_inbound(
     Ok(HttpResponse::Ok().json(engine.fund_inbound(path.into_inner(), txid).await?))
 }
 
-#[derive(serde::Deserialize)]
-struct BroadcastBody {
-    tx: String,
-}
-
-/// The page's Tachi SDK client sends broadcasts here (its `baseUrl` is
-/// `…/tachi-rpc`): Tachi refuses browser broadcasts from other sites. Only
-/// this route is relayed; the SDK reads go to Tachi directly.
-#[post("/tachi-rpc/tachi_txBroadcastSync")]
-async fn relay_broadcast(
-    engine: web::Data<Engine>,
-    body: web::Json<BroadcastBody>,
-) -> Result<HttpResponse, Error> {
-    if body.tx.is_empty() || body.tx.len() > 200_000 || hex::decode(&body.tx).is_err() {
-        return Err(Error::Invalid("tx must be hex".into()));
-    }
-    let reply = engine
-        .tachi()
-        .relay_broadcast_sync(&serde_json::json!({ "tx": body.tx }))
-        .await?;
-    Ok(HttpResponse::Ok().json(reply))
-}
-
-#[derive(serde::Deserialize)]
-struct PayVtxoBody {
-    secret_hex: String,
-    /// Set when the page broadcast the tx from `pay-vtxo/sign` itself.
-    #[serde(default)]
-    tachi_tx_hash: Option<String>,
-}
-
-/// Sign the outbound VTXO payment without sending it: the page broadcasts it
-/// to Tachi with Tachi's SDK, then calls `pay-vtxo`. Calling again returns the
-/// same tx while it can still land, so it never pays twice.
-#[post("/v1/swaps/{id}/pay-vtxo/sign")]
-async fn sign_outbound(
+/// Sign a VTXO payment from the user's demo secret to the outbound desk key,
+/// then claim the desk's lock. Safe to call again: it never pays twice.
+#[post("/v1/swaps/{id}/pay-vtxo")]
+async fn pay_outbound(
     engine: web::Data<Engine>,
     path: web::Path<Uuid>,
     body: web::Json<SecretBody>,
 ) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Ok().json(
         engine
-            .user_sign_outbound(path.into_inner(), &body.secret_hex)
-            .await?,
-    ))
-}
-
-/// Sign a VTXO payment from the user's demo secret to the outbound desk key
-/// (unless `pay-vtxo/sign` already did), then claim the desk's lock. Safe to
-/// call again: it never pays twice.
-#[post("/v1/swaps/{id}/pay-vtxo")]
-async fn pay_outbound(
-    engine: web::Data<Engine>,
-    path: web::Path<Uuid>,
-    body: web::Json<PayVtxoBody>,
-) -> Result<HttpResponse, Error> {
-    Ok(HttpResponse::Ok().json(
-        engine
-            .user_pay_outbound(path.into_inner(), &body.secret_hex, body.tachi_tx_hash.as_deref())
+            .user_pay_outbound(path.into_inner(), &body.secret_hex)
             .await?,
     ))
 }

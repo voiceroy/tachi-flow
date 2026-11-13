@@ -234,7 +234,7 @@
     // Tachi's SDK client for this network's node (from /v1/meta), so the page
     // reads balances, checks transactions and sends payments on Tachi itself
     // rather than taking this server's word for it.
-    let tachi = null, tachiSend = null, tachiUrl = "";
+    let tachi = null, tachiUrl = "";
 
     async function refreshBalance() {
       if (!tachi || !keys) return;
@@ -323,7 +323,9 @@
     function notifyAll(obj, fields) {
       for (const [f, kind, label] of fields) {
         // The Tachi tx hash covers the VTXO it created; announce one, not both.
-        if (f === "vtxo_payment_id" && obj.tachi_tx_hash) continue;
+        // An outbound payment's id is stored just before it is sent, so while
+        // the swap is still quoted it is not news yet.
+        if (f === "vtxo_payment_id" && (obj.tachi_tx_hash || obj.status === "quoted")) continue;
         if (obj[f]) notifyTx(kind, obj[f], label);
       }
     }
@@ -431,19 +433,11 @@
     async function refreshMeta() {
       const m = await j("/v1/meta");
       metaNet = m.network;
-      if (window.TachiSDK && (!tachi || tachiUrl !== m.tachi)) {
+      if (window.TachiSDK && tachiUrl !== m.tachi) {
         tachiUrl = m.tachi;
-        tachi = new TachiSDK.TachiClient({ baseUrl: m.tachi, timeoutMs: 20000 });
-        // Tachi only accepts browser broadcasts from its own explorer, so the
-        // SDK's broadcast goes through this server's one-route relay. The SDK
-        // resolves paths from the root of baseUrl, so the relay prefix is
-        // added in its fetch hook.
-        const relay = location.origin + (net ? "/" + net : "") + "/tachi-rpc";
-        tachiSend = new TachiSDK.TachiClient({
-          baseUrl: location.origin,
-          fetch: (url, init) => fetch(String(url).replace(location.origin, relay), init),
-          timeoutMs: 20000,
-        });
+        // The constructor rejects a missing or malformed URL; the page then
+        // just goes without the SDK checks.
+        try { tachi = new TachiSDK.TachiClient({ baseUrl: m.tachi, timeoutMs: 20000 }); } catch { tachi = null; }
       }
       refreshBalance();
       $("meta").textContent = m.bounty + " · " + m.network + " · " + m.tachi + " · block " + m.height +
@@ -643,33 +637,12 @@
         return;
       }
       $("swapHint").textContent = "Sending Tachi coins to the desk…";
-      const post = (path, body) => j("/v1/swaps/" + swap.id + path, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ secret_hex: keys.secret_hex, ...body }),
-      });
       try {
-        // The server signs; the page broadcasts to Tachi with Tachi's SDK. A
-        // retry gets the same tx back while it can still land, so it never
-        // pays twice. Without the SDK, pay-vtxo signs and sends on its own.
-        let hash = null, refused = "";
-        if (tachiSend && swap.status === "quoted") {
-          const signed = await post("/pay-vtxo/sign", {});
-          if (signed.tx_hex) {
-            $("swapHint").textContent = "Broadcasting your payment to Tachi with Tachi’s SDK…";
-            try {
-              const r = await tachiSend.broadcastTxSync(signed.tx_hex);
-              if (r.result && r.result.code === 0) hash = r.result.hash;
-              else refused = (r.result && r.result.log) || "refused";
-            } catch (e) {
-              refused = e.message;
-            }
-          }
-        }
-        const s = await post("/pay-vtxo", { tachi_tx_hash: hash });
-        showSwap(s);
-        if (refused && s.status === "quoted")
-          $("swapHint").innerHTML += "<br><span class='warn'>Tachi did not accept the broadcast: " + esc(refused) + ". Click Send again to retry the same payment.</span>";
+        showSwap(await j("/v1/swaps/" + swap.id + "/pay-vtxo", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ secret_hex: keys.secret_hex }),
+        }));
         refreshBooks();
         refreshSwaps();
       } catch (e) {
